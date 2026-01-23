@@ -1,4 +1,4 @@
-# Skylit Dev I/O - VS Code/Cursor Extension
+# Skylit.DEV I/O - VS Code/Cursor Extension
 
 Instant bidirectional sync between WordPress Gutenberg and your IDE.
 
@@ -21,7 +21,7 @@ This extension solves a critical problem: **WP Cron doesn't run automatically on
 
 1. **Install Extension**
    - Open VS Code/Cursor
-   - Search for "Skylit Dev I/O" in Extensions
+   - Search for "Skylit.DEV I/O" in Extensions
    - Click Install
 
 2. **Generate Auth Token**
@@ -263,4 +263,4 @@ GPL-2.0-or-later
 
 ---
 
-**Made with ❤️ by Skylit**
+**Made with ❤️ by Skylit.DEV**

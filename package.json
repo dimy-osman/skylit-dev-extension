@@ -1,6 +1,6 @@
 {
   "name": "skylit-dev-io",
-  "displayName": "Skylit Dev I/O - WordPress Sync",
+  "displayName": "Skylit.DEV I/O - WordPress Sync",
   "description": "Instant sync between WordPress Gutenberg and your IDE. Solves WP Cron unreliability on local development.",
   "version": "1.2.0",
   "publisher": "skylit",
@@ -57,7 +57,7 @@
       }
     ],
     "configuration": {
-      "title": "Skylit Dev I/O",
+      "title": "Skylit.DEV I/O",
       "properties": {
         "skylit.autoConnect": {
           "type": "boolean",

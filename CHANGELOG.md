@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the Skylit Dev I/O extension will be documented in this file.
+All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
 ## [1.2.0] - 2026-01-23
 

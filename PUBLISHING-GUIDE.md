@@ -156,7 +156,7 @@ vsce publish major
 ## Current Package Details
 
 - **Name**: skylit-dev-io
-- **Display Name**: Skylit Dev I/O - WordPress Sync
+- **Display Name**: Skylit.DEV I/O - WordPress Sync
 - **Publisher**: skylit
 - **Version**: 1.2.0
 - **License**: GPL-2.0-or-later
