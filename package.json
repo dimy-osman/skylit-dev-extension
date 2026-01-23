@@ -1,0 +1,105 @@
+{
+  "name": "skylit-dev-io",
+  "displayName": "Skylit Dev I/O - WordPress Sync",
+  "description": "Instant sync between WordPress Gutenberg and your IDE. Solves WP Cron unreliability on local development.",
+  "version": "1.2.0",
+  "publisher": "skylit",
+  "license": "GPL-2.0-or-later",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "wordpress",
+    "gutenberg",
+    "sync",
+    "html",
+    "css",
+    "local-development"
+  ],
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/skylit/skylit-dev-extension"
+  },
+  "activationEvents": [
+    "workspaceContains:**/wp-config.php",
+    "workspaceContains:**/skylit-dev/**",
+    "workspaceContains:**/*-dev-root/**",
+    "onCommand:skylit.connect",
+    "onCommand:skylit.setupToken",
+    "onCommand:skylit.showMenu"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "skylit.connect",
+        "title": "Skylit: Connect to WordPress"
+      },
+      {
+        "command": "skylit.disconnect",
+        "title": "Skylit: Disconnect"
+      },
+      {
+        "command": "skylit.setupToken",
+        "title": "Skylit: Setup Auth Token"
+      },
+      {
+        "command": "skylit.syncNow",
+        "title": "Skylit: Sync Current File"
+      },
+      {
+        "command": "skylit.showMenu",
+        "title": "Skylit: Show Menu"
+      }
+    ],
+    "configuration": {
+      "title": "Skylit Dev I/O",
+      "properties": {
+        "skylit.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically connect when WordPress is detected in workspace"
+        },
+        "skylit.debounceMs": {
+          "type": "number",
+          "default": 500,
+          "description": "Debounce delay for file changes in milliseconds (prevent rapid sync on every keystroke)"
+        },
+        "skylit.showNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show sync success/error notifications"
+        },
+        "skylit.siteUrl": {
+          "type": "string",
+          "default": "",
+          "description": "WordPress site URL (auto-detected from wp-config.php if empty)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "chokidar": "^3.5.3",
+    "axios": "^1.6.0"
+  }
+}

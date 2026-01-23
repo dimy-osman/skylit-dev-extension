@@ -1,0 +1,26 @@
+# Compiled output
+out/
+*.vsix
+
+# Dependencies
+node_modules/
+
+# IDE
+.vscode/
+.vscode-test/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.log
+npm-debug.log*
+
+# Temporary files
+*.tmp
+*.temp
+
+# Development docs (optional - remove these lines if you want to include them)
+BUILD-COMPLETE.md
+IMPLEMENTATION-COMPLETE.md

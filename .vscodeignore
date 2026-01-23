@@ -1,0 +1,28 @@
+# Source files
+src/**
+tsconfig.json
+.eslintrc.json
+
+# Build files
+*.vsix
+
+# Development documentation
+BUILD-COMPLETE.md
+IMPLEMENTATION-COMPLETE.md
+
+# Dependencies (not needed at runtime)
+node_modules/**
+!node_modules/chokidar/**
+!node_modules/axios/**
+
+# Git
+.git
+.gitignore
+
+# Editor
+.vscode/**
+.vscode-test/**
+
+# Misc
+*.map
+.DS_Store
