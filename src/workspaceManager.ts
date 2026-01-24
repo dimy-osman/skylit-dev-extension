@@ -56,6 +56,16 @@ export class WorkspaceManager {
 
         this.outputChannel.appendLine(`   ✅ Found WordPress root: ${wpRoot}`);
 
+        // Check if Skylit plugin is installed
+        const isSkylitInstalled = await this.checkSkylitPlugin(wpRoot);
+        if (!isSkylitInstalled) {
+            this.outputChannel.appendLine(`   ⚠️ Skylit.DEV plugin not found or not activated`);
+            this.outputChannel.appendLine(`   ℹ️ Please install and activate the Skylit.DEV plugin in WordPress`);
+            return null;
+        }
+
+        this.outputChannel.appendLine(`   ✅ Skylit.DEV plugin detected and active!`);
+
         try {
             const wpConfigPath = path.join(wpRoot, 'wp-config.php');
             const config = await this.parseWpConfig(wpConfigPath);
@@ -78,6 +88,7 @@ export class WorkspaceManager {
     private findWordPressInSubdirectories(startPath: string): string | null {
         // Common WordPress subdirectory patterns
         const commonPaths = [
+            'public_html',      // Hostinger, cPanel, most shared hosts
             'public',           // Valet, Forge
             'app/public',       // LocalWP
             'htdocs',           // XAMPP
@@ -99,6 +110,47 @@ export class WorkspaceManager {
         }
         
         return null;
+    }
+
+    /**
+     * Check if Skylit.DEV plugin is installed and activated
+     */
+    private async checkSkylitPlugin(wpRoot: string): Promise<boolean> {
+        // Check for plugin file in multiple possible locations
+        const pluginPaths = [
+            path.join(wpRoot, 'wp-content', 'plugins', 'skylit-dev', 'skylit-dev-ui.php'),
+            path.join(wpRoot, 'wp-content', 'plugins', 'skylit-dev-ui', 'skylit-dev-ui.php'),
+            path.join(wpRoot, 'wp-content', 'plugins', 'skylit', 'skylit-dev-ui.php'),
+        ];
+
+        for (const pluginPath of pluginPaths) {
+            if (fs.existsSync(pluginPath)) {
+                this.outputChannel.appendLine(`   🔌 Found plugin file: ${pluginPath}`);
+                
+                // Read plugin file to check if it's the right one
+                try {
+                    const content = fs.readFileSync(pluginPath, 'utf8');
+                    
+                    // Verify it's actually the Skylit plugin
+                    if (content.includes('Plugin Name: Skylit.DEV') || 
+                        content.includes('Skylit Dev UI') ||
+                        content.includes('SKYLIT_DEV_UI_VERSION')) {
+                        
+                        // Extract version if available
+                        const versionMatch = content.match(/Version:\s*([0-9.]+)/i);
+                        if (versionMatch) {
+                            this.outputChannel.appendLine(`   ℹ️ Plugin version: ${versionMatch[1]}`);
+                        }
+                        
+                        return true;
+                    }
+                } catch (error: any) {
+                    this.outputChannel.appendLine(`   ⚠️ Could not read plugin file: ${error.message}`);
+                }
+            }
+        }
+
+        return false;
     }
 
     /**

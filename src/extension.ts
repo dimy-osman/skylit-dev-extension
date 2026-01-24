@@ -45,14 +45,41 @@ export async function activate(context: vscode.ExtensionContext) {
     const sites = await workspaceManager.detectWordPressSites();
     
     if (sites.length === 0) {
-        outputChannel.appendLine('⚠️ No WordPress sites detected in workspace');
-        statusBar.updateStatus('disconnected', 'No WordPress detected');
+        outputChannel.appendLine('⚠️ No WordPress sites with Skylit.DEV plugin detected');
+        outputChannel.appendLine('ℹ️ Make sure:');
+        outputChannel.appendLine('   1. WordPress is in your workspace (or in a subdirectory like public_html/)');
+        outputChannel.appendLine('   2. Skylit.DEV plugin is installed and activated');
+        statusBar.updateStatus('disconnected', 'No Skylit.DEV detected');
+        
+        // Show helpful notification
+        vscode.window.showWarningMessage(
+            'Skylit.DEV plugin not detected. Install and activate the plugin in WordPress.',
+            'Learn More'
+        ).then(selection => {
+            if (selection === 'Learn More') {
+                vscode.env.openExternal(vscode.Uri.parse('https://skylit.dev/docs/getting-started'));
+            }
+        });
+        
         return;
     }
 
-    outputChannel.appendLine(`✅ Detected ${sites.length} WordPress site(s)`);
+    outputChannel.appendLine(`✅ Detected ${sites.length} WordPress site(s) with Skylit.DEV plugin`);
     sites.forEach(site => {
         outputChannel.appendLine(`   - ${site.name}: ${site.siteUrl}`);
+    });
+
+    // Show success notification
+    vscode.window.showInformationMessage(
+        `🎉 Skylit.DEV plugin detected! Configure auth token to start syncing.`,
+        'Setup Token',
+        'Connect Now'
+    ).then(selection => {
+        if (selection === 'Setup Token') {
+            vscode.commands.executeCommand('skylit.setupToken');
+        } else if (selection === 'Connect Now') {
+            vscode.commands.executeCommand('skylit.connect');
+        }
     });
 
     // Check auto-connect setting
