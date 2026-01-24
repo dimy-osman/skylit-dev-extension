@@ -2,6 +2,37 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.3.1] - 2026-01-24
+
+### Fixed
+- **🌍 Cross-platform compatibility**: Extension now works on Windows, macOS, Linux, and remote SSH servers
+- **📦 Webpack bundling**: All dependencies now bundled into single JavaScript file (no more "Cannot find module" errors)
+- **🍎 macOS support**: `fsevents` marked as optional dependency, gracefully skipped on Windows/Linux
+- **🔧 TypeScript configuration**: Fixed module resolution for proper dependency imports
+
+### Changed
+- **BREAKING**: Extension main entry point changed from `./out/extension.js` to `./dist/extension.js`
+- Build system switched from TypeScript compiler to Webpack
+- All dependencies (chokidar, axios, readdirp, etc.) now bundled into 354KB single file
+- VSIX package reduced from multiple files + node_modules to single bundled JavaScript file
+
+### Technical Improvements
+- Added webpack configuration for production builds
+- Configured webpack to handle platform-specific dependencies
+- Updated `.vscodeignore` to exclude source files and node_modules
+- Bundle includes all transitive dependencies (no external dependencies needed)
+- Extension now truly system-agnostic and SSH-friendly
+
+### Documentation
+- **📖 Completely rewritten README**: Now includes detailed technical explanations
+- Added architecture diagrams and component breakdowns
+- Included timeline explanations of sync operations
+- Added troubleshooting section with common issues
+- Documented debouncing, folder detection, and API flow
+- Added performance metrics and cross-platform notes
+
+---
+
 ## [1.3.0] - 2026-01-19
 
 ### Added

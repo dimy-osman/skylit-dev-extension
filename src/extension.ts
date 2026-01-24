@@ -117,6 +117,40 @@ export function deactivate() {
  * Register command palette actions
  */
 function registerCommands(context: vscode.ExtensionContext) {
+    // Scan for WordPress command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('skylit.scanWorkspace', async () => {
+            outputChannel.show(); // Show output channel
+            outputChannel.appendLine('🔍 Manual WordPress scan triggered...');
+            
+            const sites = await workspaceManager.detectWordPressSites();
+            
+            if (sites.length === 0) {
+                vscode.window.showWarningMessage(
+                    'No WordPress sites with Skylit.DEV plugin found. Check Output panel for details.',
+                    'View Output'
+                ).then(selection => {
+                    if (selection === 'View Output') {
+                        outputChannel.show();
+                    }
+                });
+                return;
+            }
+
+            vscode.window.showInformationMessage(
+                `Found ${sites.length} WordPress site(s) with Skylit.DEV plugin!`,
+                'Connect Now',
+                'Setup Token'
+            ).then(selection => {
+                if (selection === 'Connect Now') {
+                    vscode.commands.executeCommand('skylit.connect');
+                } else if (selection === 'Setup Token') {
+                    vscode.commands.executeCommand('skylit.setupToken');
+                }
+            });
+        })
+    );
+
     // Connect command
     context.subscriptions.push(
         vscode.commands.registerCommand('skylit.connect', async () => {
@@ -219,10 +253,11 @@ function registerCommands(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('skylit.showMenu', async () => {
             const items = [
-                { label: '🔌 Connect to WordPress', command: 'skylit.connect' },
-                { label: '🔑 Setup Auth Token', command: 'skylit.setupToken' },
-                { label: '🔄 Sync Current File', command: 'skylit.syncNow' },
-                { label: '❌ Disconnect', command: 'skylit.disconnect' }
+                { label: '🔍 Scan for WordPress', command: 'skylit.scanWorkspace', description: 'Manually scan workspace for WordPress + Skylit plugin' },
+                { label: '🔌 Connect to WordPress', command: 'skylit.connect', description: 'Connect to detected WordPress site' },
+                { label: '🔑 Setup Auth Token', command: 'skylit.setupToken', description: 'Enter WordPress auth token' },
+                { label: '🔄 Sync Current File', command: 'skylit.syncNow', description: 'Force sync the active file' },
+                { label: '❌ Disconnect', command: 'skylit.disconnect', description: 'Disconnect from WordPress' }
             ];
 
             const choice = await vscode.window.showQuickPick(items, {
@@ -273,7 +308,7 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext) {
         if (!isValid) {
             outputChannel.appendLine('❌ Invalid auth token');
             vscode.window.showErrorMessage(
-                'Invalid auth token. Please generate a new one in WordPress Admin → Skylit → About'
+                'Invalid auth token. Please generate a new one in WordPress Admin → Skylit.DEV → Dev Sync'
             );
             statusBar.updateStatus('error', 'Invalid token');
             return;
@@ -290,7 +325,7 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext) {
         if (!status.dev_path || status.dev_path.trim() === '') {
             outputChannel.appendLine('❌ WordPress did not provide a dev folder path');
             vscode.window.showErrorMessage(
-                'Dev folder not configured in WordPress. Please set it in Admin → Skylit → Dev Sync'
+                'Dev folder not configured in WordPress. Please set it in Admin → Skylit.DEV → Dev Sync'
             );
             statusBar.updateStatus('error', 'Dev folder not configured');
             return;

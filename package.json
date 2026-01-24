@@ -2,12 +2,15 @@
   "name": "skylit-dev-io",
   "displayName": "Skylit.DEV I/O - WordPress Sync",
   "description": "Instant sync between WordPress Gutenberg and your IDE. Solves WP Cron unreliability on local development.",
-  "version": "1.3.0",
+  "version": "1.3.2",
   "publisher": "dimy-osman",
   "license": "GPL-2.0-or-later",
   "engines": {
     "vscode": "^1.80.0"
   },
+  "extensionKind": [
+    "workspace"
+  ],
   "categories": [
     "Other"
   ],
@@ -27,9 +30,13 @@
   "activationEvents": [
     "onStartupFinished"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "commands": [
+      {
+        "command": "skylit.scanWorkspace",
+        "title": "Skylit: Scan for WordPress"
+      },
       {
         "command": "skylit.connect",
         "title": "Skylit: Connect to WordPress"
@@ -78,9 +85,10 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack --mode development",
+    "watch": "webpack --watch --mode development",
+    "package": "webpack --mode production --devtool hidden-source-map",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js"
@@ -91,10 +99,16 @@
     "@typescript-eslint/eslint-plugin": "^6.0.0",
     "@typescript-eslint/parser": "^6.0.0",
     "eslint": "^8.0.0",
-    "typescript": "^5.0.0"
+    "ts-loader": "^9.5.4",
+    "typescript": "^5.0.0",
+    "webpack": "^5.104.1",
+    "webpack-cli": "^6.0.1"
   },
   "dependencies": {
-    "chokidar": "^3.5.3",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "chokidar": "^3.5.3"
+  },
+  "optionalDependencies": {
+    "fsevents": "^2.3.3"
   }
 }
