@@ -544,42 +544,18 @@ function startJumpPolling() {
             
             if (jumpData.pending && jumpData.file && jumpData.line) {
                 outputChannel.appendLine(`📍 Jump request received: ${jumpData.file}:${jumpData.line}`);
+                outputChannel.appendLine(`   Current dev path from WordPress: ${currentDevPath}`);
                 outputChannel.appendLine(`   Attempting to open file...`);
                 
-                // Convert absolute server path to workspace-relative path
-                // WordPress sends: /home/u826687906/.../sirc-dev-root/post-types/pages/...
-                // We need: workspace-relative path to the file
-                let localFilePath = jumpData.file;
-                
-                if (currentDevPath) {
-                    // Normalize paths to use forward slashes
-                    const serverDevPath = currentDevPath.replace(/\\/g, '/');
-                    const serverFilePath = jumpData.file.replace(/\\/g, '/');
-                    
-                    outputChannel.appendLine(`   Server dev path: ${serverDevPath}`);
-                    outputChannel.appendLine(`   Server file path: ${serverFilePath}`);
-                    
-                    // If the file path starts with the dev path, extract the relative part
-                    if (serverFilePath.startsWith(serverDevPath)) {
-                        const relativePath = serverFilePath.substring(serverDevPath.length);
-                        outputChannel.appendLine(`   Relative path: ${relativePath}`);
-                        
-                        // Get workspace folder
-                        const workspaceFolders = vscode.workspace.workspaceFolders;
-                        if (workspaceFolders && workspaceFolders.length > 0) {
-                            // Construct workspace-relative path
-                            localFilePath = vscode.Uri.joinPath(workspaceFolders[0].uri, relativePath.replace(/^\/+/, '')).fsPath;
-                            outputChannel.appendLine(`   Local file path: ${localFilePath}`);
-                        }
-                    }
-                }
-                
-                // Open file in editor
-                const fileUri = vscode.Uri.file(localFilePath);
-                outputChannel.appendLine(`   File URI: ${fileUri.fsPath}`);
+                // WordPress sends the absolute path to the file
+                // For remote workspaces (SSH), use the path directly
+                // For local workspaces, we need to map it to the local dev folder
+                const fileUri = vscode.Uri.file(jumpData.file);
+                outputChannel.appendLine(`   File URI: ${fileUri.toString()}`);
+                outputChannel.appendLine(`   File path: ${fileUri.fsPath}`);
                 
                 const document = await vscode.workspace.openTextDocument(fileUri);
-                outputChannel.appendLine(`   Document opened: ${document.fileName}`);
+                outputChannel.appendLine(`   ✅ Document opened: ${document.fileName}`);
                 
                 // Show document with cursor at specified line
                 const editor = await vscode.window.showTextDocument(document, {
@@ -591,7 +567,7 @@ function startJumpPolling() {
                     ),
                     viewColumn: vscode.ViewColumn.One
                 });
-                outputChannel.appendLine(`   Editor opened`);
+                outputChannel.appendLine(`   ✅ Editor opened, showing line ${jumpData.line}`);
                 
                 // Reveal line at center of viewport
                 editor.revealRange(
@@ -599,7 +575,7 @@ function startJumpPolling() {
                     vscode.TextEditorRevealType.InCenter
                 );
                 
-                outputChannel.appendLine(`✅ Jumped to ${jumpData.file}:${jumpData.line}`);
+                outputChannel.appendLine(`✅ Successfully jumped to ${jumpData.file}:${jumpData.line}`);
             }
         } catch (error: any) {
             // Log actual errors (not just "no pending jumps")
