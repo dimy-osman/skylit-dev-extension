@@ -52,6 +52,13 @@ export class AuthManager {
     }
 
     /**
+     * Clear auth token (alias for deleteToken)
+     */
+    async clearToken(siteUrl: string): Promise<void> {
+        await this.deleteToken(siteUrl);
+    }
+
+    /**
      * Generate storage key from site URL
      */
     private getStorageKey(siteUrl: string): string {

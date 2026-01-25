@@ -36,8 +36,10 @@ export class StatusBar {
 
         switch (state) {
             case 'disconnected':
-                this.statusBarItem.text = '$(plug) Skylit.DEV I/O';
-                this.statusBarItem.backgroundColor = undefined;
+                this.statusBarItem.text = '$(circle-slash) Skylit.DEV I/O';
+                this.statusBarItem.backgroundColor = new vscode.ThemeColor(
+                    'statusBarItem.errorBackground'
+                );
                 this.statusBarItem.tooltip = message || 'Skylit.DEV I/O: Click to connect to WordPress';
                 break;
 

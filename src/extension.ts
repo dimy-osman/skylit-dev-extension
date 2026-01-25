@@ -69,27 +69,26 @@ export async function activate(context: vscode.ExtensionContext) {
         outputChannel.appendLine(`   - ${site.name}: ${site.siteUrl}`);
     });
 
-    // Show success notification
-    vscode.window.showInformationMessage(
-        `🎉 Skylit.DEV plugin detected! Configure auth token to start syncing.`,
-        'Setup Token',
-        'Connect Now'
-    ).then(selection => {
-        if (selection === 'Setup Token') {
-            vscode.commands.executeCommand('skylit.setupToken');
-        } else if (selection === 'Connect Now') {
-            vscode.commands.executeCommand('skylit.connect');
-        }
-    });
-
-    // Check auto-connect setting
+    // Check if auto-connect is enabled (default: true)
     const config = vscode.workspace.getConfiguration('skylit');
     const autoConnect = config.get<boolean>('autoConnect', true);
 
     if (autoConnect) {
-        await connectToWordPress(sites[0], context);
+        outputChannel.appendLine('🔄 Auto-connect enabled, attempting connection...');
+        
+        // Auto-connect to the first site (or let user choose if multiple)
+        const siteToConnect = sites[0];
+        
+        try {
+            await connectToWordPress(siteToConnect, context, true); // Pass true for isAutoConnect
+        } catch (error: any) {
+            outputChannel.appendLine(`⚠️ Auto-connect failed: ${error.message}`);
+            outputChannel.appendLine('💡 You can manually connect by clicking the status bar or running "Skylit: Connect"');
+            statusBar.updateStatus('disconnected', 'Auto-connect failed - Click to retry');
+        }
     } else {
-        statusBar.updateStatus('disconnected', 'Ready to connect');
+        outputChannel.appendLine('ℹ️ Auto-connect disabled in settings');
+        statusBar.updateStatus('disconnected', 'Click to connect to WordPress');
     }
 }
 
@@ -154,10 +153,19 @@ function registerCommands(context: vscode.ExtensionContext) {
     // Connect command
     context.subscriptions.push(
         vscode.commands.registerCommand('skylit.connect', async () => {
+            outputChannel.appendLine('🔌 Manual connection requested...');
+            
             const sites = await workspaceManager.detectWordPressSites();
             
             if (sites.length === 0) {
-                vscode.window.showErrorMessage('No WordPress sites found in workspace');
+                vscode.window.showErrorMessage(
+                    'No WordPress sites found in workspace',
+                    'Scan Workspace'
+                ).then(selection => {
+                    if (selection === 'Scan Workspace') {
+                        vscode.commands.executeCommand('skylit.scanWorkspace');
+                    }
+                });
                 return;
             }
 
@@ -172,7 +180,7 @@ function registerCommands(context: vscode.ExtensionContext) {
                 selectedSite = choice.site;
             }
 
-            await connectToWordPress(selectedSite, context);
+            await connectToWordPress(selectedSite, context, false); // Pass false for manual connection
         })
     );
 
@@ -252,20 +260,37 @@ function registerCommands(context: vscode.ExtensionContext) {
     // Show menu command
     context.subscriptions.push(
         vscode.commands.registerCommand('skylit.showMenu', async () => {
-            const items = [
-                { label: '🔍 Scan for WordPress', command: 'skylit.scanWorkspace', description: 'Manually scan workspace for WordPress + Skylit plugin' },
-                { label: '🔌 Connect to WordPress', command: 'skylit.connect', description: 'Connect to detected WordPress site' },
-                { label: '🔑 Setup Auth Token', command: 'skylit.setupToken', description: 'Enter WordPress auth token' },
-                { label: '🔄 Sync Current File', command: 'skylit.syncNow', description: 'Force sync the active file' },
-                { label: '❌ Disconnect', command: 'skylit.disconnect', description: 'Disconnect from WordPress' }
-            ];
+            // If disconnected or error, show quick connect options
+            if (statusBar['connectionState'] === 'disconnected' || statusBar['connectionState'] === 'error') {
+                const items = [
+                    { label: '🔌 Connect to WordPress', command: 'skylit.connect', description: 'Connect to detected WordPress site' },
+                    { label: '🔑 Setup Auth Token', command: 'skylit.setupToken', description: 'Enter WordPress auth token' },
+                    { label: '🔍 Scan for WordPress', command: 'skylit.scanWorkspace', description: 'Manually scan workspace for WordPress + Skylit plugin' },
+                ];
 
-            const choice = await vscode.window.showQuickPick(items, {
-                placeHolder: 'Skylit.DEV I/O Actions'
-            });
+                const choice = await vscode.window.showQuickPick(items, {
+                    placeHolder: 'Skylit.DEV I/O - Not Connected'
+                });
 
-            if (choice) {
-                vscode.commands.executeCommand(choice.command);
+                if (choice) {
+                    vscode.commands.executeCommand(choice.command);
+                }
+            } else {
+                // Connected - show all actions
+                const items = [
+                    { label: '🔄 Sync Current File', command: 'skylit.syncNow', description: 'Force sync the active file' },
+                    { label: '❌ Disconnect', command: 'skylit.disconnect', description: 'Disconnect from WordPress' },
+                    { label: '🔍 Scan for WordPress', command: 'skylit.scanWorkspace', description: 'Manually scan workspace for WordPress + Skylit plugin' },
+                    { label: '🔑 Setup Auth Token', command: 'skylit.setupToken', description: 'Enter WordPress auth token' },
+                ];
+
+                const choice = await vscode.window.showQuickPick(items, {
+                    placeHolder: 'Skylit.DEV I/O Actions'
+                });
+
+                if (choice) {
+                    vscode.commands.executeCommand(choice.command);
+                }
             }
         })
     );
@@ -274,16 +299,69 @@ function registerCommands(context: vscode.ExtensionContext) {
 /**
  * Connect to WordPress site
  */
-async function connectToWordPress(site: any, context: vscode.ExtensionContext) {
+async function connectToWordPress(site: any, context: vscode.ExtensionContext, isAutoConnect: boolean = false) {
     outputChannel.appendLine(`🔌 Connecting to ${site.name}...`);
     statusBar.updateStatus('connecting', 'Connecting...');
 
     try {
+        // Check if site URL is localhost and prompt for actual URL
+        let siteUrl = site.siteUrl;
+        if (siteUrl === 'http://localhost' || siteUrl === 'https://localhost') {
+            outputChannel.appendLine(`⚠️ Default localhost URL detected`);
+            
+            // Don't prompt during auto-connect, just fail gracefully
+            if (isAutoConnect) {
+                outputChannel.appendLine('💡 Please set "skylit.siteUrl" in VS Code settings');
+                statusBar.updateStatus('disconnected', 'Configure site URL');
+                return;
+            }
+            
+            // Prompt user for actual URL
+            const userUrl = await vscode.window.showInputBox({
+                prompt: 'Enter your WordPress site URL',
+                placeHolder: 'https://palegreen-capybara-849923.hostingersite.com',
+                value: siteUrl,
+                ignoreFocusOut: true
+            });
+            
+            if (!userUrl || userUrl.trim() === '') {
+                statusBar.updateStatus('disconnected', 'Connection cancelled');
+                return;
+            }
+            
+            siteUrl = userUrl.trim().replace(/\/$/, '');
+            site.siteUrl = siteUrl;
+            outputChannel.appendLine(`✅ Using URL: ${siteUrl}`);
+            
+            // Save to settings for future use
+            const vscodeConfig = vscode.workspace.getConfiguration('skylit');
+            await vscodeConfig.update('siteUrl', siteUrl, vscode.ConfigurationTarget.Workspace);
+        }
+
         // Check for saved token
         let token = await authManager.getToken(site.siteUrl);
         
         if (!token) {
             outputChannel.appendLine('⚠️ No auth token found');
+            
+            // Don't prompt during auto-connect, just fail gracefully
+            if (isAutoConnect) {
+                outputChannel.appendLine('💡 Run "Skylit: Setup Auth Token" or click the status bar to connect');
+                statusBar.updateStatus('disconnected', 'No auth token - Click to setup');
+                
+                // Show a non-intrusive info message
+                vscode.window.showInformationMessage(
+                    'Skylit.DEV: Auth token required',
+                    'Setup Token',
+                    'Dismiss'
+                ).then(selection => {
+                    if (selection === 'Setup Token') {
+                        vscode.commands.executeCommand('skylit.setupToken');
+                    }
+                });
+                return;
+            }
+            
             const input = await vscode.window.showInputBox({
                 prompt: `Enter auth token for ${site.name}`,
                 placeHolder: 'skylit_abc123...',
@@ -307,9 +385,34 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext) {
         const isValid = await restClient.validateToken();
         if (!isValid) {
             outputChannel.appendLine('❌ Invalid auth token');
+            
+            // Clear the invalid token
+            await authManager.clearToken(site.siteUrl);
+            
+            if (isAutoConnect) {
+                outputChannel.appendLine('💡 Token is invalid or expired. Please setup a new token.');
+                statusBar.updateStatus('error', 'Invalid token - Click to setup');
+                
+                vscode.window.showWarningMessage(
+                    'Skylit.DEV: Auth token is invalid or expired',
+                    'Setup New Token',
+                    'Dismiss'
+                ).then(selection => {
+                    if (selection === 'Setup New Token') {
+                        vscode.commands.executeCommand('skylit.setupToken');
+                    }
+                });
+                return;
+            }
+            
             vscode.window.showErrorMessage(
-                'Invalid auth token. Please generate a new one in WordPress Admin → Skylit.DEV → Dev Sync'
-            );
+                'Invalid auth token. Please generate a new one in WordPress Admin → Skylit.DEV → Dev Sync',
+                'Setup Token'
+            ).then(selection => {
+                if (selection === 'Setup Token') {
+                    vscode.commands.executeCommand('skylit.setupToken');
+                }
+            });
             statusBar.updateStatus('error', 'Invalid token');
             return;
         }
@@ -441,10 +544,14 @@ function startJumpPolling() {
             
             if (jumpData.pending && jumpData.file && jumpData.line) {
                 outputChannel.appendLine(`📍 Jump request received: ${jumpData.file}:${jumpData.line}`);
+                outputChannel.appendLine(`   Attempting to open file...`);
                 
                 // Open file in editor
                 const fileUri = vscode.Uri.file(jumpData.file);
+                outputChannel.appendLine(`   File URI: ${fileUri.fsPath}`);
+                
                 const document = await vscode.workspace.openTextDocument(fileUri);
+                outputChannel.appendLine(`   Document opened: ${document.fileName}`);
                 
                 // Show document with cursor at specified line
                 const editor = await vscode.window.showTextDocument(document, {
@@ -456,6 +563,7 @@ function startJumpPolling() {
                     ),
                     viewColumn: vscode.ViewColumn.One
                 });
+                outputChannel.appendLine(`   Editor opened`);
                 
                 // Reveal line at center of viewport
                 editor.revealRange(
@@ -466,7 +574,10 @@ function startJumpPolling() {
                 outputChannel.appendLine(`✅ Jumped to ${jumpData.file}:${jumpData.line}`);
             }
         } catch (error: any) {
-            // Silently fail - most polls will have no pending jumps
+            // Log actual errors (not just "no pending jumps")
+            if (error.message && !error.message.includes('No pending') && !error.message.includes('404')) {
+                outputChannel.appendLine(`⚠️ Jump error: ${error.message}`);
+            }
         }
     }, 500); // Poll every 500ms for responsiveness
 }

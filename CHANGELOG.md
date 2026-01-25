@@ -2,6 +2,21 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.3.4] - 2026-01-24
+
+### Changed
+- **🔕 No more auto-prompts on startup**: Extension no longer automatically shows connection dialogs when activated
+- **Manual connection workflow**: Extension now loads with red/disconnected status bar, waiting for user to click and initiate connection
+- **User-initiated URL/token prompts**: WordPress URL and auth token prompts only appear when user manually clicks "Connect to WordPress"
+- **Cleaner startup experience**: Extension silently detects WordPress sites and shows disconnected state without interrupting workflow
+
+### Improved
+- Better first-time user experience - no unexpected dialogs
+- More predictable connection flow
+- User is in full control of when to connect
+
+---
+
 ## [1.3.1] - 2026-01-24
 
 ### Fixed

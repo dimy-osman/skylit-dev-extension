@@ -345,21 +345,25 @@ _trash/pages/about_456/  ← Trashed location
 
 1. Open your WordPress project in VS Code/Cursor
 2. Extension auto-detects WordPress (searches for `wp-config.php`)
-3. Status bar shows: **"⏸️  Skylit: Disconnected"**
-4. Click status bar
-5. Choose **"Setup Auth Token"**
-6. Paste token from WordPress
-7. Status bar updates: **"✅ Skylit: Connected"**
+3. Status bar shows: **"🔴 Skylit.DEV I/O"** (red disconnected state)
+4. **When ready to connect**, click the red status bar
+5. Choose **"Connect to WordPress"**
+6. If prompted, enter your WordPress site URL
+7. Enter/paste auth token from WordPress
+8. Status bar updates: **"✅ Skylit.DEV I/O"** (green connected state)
 
 **What happens internally:**
 ```typescript
-1. Token stored: await context.secrets.store('skylit_token', token)
-2. Workspace scanned: find wp-config.php, extract site URL
-3. Dev folder located: find prj-dev-root/ relative to wp-config
-4. File watcher started: chokidar.watch(devFolder)
-5. Test connection: GET /wp-json/skylit/v1/health
-6. If success: status = "Connected"
+1. Workspace scanned: find wp-config.php, extract site URL
+2. User clicks "Connect to WordPress" → prompts appear
+3. Token stored: await context.secrets.store('skylit_token', token)
+4. Dev folder located: find prj-dev-root/ relative to wp-config
+5. File watcher started: chokidar.watch(devFolder)
+6. Test connection: GET /wp-json/skylit/v1/health
+7. If success: status = "Connected" (green)
 ```
+
+**New in v1.3.4:** Extension no longer auto-prompts on startup. It loads silently with a red disconnected status bar and waits for you to manually initiate connection.
 
 ---
 
@@ -371,7 +375,8 @@ Open VS Code Settings (Ctrl+,) and search for "Skylit":
 
 ```jsonc
 {
-  // Auto-connect when WordPress detected in workspace
+  // Auto-connect when WordPress detected in workspace (deprecated in v1.3.4)
+  // Connection is now always user-initiated via status bar click
   "skylit.autoConnect": true,
   
   // Milliseconds to wait after file change before syncing
@@ -383,6 +388,7 @@ Open VS Code Settings (Ctrl+,) and search for "Skylit":
   
   // Override auto-detected WordPress site URL
   // Leave empty to auto-detect from wp-config.php
+  // Set this to skip the URL prompt on first connection
   "skylit.siteUrl": ""
 }
 ```
