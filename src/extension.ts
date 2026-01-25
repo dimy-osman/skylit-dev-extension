@@ -545,14 +545,38 @@ function startJumpPolling() {
             if (jumpData.pending && jumpData.file && jumpData.line) {
                 outputChannel.appendLine(`📍 Jump request received: ${jumpData.file}:${jumpData.line}`);
                 outputChannel.appendLine(`   Current dev path from WordPress: ${currentDevPath}`);
-                outputChannel.appendLine(`   Attempting to open file...`);
                 
-                // WordPress sends the absolute path to the file
-                // For remote workspaces (SSH), use the path directly
-                // For local workspaces, we need to map it to the local dev folder
-                const fileUri = vscode.Uri.file(jumpData.file);
+                // Get workspace folders to determine if we're in a remote workspace
+                const workspaceFolders = vscode.workspace.workspaceFolders;
+                if (!workspaceFolders || workspaceFolders.length === 0) {
+                    outputChannel.appendLine(`   ❌ No workspace folder found`);
+                    return;
+                }
+                
+                const workspaceUri = workspaceFolders[0].uri;
+                outputChannel.appendLine(`   Workspace URI scheme: ${workspaceUri.scheme}`);
+                outputChannel.appendLine(`   Workspace path: ${workspaceUri.path}`);
+                
+                // For remote workspaces (SSH, WSL, etc.), construct URI with the same scheme
+                // For local workspaces, use file:// scheme
+                let fileUri: vscode.Uri;
+                
+                if (workspaceUri.scheme !== 'file') {
+                    // Remote workspace - use the workspace's URI scheme
+                    fileUri = vscode.Uri.from({
+                        scheme: workspaceUri.scheme,
+                        authority: workspaceUri.authority,
+                        path: jumpData.file
+                    });
+                    outputChannel.appendLine(`   Using remote URI scheme: ${workspaceUri.scheme}`);
+                } else {
+                    // Local workspace - use file:// scheme
+                    fileUri = vscode.Uri.file(jumpData.file);
+                    outputChannel.appendLine(`   Using local file scheme`);
+                }
+                
                 outputChannel.appendLine(`   File URI: ${fileUri.toString()}`);
-                outputChannel.appendLine(`   File path: ${fileUri.fsPath}`);
+                outputChannel.appendLine(`   Attempting to open file...`);
                 
                 const document = await vscode.workspace.openTextDocument(fileUri);
                 outputChannel.appendLine(`   ✅ Document opened: ${document.fileName}`);
