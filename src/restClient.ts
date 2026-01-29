@@ -178,6 +178,36 @@ export class RestClient {
     }
 
     /**
+     * Get block changes from last export
+     * Used to restore folding states for unchanged blocks
+     */
+    async getBlockChanges(postId: number): Promise<{
+        success: boolean;
+        post_id: number;
+        has_data: boolean;
+        blocks_changed?: number;
+        blocks_unchanged?: number;
+        changed_blocks?: Array<{
+            layoutBlockId: string;
+            blockName: string;
+            startLine: number;
+            endLine: number;
+        }>;
+        unchanged_blocks?: Array<{
+            layoutBlockId: string;
+            blockName: string;
+            startLine: number;
+            endLine: number;
+            whitespace_only?: boolean;
+        }>;
+        timestamp?: string;
+        file_unchanged?: boolean;
+    }> {
+        const response = await this.client.get(`/sync/block-changes/${postId}`);
+        return response.data;
+    }
+
+    /**
      * Sync theme.json from dev folder to active theme
      */
     async syncThemeJson(): Promise<{ success: boolean; message?: string }> {
@@ -294,6 +324,43 @@ export class RestClient {
     }
 
     /**
+     * Create an empty WordPress post and get the ID
+     * Used by AI to get the correct folder path BEFORE creating files
+     * This prevents the race condition where AI creates files in wrong folder
+     */
+    async createEmptyPost(
+        postType: string,
+        title: string,
+        slug: string
+    ): Promise<{
+        success: boolean;
+        post_id?: number;
+        folder_name?: string;
+        error?: string;
+    }> {
+        this.outputChannel.appendLine(`📄 Creating empty ${postType}: "${title}" (${slug})`);
+        
+        try {
+            const response = await this.client.post('/sync/create-empty-post', {
+                post_type: postType,
+                title: title,
+                slug: slug
+            });
+            
+            if (response.data.success) {
+                this.outputChannel.appendLine(
+                    `✅ Created: ${response.data.title} (ID: ${response.data.post_id})`
+                );
+            }
+            
+            return response.data;
+        } catch (error: any) {
+            this.outputChannel.appendLine(`❌ Create empty post failed: ${error.message}`);
+            throw error;
+        }
+    }
+
+    /**
      * Create a new post from a specific folder
      * Used when a new folder is detected in post-types directory
      */
@@ -405,6 +472,92 @@ export class RestClient {
         } catch (error: any) {
             this.outputChannel.appendLine(`❌ Metadata sync failed: ${error.message}`);
             throw error;
+        }
+    }
+
+    /**
+     * Get folder rename notifications from plugin
+     * Called periodically to catch any renames that might have been missed
+     */
+    async getRenameNotifications(
+        since?: number,
+        clear: boolean = false
+    ): Promise<{
+        success: boolean;
+        notifications: Array<{
+            type: string;
+            old_folder: string;
+            new_folder: string;
+            post_id: number;
+            post_type: string;
+            timestamp: number;
+            message: string;
+        }>;
+        count: number;
+        timestamp: number;
+    }> {
+        try {
+            const params: Record<string, any> = {};
+            if (since !== undefined) {
+                params.since = since;
+            }
+            if (clear) {
+                params.clear = true;
+            }
+            
+            const response = await this.client.get('/sync/rename-notifications', { params });
+            
+            if (response.data.count > 0) {
+                this.outputChannel.appendLine(
+                    `📁 ${response.data.count} rename notification(s) received`
+                );
+            }
+            
+            return response.data;
+        } catch (error: any) {
+            // Don't log error for this - it's just a polling endpoint
+            return {
+                success: false,
+                notifications: [],
+                count: 0,
+                timestamp: Date.now() / 1000
+            };
+        }
+    }
+
+    /**
+     * Process pending folder renames on the server
+     * Triggers retry of any failed folder renames
+     */
+    async processPendingRenames(): Promise<{
+        success: boolean;
+        results: {
+            processed: number;
+            success: number;
+            failed: number;
+            removed?: number;
+        };
+        message: string;
+    }> {
+        this.outputChannel.appendLine('🔄 Processing pending folder renames...');
+        
+        try {
+            const response = await this.client.post('/sync/process-pending-renames');
+            
+            if (response.data.results.success > 0) {
+                this.outputChannel.appendLine(
+                    `✅ ${response.data.results.success} pending rename(s) completed`
+                );
+            }
+            
+            return response.data;
+        } catch (error: any) {
+            this.outputChannel.appendLine(`⚠️ Could not process pending renames: ${error.message}`);
+            return {
+                success: false,
+                results: { processed: 0, success: 0, failed: 0 },
+                message: error.message
+            };
         }
     }
 

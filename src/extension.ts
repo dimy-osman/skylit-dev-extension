@@ -257,6 +257,107 @@ function registerCommands(context: vscode.ExtensionContext) {
         })
     );
 
+    // Create post command - for AI-assisted development
+    // AI calls this FIRST to get the correct folder path before creating files
+    context.subscriptions.push(
+        vscode.commands.registerCommand('skylit.createPost', async (args?: { title?: string; slug?: string; postType?: string }) => {
+            if (!restClient) {
+                outputChannel.appendLine('❌ [createPost] Not connected to WordPress');
+                return { success: false, error: 'Not connected to WordPress' };
+            }
+
+            if (!currentDevPath) {
+                outputChannel.appendLine('❌ [createPost] Dev path not available');
+                return { success: false, error: 'Dev path not available' };
+            }
+
+            // Get parameters from args or prompt user
+            let title = args?.title;
+            let slug = args?.slug;
+            let postType = args?.postType || 'page';
+
+            if (!title) {
+                title = await vscode.window.showInputBox({
+                    prompt: 'Enter page/post title',
+                    placeHolder: 'My New Page'
+                });
+                if (!title) {
+                    return { success: false, error: 'Title is required' };
+                }
+            }
+
+            if (!slug) {
+                // Generate slug from title
+                slug = title.toLowerCase()
+                    .replace(/[^a-z0-9\s-]/g, '')
+                    .replace(/\s+/g, '-')
+                    .replace(/-+/g, '-')
+                    .trim();
+            }
+
+            outputChannel.appendLine(`📄 [createPost] Creating ${postType}: "${title}" (${slug})`);
+
+            try {
+                // Create empty post in WordPress to get the ID
+                const response = await restClient.createEmptyPost(postType, title, slug);
+
+                if (response.success && response.post_id) {
+                    const folderName = `${slug}_${response.post_id}`;
+                    const postTypeFolder = postType === 'page' ? 'pages' : postType === 'post' ? 'posts' : postType + 's';
+                    const folderPath = `post-types/${postTypeFolder}/${folderName}`;
+                    const fullPath = `${currentDevPath.replace(/\\/g, '/')}/${folderPath}`;
+
+                    outputChannel.appendLine(`✅ [createPost] Created ${postType} ID: ${response.post_id}`);
+                    outputChannel.appendLine(`   Folder path: ${folderPath}`);
+                    outputChannel.appendLine(`   Full path: ${fullPath}`);
+
+                    // Write result to file for AI to read
+                    const resultFile = `${currentDevPath}/.skylit/last-created-post.json`;
+                    const resultData = {
+                        success: true,
+                        post_id: response.post_id,
+                        post_type: postType,
+                        title: title,
+                        slug: slug,
+                        folder_name: folderName,
+                        folder_path: folderPath,
+                        full_path: fullPath,
+                        html_file: `${fullPath}/${folderName}.html`,
+                        css_file: `${fullPath}/${folderName}.css`,
+                        created_at: new Date().toISOString()
+                    };
+
+                    // Ensure .skylit folder exists
+                    const skylitDir = vscode.Uri.file(`${currentDevPath}/.skylit`);
+                    try {
+                        await vscode.workspace.fs.stat(skylitDir);
+                    } catch {
+                        await vscode.workspace.fs.createDirectory(skylitDir);
+                    }
+
+                    // Write result file
+                    await vscode.workspace.fs.writeFile(
+                        vscode.Uri.file(resultFile),
+                        Buffer.from(JSON.stringify(resultData, null, 2), 'utf8')
+                    );
+
+                    // Show notification
+                    vscode.window.showInformationMessage(
+                        `✅ Created ${postType}: ${title} → ${folderName}`
+                    );
+
+                    return resultData;
+                } else {
+                    outputChannel.appendLine(`❌ [createPost] Failed: ${response.error}`);
+                    return { success: false, error: response.error };
+                }
+            } catch (error: any) {
+                outputChannel.appendLine(`❌ [createPost] Error: ${error.message}`);
+                return { success: false, error: error.message };
+            }
+        })
+    );
+
     // Show menu command
     context.subscriptions.push(
         vscode.commands.registerCommand('skylit.showMenu', async () => {
