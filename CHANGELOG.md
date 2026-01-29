@@ -2,6 +2,14 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.9.10] - 2026-01-29
+
+### Fixed
+- **🔄 Check Order Fix**: Duplicate detection now runs BEFORE "already processed" check
+  - Was: `processedNewFolders` check ran first, skipping before duplicate check
+  - Now: `recentlyRenamedFolders` check runs first, triggering redirect/cleanup
+  - Ensures duplicate folders are merged/deleted even if folder was marked processed
+
 ## [1.9.9] - 2026-01-29
 
 ### Fixed

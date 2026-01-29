@@ -1184,13 +1184,8 @@ export class FileWatcher {
             return;
         }
         
-        // Skip if already processed
-        if (this.processedNewFolders.has(normalizedPath)) {
-            this.outputChannel.appendLine(`🔍 [New Folder] Skipping - already processed: ${folderName}`);
-            return;
-        }
-        
-        // Check if this folder was recently renamed (AI recreated old folder)
+        // IMPORTANT: Check for duplicates FIRST, before "already processed" check
+        // This handles the case where WordPress recreates the old folder after we renamed it
         const recentRename = this.recentlyRenamedFolders.get(folderName);
         if (recentRename) {
             const ageMs = Date.now() - recentRename.timestamp;
@@ -1199,16 +1194,19 @@ export class FileWatcher {
                 this.outputChannel.appendLine(`🔄 [Duplicate Prevention] "${folderName}" was recently renamed to "${recentRename.newFolder}"`);
                 this.outputChannel.appendLine(`   Redirecting to existing post (ID: ${recentRename.postId})`);
                 
-                // Mark as processed to prevent further attempts
-                this.processedNewFolders.add(normalizedPath);
-                
-                // Auto-redirect: rename this duplicate folder to match existing
+                // Auto-redirect: delete this duplicate folder and merge contents
                 this.redirectDuplicateFolder(normalizedPath, recentRename, postTypeFolder);
                 return;
             } else {
                 // Old entry, remove it
                 this.recentlyRenamedFolders.delete(folderName);
             }
+        }
+        
+        // Skip if already processed (but not if it's a duplicate - handled above)
+        if (this.processedNewFolders.has(normalizedPath)) {
+            this.outputChannel.appendLine(`🔍 [New Folder] Skipping - already processed: ${folderName}`);
+            return;
         }
         
         this.outputChannel.appendLine(`📁 New folder detected: ${relativePath}`);
