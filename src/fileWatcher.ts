@@ -251,6 +251,7 @@ export class FileWatcher {
     private lastFolderActionTime: Map<number, number> = new Map();
     private lastThemeSyncTime: Map<string, number> = new Map(); // Track theme file syncs
     private processedNewFolders: Set<string> = new Set(); // Track folders we've already processed
+    private recentlyRenamedFolders: Map<string, { newFolder: string; postId: number; timestamp: number }> = new Map(); // Track old→new renames to prevent duplicates
     private pendingRenames: Map<number, { oldPath: string; oldSlug: string; timestamp: number }> = new Map(); // Track folder renames
     private recentFolderDeletes: Map<number, { path: string; timestamp: number }> = new Map(); // Track recent deletes to detect server-side renames
     private pendingRestoreTimers: Map<number, NodeJS.Timeout> = new Map(); // Pending restore timers that can be cancelled
@@ -1189,6 +1190,27 @@ export class FileWatcher {
             return;
         }
         
+        // Check if this folder was recently renamed (AI recreated old folder)
+        const recentRename = this.recentlyRenamedFolders.get(folderName);
+        if (recentRename) {
+            const ageMs = Date.now() - recentRename.timestamp;
+            // If renamed within last 5 minutes, redirect to existing folder
+            if (ageMs < 5 * 60 * 1000) {
+                this.outputChannel.appendLine(`🔄 [Duplicate Prevention] "${folderName}" was recently renamed to "${recentRename.newFolder}"`);
+                this.outputChannel.appendLine(`   Redirecting to existing post (ID: ${recentRename.postId})`);
+                
+                // Mark as processed to prevent further attempts
+                this.processedNewFolders.add(normalizedPath);
+                
+                // Auto-redirect: rename this duplicate folder to match existing
+                this.redirectDuplicateFolder(normalizedPath, recentRename, postTypeFolder);
+                return;
+            } else {
+                // Old entry, remove it
+                this.recentlyRenamedFolders.delete(folderName);
+            }
+        }
+        
         this.outputChannel.appendLine(`📁 New folder detected: ${relativePath}`);
         
         // Debounce to wait for HTML file to be created
@@ -1265,6 +1287,15 @@ export class FileWatcher {
                 if (response.new_folder) {
                     const newFolderPath = this.devFolder.replace(/\\/g, '/') + '/' + response.new_folder;
                     this.processedNewFolders.add(newFolderPath);
+                    
+                    // Track the rename to prevent AI from recreating old folder
+                    const newFolderName = path.basename(response.new_folder);
+                    this.recentlyRenamedFolders.set(folderName, {
+                        newFolder: newFolderName,
+                        postId: response.post_id,
+                        timestamp: Date.now()
+                    });
+                    this.outputChannel.appendLine(`   📝 Tracking rename: "${folderName}" → "${newFolderName}" for duplicate prevention`);
                 }
                 
                 // Handle open editors - close old file and open new file
@@ -1346,6 +1377,79 @@ export class FileWatcher {
         } catch (error: any) {
             this.outputChannel.appendLine(`⚠️ Could not write notification file: ${error.message}`);
             // Non-critical - don't throw
+        }
+    }
+    
+    /**
+     * Redirect a duplicate folder (AI recreated old folder after rename)
+     * Moves content to existing folder and deletes duplicate
+     */
+    private async redirectDuplicateFolder(
+        duplicateFolderPath: string,
+        renameInfo: { newFolder: string; postId: number; timestamp: number },
+        postTypeFolder: string
+    ) {
+        try {
+            const oldFolderName = path.basename(duplicateFolderPath);
+            const targetFolderPath = duplicateFolderPath.replace(
+                `/${oldFolderName}`,
+                `/${renameInfo.newFolder}`
+            );
+            
+            this.outputChannel.appendLine(`🔄 [Redirect] Moving duplicate "${oldFolderName}" content to "${renameInfo.newFolder}"`);
+            
+            // Check if target folder exists
+            const targetExists = await vsExists(targetFolderPath);
+            if (!targetExists) {
+                this.outputChannel.appendLine(`⚠️ [Redirect] Target folder doesn't exist: ${renameInfo.newFolder}`);
+                return;
+            }
+            
+            // Read contents of duplicate folder
+            const duplicateContents = await vsReadDir(duplicateFolderPath);
+            
+            // Copy each file from duplicate to target (overwriting)
+            for (const [fileName, fileType] of duplicateContents) {
+                if (fileType === vscode.FileType.File) {
+                    const srcPath = posixJoin(duplicateFolderPath, fileName);
+                    // Rename files to match target folder name
+                    const newFileName = fileName.replace(
+                        new RegExp(`^${oldFolderName}`),
+                        renameInfo.newFolder
+                    );
+                    const destPath = posixJoin(targetFolderPath, newFileName);
+                    
+                    try {
+                        const content = await vsReadFile(srcPath);
+                        await vsWriteFile(destPath, content);
+                        this.outputChannel.appendLine(`   ✅ Merged: ${fileName} → ${newFileName}`);
+                    } catch (err: any) {
+                        this.outputChannel.appendLine(`   ⚠️ Could not merge ${fileName}: ${err.message}`);
+                    }
+                }
+            }
+            
+            // Delete the duplicate folder
+            try {
+                await vscode.workspace.fs.delete(pathToUri(duplicateFolderPath), { recursive: true });
+                this.outputChannel.appendLine(`🗑️ [Redirect] Deleted duplicate folder: ${oldFolderName}`);
+            } catch (deleteErr: any) {
+                this.outputChannel.appendLine(`⚠️ [Redirect] Could not delete duplicate folder: ${deleteErr.message}`);
+            }
+            
+            // Write notification so AI knows where the files went
+            await this.writePostCreationNotification({
+                post_id: renameInfo.postId,
+                new_folder: `post-types/${postTypeFolder}/${renameInfo.newFolder}`,
+                slug: renameInfo.newFolder.replace(/_\d+$/, '')
+            }, postTypeFolder === 'pages' ? 'page' : 'post');
+            
+            vscode.window.showInformationMessage(
+                `🔄 Merged duplicate folder "${oldFolderName}" into existing "${renameInfo.newFolder}"`
+            );
+            
+        } catch (error: any) {
+            this.outputChannel.appendLine(`❌ [Redirect] Failed to redirect duplicate folder: ${error.message}`);
         }
     }
     

@@ -2,6 +2,15 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.9.5] - 2026-01-29
+
+### Added
+- **🔄 Duplicate Prevention**: If AI recreates a folder that was just renamed, automatically merges it
+  - Tracks recent renames (old folder → new folder with ID)
+  - If old folder is recreated within 5 minutes, content is merged to existing folder
+  - Duplicate folder is deleted automatically
+  - AI can work continuously without waiting - extension handles redirects seamlessly
+
 ## [1.9.4] - 2026-01-29
 
 ### Added
