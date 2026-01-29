@@ -1274,32 +1274,37 @@ export class FileWatcher {
         this.statusBar.showSyncing(`Creating ${postType}...`);
         
         try {
-            const response = await this.restClient.createPostFromFolder(relativePath, postType);
+            // Pass skip_rename=true so IDE does the rename via VS Code API
+            // This ensures open editors (including AI's) are automatically updated
+            const response = await this.restClient.createPostFromFolder(relativePath, postType, true);
             
             if (response.success && response.post_id) {
                 this.statusBar.showSuccess(`Created: ${response.title}`);
                 this.outputChannel.appendLine(
                     `✅ Created ${postType} "${response.title}" (ID: ${response.post_id})`
                 );
-                this.outputChannel.appendLine(`   Folder renamed: ${response.old_folder} → ${response.new_folder}`);
+                
+                // Do the rename via VS Code API - this updates all open editors automatically!
+                const newFolderName = `${response.slug}_${response.post_id}`;
+                const newFolderPath = posixJoin(this.devFolder, `post-types/${postTypeFolder}/${newFolderName}`);
+                
+                await this.renameViaVSCode(folderPath, newFolderPath, folderName, newFolderName);
+                
+                this.outputChannel.appendLine(`   Folder renamed: ${folderName} → ${newFolderName}`);
                 
                 // Mark the new folder as processed too (so we don't try to create again)
-                if (response.new_folder) {
-                    const newFolderPath = this.devFolder.replace(/\\/g, '/') + '/' + response.new_folder;
-                    this.processedNewFolders.add(newFolderPath);
-                    
-                    // Track the rename to prevent AI from recreating old folder
-                    const newFolderName = path.basename(response.new_folder);
-                    this.recentlyRenamedFolders.set(folderName, {
-                        newFolder: newFolderName,
-                        postId: response.post_id,
-                        timestamp: Date.now()
-                    });
-                    this.outputChannel.appendLine(`   📝 Tracking rename: "${folderName}" → "${newFolderName}" for duplicate prevention`);
-                }
+                this.processedNewFolders.add(newFolderPath);
                 
-                // Handle open editors - close old file and open new file
-                await this.handleFileRename(folderPath, response.new_folder, response.post_id);
+                // Track the rename to prevent AI from recreating old folder
+                this.recentlyRenamedFolders.set(folderName, {
+                    newFolder: newFolderName,
+                    postId: response.post_id,
+                    timestamp: Date.now()
+                });
+                this.outputChannel.appendLine(`   📝 Tracking rename: "${folderName}" → "${newFolderName}" for duplicate prevention`);
+                
+                // Update response with actual new folder path for notification
+                response.new_folder = `post-types/${postTypeFolder}/${newFolderName}`;
                 
                 // Write notification for AI - same format as AI request flow
                 // This allows AI to know the new folder path after auto-rename
@@ -1321,6 +1326,187 @@ export class FileWatcher {
             this.outputChannel.appendLine(`❌ Failed to create post: ${error.message}`);
             this.processedNewFolders.delete(folderPath);
             vscode.window.showErrorMessage(`Failed to create ${postType}: ${error.message}`);
+        }
+    }
+    
+    /**
+     * Rename folder and files using VS Code's WorkspaceEdit API
+     * This ensures all open editors (including AI's) are automatically updated
+     */
+    private async renameViaVSCode(
+        oldFolderPath: string,
+        newFolderPath: string,
+        oldFolderName: string,
+        newFolderName: string
+    ) {
+        this.outputChannel.appendLine(`🔄 [VS Code Rename] ${oldFolderName} → ${newFolderName}`);
+        
+        try {
+            // Check if target folder already exists (server already renamed)
+            const targetExists = await vsExists(newFolderPath);
+            const sourceExists = await vsExists(oldFolderPath);
+            
+            if (targetExists && !sourceExists) {
+                // Server already renamed the folder - just rename files inside
+                this.outputChannel.appendLine(`   ℹ️ Target folder already exists (server renamed). Renaming files inside...`);
+                await this.renameFilesInFolder(newFolderPath, oldFolderName, newFolderName);
+                return;
+            }
+            
+            if (targetExists && sourceExists) {
+                // Both exist - merge source into target, then delete source
+                this.outputChannel.appendLine(`   ℹ️ Both folders exist. Merging...`);
+                await this.mergeAndRenameFolders(oldFolderPath, newFolderPath, oldFolderName, newFolderName);
+                return;
+            }
+            
+            if (!sourceExists) {
+                // Source doesn't exist - nothing to rename
+                this.outputChannel.appendLine(`   ⚠️ Source folder doesn't exist. Skipping rename.`);
+                return;
+            }
+            
+            // Normal case: rename folder using VS Code API
+            // First, rename the folder itself
+            const edit = new vscode.WorkspaceEdit();
+            edit.renameFile(
+                pathToUri(oldFolderPath),
+                pathToUri(newFolderPath),
+                { overwrite: false }
+            );
+            
+            const folderSuccess = await vscode.workspace.applyEdit(edit);
+            
+            if (folderSuccess) {
+                this.outputChannel.appendLine(`   ✅ Folder renamed via VS Code API`);
+                // Now rename files inside the new folder
+                await this.renameFilesInFolder(newFolderPath, oldFolderName, newFolderName);
+            } else {
+                this.outputChannel.appendLine(`   ⚠️ VS Code folder rename failed, trying fs.rename...`);
+                
+                // Fallback to filesystem rename
+                await vscode.workspace.fs.rename(
+                    pathToUri(oldFolderPath),
+                    pathToUri(newFolderPath),
+                    { overwrite: false }
+                );
+                
+                await this.renameFilesInFolder(newFolderPath, oldFolderName, newFolderName);
+            }
+            
+            this.outputChannel.appendLine(`✅ [VS Code Rename] Complete`);
+            
+        } catch (error: any) {
+            this.outputChannel.appendLine(`❌ [VS Code Rename] Error: ${error.message}`);
+            // Don't throw - the post was created successfully, rename is secondary
+            // The folder might already be renamed by the server (old plugin version)
+        }
+    }
+    
+    /**
+     * Rename files inside a folder to match the new folder name
+     */
+    private async renameFilesInFolder(
+        folderPath: string,
+        oldPrefix: string,
+        newPrefix: string
+    ) {
+        try {
+            const files = await vsReadDir(folderPath);
+            const edit = new vscode.WorkspaceEdit();
+            let hasRenames = false;
+            
+            for (const [fileName, fileType] of files) {
+                if (fileType === vscode.FileType.File && fileName.startsWith(oldPrefix)) {
+                    const newFileName = fileName.replace(oldPrefix, newPrefix);
+                    if (newFileName !== fileName) {
+                        const oldFilePath = posixJoin(folderPath, fileName);
+                        const newFilePath = posixJoin(folderPath, newFileName);
+                        
+                        edit.renameFile(
+                            pathToUri(oldFilePath),
+                            pathToUri(newFilePath),
+                            { overwrite: true }
+                        );
+                        
+                        this.outputChannel.appendLine(`   📄 ${fileName} → ${newFileName}`);
+                        hasRenames = true;
+                    }
+                }
+            }
+            
+            if (hasRenames) {
+                const success = await vscode.workspace.applyEdit(edit);
+                if (!success) {
+                    // Fallback to individual renames
+                    for (const [fileName, fileType] of files) {
+                        if (fileType === vscode.FileType.File && fileName.startsWith(oldPrefix)) {
+                            const newFileName = fileName.replace(oldPrefix, newPrefix);
+                            if (newFileName !== fileName) {
+                                const oldFilePath = posixJoin(folderPath, fileName);
+                                const newFilePath = posixJoin(folderPath, newFileName);
+                                await vscode.workspace.fs.rename(
+                                    pathToUri(oldFilePath),
+                                    pathToUri(newFilePath),
+                                    { overwrite: true }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (error: any) {
+            this.outputChannel.appendLine(`   ⚠️ File rename error: ${error.message}`);
+        }
+    }
+    
+    /**
+     * Merge source folder into target folder, renaming files as needed
+     */
+    private async mergeAndRenameFolders(
+        sourcePath: string,
+        targetPath: string,
+        oldPrefix: string,
+        newPrefix: string
+    ) {
+        try {
+            const sourceFiles = await vsReadDir(sourcePath);
+            
+            for (const [fileName, fileType] of sourceFiles) {
+                if (fileType === vscode.FileType.File) {
+                    const sourceFilePath = posixJoin(sourcePath, fileName);
+                    const newFileName = fileName.startsWith(oldPrefix) 
+                        ? fileName.replace(oldPrefix, newPrefix)
+                        : fileName;
+                    const targetFilePath = posixJoin(targetPath, newFileName);
+                    
+                    // Move file from source to target
+                    try {
+                        await vscode.workspace.fs.rename(
+                            pathToUri(sourceFilePath),
+                            pathToUri(targetFilePath),
+                            { overwrite: true }
+                        );
+                        this.outputChannel.appendLine(`   📄 Merged: ${fileName} → ${newFileName}`);
+                    } catch (e) {
+                        // File might already exist in target
+                    }
+                }
+            }
+            
+            // Delete empty source folder
+            try {
+                await vscode.workspace.fs.delete(pathToUri(sourcePath), { recursive: true });
+                this.outputChannel.appendLine(`   🗑️ Deleted source folder: ${path.basename(sourcePath)}`);
+            } catch (e) {
+                // Non-critical
+            }
+            
+            // Rename any remaining files in target with old prefix
+            await this.renameFilesInFolder(targetPath, oldPrefix, newPrefix);
+            
+        } catch (error: any) {
+            this.outputChannel.appendLine(`   ⚠️ Merge error: ${error.message}`);
         }
     }
     

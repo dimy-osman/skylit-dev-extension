@@ -366,7 +366,8 @@ export class RestClient {
      */
     async createPostFromFolder(
         folderPath: string,
-        postType: string
+        postType: string,
+        skipRename: boolean = true // Default to skip - IDE will do the rename via VS Code API
     ): Promise<{
         success: boolean;
         post_id?: number;
@@ -375,15 +376,17 @@ export class RestClient {
         slug?: string;
         old_folder?: string;
         new_folder?: string;
+        renamed_by_server?: boolean;
         message?: string;
         error?: string;
     }> {
-        this.outputChannel.appendLine(`📄 Creating post from folder: ${folderPath} (${postType})`);
+        this.outputChannel.appendLine(`📄 Creating post from folder: ${folderPath} (${postType}, skipRename: ${skipRename})`);
         
         try {
             const response = await this.client.post('/sync/create-post', {
                 folder_path: folderPath,
-                post_type: postType
+                post_type: postType,
+                skip_rename: skipRename
             });
             
             if (response.data.success) {

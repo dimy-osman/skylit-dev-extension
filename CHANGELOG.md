@@ -2,6 +2,30 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.9.7] - 2026-01-29
+
+### Fixed
+- **🔄 Robust Rename Handling**: Fixed rename logic to handle all edge cases
+  - Handles case where server already renamed (old WP plugin version)
+  - Handles case where both source and target exist (merge)
+  - Handles case where source doesn't exist (skip gracefully)
+  - Separates folder rename from file rename for reliability
+  - No longer throws errors - gracefully handles all scenarios
+
+## [1.9.6] - 2026-01-29
+
+### Changed
+- **🔄 VS Code Native Rename**: Extension now does the folder/file rename using VS Code's WorkspaceEdit API
+  - Open editors are automatically updated to the new file paths
+  - AI editing the file sees the rename happen seamlessly - no duplicate files!
+  - WordPress plugin returns post ID, extension handles the rename
+  - Uses `vscode.workspace.applyEdit()` with `renameFile` for atomic updates
+
+### Fixed
+- AI can now continuously edit without worrying about renamed files
+- No more "file not found" errors when folder is renamed
+- No more duplicate folders from AI recreating old paths
+
 ## [1.9.5] - 2026-01-29
 
 ### Added
