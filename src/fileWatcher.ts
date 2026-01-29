@@ -1288,20 +1288,20 @@ export class FileWatcher {
                 const newFolderName = `${response.slug}_${response.post_id}`;
                 const newFolderPath = posixJoin(this.devFolder, `post-types/${postTypeFolder}/${newFolderName}`);
                 
-                await this.renameViaVSCode(folderPath, newFolderPath, folderName, newFolderName);
-                
-                this.outputChannel.appendLine(`   Folder renamed: ${folderName} → ${newFolderName}`);
-                
-                // Mark the new folder as processed too (so we don't try to create again)
-                this.processedNewFolders.add(newFolderPath);
-                
-                // Track the rename to prevent AI from recreating old folder
+                // IMPORTANT: Track the rename BEFORE we start, so trash handler knows to skip it
                 this.recentlyRenamedFolders.set(folderName, {
                     newFolder: newFolderName,
                     postId: response.post_id,
                     timestamp: Date.now()
                 });
-                this.outputChannel.appendLine(`   📝 Tracking rename: "${folderName}" → "${newFolderName}" for duplicate prevention`);
+                this.outputChannel.appendLine(`   📝 Pre-tracking rename: "${folderName}" → "${newFolderName}"`);
+                
+                // Mark the new folder as processed too (so we don't try to create again)
+                this.processedNewFolders.add(newFolderPath);
+                
+                await this.renameViaVSCode(folderPath, newFolderPath, folderName, newFolderName);
+                
+                this.outputChannel.appendLine(`   Folder renamed: ${folderName} → ${newFolderName}`);
                 
                 // Update response with actual new folder path for notification
                 response.new_folder = `post-types/${postTypeFolder}/${newFolderName}`;

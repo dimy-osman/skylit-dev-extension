@@ -2,6 +2,14 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.9.9] - 2026-01-29
+
+### Fixed
+- **⏱️ Timing Fix**: Track rename BEFORE starting VS Code rename operation
+  - Was: tracking happened after rename completed, but trash handler timer fired during rename
+  - Now: tracking happens immediately before rename starts
+  - Ensures trash handler always sees the rename tracking when checking
+
 ## [1.9.8] - 2026-01-29
 
 ### Fixed
