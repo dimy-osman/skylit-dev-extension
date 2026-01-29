@@ -696,15 +696,6 @@ export class FileWatcher {
                 this.outputChannel.appendLine(`❌ [AI Request] Failed: ${response.error}`);
             }
             
-            // Delete the request file after processing
-            try {
-                const requestUri = pathToUri(requestFilePath);
-                await vscode.workspace.fs.delete(requestUri);
-                this.outputChannel.appendLine(`🗑️ [AI Request] Request file deleted`);
-            } catch (e) {
-                // Ignore delete errors
-            }
-            
         } catch (error: any) {
             this.outputChannel.appendLine(`❌ [AI Request] Error: ${error.message}`);
             
@@ -718,6 +709,23 @@ export class FileWatcher {
                 await vsWriteFile(resultFile, JSON.stringify(errorResult, null, 2));
             } catch (e) {
                 // Ignore write errors
+            }
+        } finally {
+            // ALWAYS delete the request file, even on error
+            // This prevents infinite retry loops
+            try {
+                const requestUri = pathToUri(requestFilePath);
+                await vscode.workspace.fs.delete(requestUri);
+                this.outputChannel.appendLine(`🗑️ [AI Request] Request file deleted`);
+            } catch (deleteError: any) {
+                this.outputChannel.appendLine(`⚠️ [AI Request] Could not delete request file: ${deleteError.message}`);
+                // If delete fails on SSH, try fs.unlink as fallback
+                try {
+                    await fs.promises.unlink(requestFilePath);
+                    this.outputChannel.appendLine(`🗑️ [AI Request] Request file deleted via fs.unlink`);
+                } catch (unlinkError) {
+                    this.outputChannel.appendLine(`❌ [AI Request] Failed to delete request file - manual cleanup needed`);
+                }
             }
         }
     }

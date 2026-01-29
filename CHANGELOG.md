@@ -2,6 +2,15 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.9.3] - 2026-01-29
+
+### Fixed
+- **🐛 Critical: Request file deletion**: Fixed infinite retry loop bug
+  - Request file now ALWAYS deleted via `finally` block, even on errors
+  - Prevents infinite "slug already exists" errors
+  - Added fallback to fs.unlink if VS Code API fails on SSH
+  - Delete happens after both success and failure cases
+
 ## [1.9.2] - 2026-01-29
 
 ### Fixed
