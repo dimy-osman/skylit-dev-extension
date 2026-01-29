@@ -2,6 +2,15 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.9.4] - 2026-01-29
+
+### Added
+- **📝 Auto-Create Notification**: When folders without IDs are detected and posts created, writes `last-created-post.json`
+  - AI can now create folders directly without request file
+  - Extension auto-creates WordPress post and renames folder
+  - Notification file contains new path for AI to continue editing
+  - Simplifies workflow: just create folder → wait → read result → continue
+
 ## [1.9.3] - 2026-01-29
 
 ### Fixed

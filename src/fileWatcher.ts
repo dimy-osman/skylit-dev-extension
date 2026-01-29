@@ -1270,6 +1270,10 @@ export class FileWatcher {
                 // Handle open editors - close old file and open new file
                 await this.handleFileRename(folderPath, response.new_folder, response.post_id);
                 
+                // Write notification for AI - same format as AI request flow
+                // This allows AI to know the new folder path after auto-rename
+                await this.writePostCreationNotification(response, postType);
+                
                 // Show notification
                 const config = vscode.workspace.getConfiguration('skylit');
                 if (config.get<boolean>('showNotifications', true)) {
@@ -1286,6 +1290,62 @@ export class FileWatcher {
             this.outputChannel.appendLine(`❌ Failed to create post: ${error.message}`);
             this.processedNewFolders.delete(folderPath);
             vscode.window.showErrorMessage(`Failed to create ${postType}: ${error.message}`);
+        }
+    }
+    
+    /**
+     * Write a notification file for AI agents when a post is created
+     * This allows AI to know the new folder path after auto-rename
+     * Same format as processAICreatePostRequest for consistency
+     */
+    private async writePostCreationNotification(
+        response: { post_id?: number; title?: string; new_folder?: string; slug?: string },
+        postType: string
+    ) {
+        if (!response.post_id) {
+            return; // No post ID, nothing to write
+        }
+        const skylitPath = posixJoin(this.devFolder, '.skylit');
+        const resultFile = posixJoin(skylitPath, 'last-created-post.json');
+        
+        try {
+            // Ensure .skylit folder exists
+            const skylitUri = pathToUri(skylitPath);
+            try {
+                await vscode.workspace.fs.stat(skylitUri);
+            } catch {
+                await vscode.workspace.fs.createDirectory(skylitUri);
+            }
+            
+            // Extract slug from new folder name (e.g., "my-page_550" -> "my-page")
+            const slug = response.slug || (response.new_folder ? response.new_folder.replace(/_\d+$/, '') : '');
+            const folderName = response.new_folder || '';
+            const fullPath = `${this.devFolder.replace(/\\/g, '/')}/${response.new_folder || ''}`;
+            
+            const resultData = {
+                success: true,
+                post_id: response.post_id,
+                post_type: postType,
+                title: response.title || '',
+                slug: slug,
+                folder_name: folderName,
+                folder_path: response.new_folder || '',
+                full_path: fullPath,
+                html_file: `${fullPath}/${folderName}.html`,
+                css_file: `${fullPath}/${folderName}.css`,
+                created_at: new Date().toISOString(),
+                auto_created: true // Flag to indicate this was auto-created (not via AI request)
+            };
+            
+            // Write result
+            await vsWriteFile(resultFile, JSON.stringify(resultData, null, 2));
+            
+            this.outputChannel.appendLine(`📝 [Folder Auto-Create] Notification written to: ${resultFile}`);
+            this.outputChannel.appendLine(`   AI can now read this to know the new path: ${folderName}`);
+            
+        } catch (error: any) {
+            this.outputChannel.appendLine(`⚠️ Could not write notification file: ${error.message}`);
+            // Non-critical - don't throw
         }
     }
     

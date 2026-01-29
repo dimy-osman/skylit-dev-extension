@@ -2,7 +2,7 @@
   "name": "skylit-dev-io",
   "displayName": "Skylit.DEV I/O - WordPress Sync",
   "description": "Instant sync between WordPress Gutenberg and your IDE. Solves WP Cron unreliability on local development.",
-	"version": "1.9.3",
+	"version": "1.9.4",
   "publisher": "dimy-osman",
   "license": "GPL-2.0-or-later",
   "engines": {
