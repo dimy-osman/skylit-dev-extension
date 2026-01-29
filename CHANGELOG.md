@@ -2,6 +2,14 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.9.8] - 2026-01-29
+
+### Fixed
+- **🚫 False Restore Prevention**: Fixed critical bug where our own renames triggered false "restore" actions
+  - Trash handler now checks if folder was just renamed by us before treating as restore
+  - Prevents WordPress from exporting duplicate folders after rename
+  - No more duplicate `learning-hub/` + `learning-hub_731/` folders
+
 ## [1.9.7] - 2026-01-29
 
 ### Fixed

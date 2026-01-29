@@ -2027,6 +2027,18 @@ export class FileWatcher {
                 return;
             }
             
+            // Check if this folder was just created by OUR rename operation (not a restore)
+            // Look through recentlyRenamedFolders to see if this is the NEW folder we just created
+            for (const [oldName, renameInfo] of this.recentlyRenamedFolders.entries()) {
+                if (renameInfo.newFolder === folderName && renameInfo.postId === postId) {
+                    const ageMs = Date.now() - renameInfo.timestamp;
+                    if (ageMs < 30000) { // Within last 30 seconds
+                        this.outputChannel.appendLine(`🔄 [Handle Trash] Skipping - this is our own rename: ${oldName} → ${folderName}`);
+                        return;
+                    }
+                }
+            }
+            
             // No recent delete - might be restore, but wait to see if DELETE follows
             this.outputChannel.appendLine(`🔍 [Handle Trash] Folder appeared outside trash - waiting to detect rename pattern...`);
             
@@ -2038,6 +2050,18 @@ export class FileWatcher {
             
             const timer = setTimeout(() => {
                 this.pendingRestoreTimers.delete(postId);
+                
+                // Double-check if this was our rename before triggering restore
+                for (const [oldName, renameInfo] of this.recentlyRenamedFolders.entries()) {
+                    if (renameInfo.newFolder === folderName && renameInfo.postId === postId) {
+                        const ageMs = Date.now() - renameInfo.timestamp;
+                        if (ageMs < 30000) {
+                            this.outputChannel.appendLine(`🔄 [Handle Trash] Skipping restore - this was our rename: ${oldName} → ${folderName}`);
+                            return;
+                        }
+                    }
+                }
+                
                 this.outputChannel.appendLine(`♻️ Detected restore (no DELETE followed): ${folderName} (Post ID: ${postId})`);
                 this.debounceFolderAction(postId, 'restore');
             }, 1000); // Wait 1 second for potential DELETE event
