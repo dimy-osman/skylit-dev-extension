@@ -2,6 +2,48 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.10.0] - 2026-01-30
+
+### Added
+- **🧹 Metadata Cleanup System** - Automatic removal of orphaned metadata files
+  - Runs on extension startup (initial cleanup)
+  - Periodic cleanup every 5 minutes
+  - Cleanup stopped on disconnect/deactivate
+  - REST client method: `cleanupMetadata()`
+  - Integrates with plugin endpoint: `POST /wp-json/skylit/v1/sync/cleanup-metadata`
+
+### Fixed
+- **🎯 TypeScript Build Error** - Removed invalid delete action check in fileWatcher
+  - Delete action handled by PHP plugin directly, not by extension
+  - Fixed compilation error preventing VSIX build
+
+### Changed
+- **📦 Extension Architecture** - Metadata cleanup fully integrated
+  - `extension.ts`: Added cleanup triggers and interval management
+  - `restClient.ts`: Added `cleanupMetadata()` method
+  - Compiled VSIX: `skylit-dev-io-1.10.0.vsix` (424.67 KB)
+
+## [1.9.12] - 2026-01-29
+
+### Fixed
+- **⏱️ Duplicate Detection Timing**: Reduced from 5 minutes to 30 seconds
+  - WordPress exports happen within seconds, not minutes
+  - After 30 seconds, same-name folder creates a NEW post (with auto-numbered slug)
+  - Prevents false duplicate detection for intentional new page creations
+- **🧹 Cleanup After Merge**: Clear rename tracking after successful duplicate merge
+  - Allows creating new pages with same name after duplicate was handled
+  - No more permanent blocking of folder names
+
+## [1.9.11] - 2026-01-29
+
+### Fixed
+- **🔄 Status Bar Race Condition**: Fixed infinite spinning status bar issue
+  - Multiple overlapping `showSyncing()` calls no longer cause permanent spin
+  - Status now always resets to base connection state, not captured "current" state
+  - Added `showError()` for API errors with auto-reset
+  - Added `resetToBase()` for manual reset in catch blocks
+  - Error states during post creation now properly reset after 3 seconds
+
 ## [1.9.10] - 2026-01-29
 
 ### Fixed

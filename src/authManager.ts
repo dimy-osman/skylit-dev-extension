@@ -4,17 +4,18 @@
  */
 
 import * as vscode from 'vscode';
+import { DebugLogger } from './debugLogger';
 
 export class AuthManager {
     private secretStorage: vscode.SecretStorage;
-    private outputChannel: vscode.OutputChannel;
+    private debugLogger: DebugLogger;
 
     constructor(
         context: vscode.ExtensionContext,
-        outputChannel: vscode.OutputChannel
+        debugLogger: DebugLogger
     ) {
         this.secretStorage = context.secrets;
-        this.outputChannel = outputChannel;
+        this.debugLogger = debugLogger;
     }
 
     /**
@@ -25,9 +26,9 @@ export class AuthManager {
         const token = await this.secretStorage.get(key);
         
         if (token) {
-            this.outputChannel.appendLine(`🔑 Found saved token for ${siteUrl}`);
+            this.debugLogger.log(`🔑 Found saved token for ${siteUrl}`);
         } else {
-            this.outputChannel.appendLine(`⚠️ No token found for ${siteUrl}`);
+            this.debugLogger.log(`⚠️ No token found for ${siteUrl}`);
         }
 
         return token;
@@ -39,7 +40,7 @@ export class AuthManager {
     async saveToken(siteUrl: string, token: string): Promise<void> {
         const key = this.getStorageKey(siteUrl);
         await this.secretStorage.store(key, token);
-        this.outputChannel.appendLine(`✅ Saved token for ${siteUrl}`);
+        this.debugLogger.info(`✅ Saved token for ${siteUrl}`);
     }
 
     /**
@@ -48,7 +49,7 @@ export class AuthManager {
     async deleteToken(siteUrl: string): Promise<void> {
         const key = this.getStorageKey(siteUrl);
         await this.secretStorage.delete(key);
-        this.outputChannel.appendLine(`🗑️ Deleted token for ${siteUrl}`);
+        this.debugLogger.info(`🗑️ Deleted token for ${siteUrl}`);
     }
 
     /**

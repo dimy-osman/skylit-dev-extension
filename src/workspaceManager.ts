@@ -5,16 +5,17 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { DebugLogger } from './debugLogger';
 import { WordPressSite, WpConfig } from './types';
 
 export class WorkspaceManager {
-    private outputChannel: vscode.OutputChannel;
+    private debugLogger: DebugLogger;
     private pathSeparator: string = '/'; // Default to Unix-style
     private isRemote: boolean = false;
     private workspaceUri: vscode.Uri | null = null;
 
-    constructor(outputChannel: vscode.OutputChannel) {
-        this.outputChannel = outputChannel;
+    constructor(debugLogger: DebugLogger) {
+        this.debugLogger = debugLogger;
         
         // Detect if we're in a remote workspace (SSH, WSL, Dev Containers)
         const workspaceFolders = vscode.workspace.workspaceFolders || [];
@@ -146,7 +147,7 @@ export class WorkspaceManager {
         const workspaceFolders = vscode.workspace.workspaceFolders || [];
         const sites: WordPressSite[] = [];
 
-        this.outputChannel.appendLine('🔍 Scanning workspace for WordPress sites...');
+        this.debugLogger.log('🔍 Scanning workspace for WordPress sites...');
 
         for (const folder of workspaceFolders) {
             // Use URI path for remote workspaces (SSH), fsPath for local
@@ -167,33 +168,33 @@ export class WorkspaceManager {
      * Detect WordPress in a specific folder
      */
     private async detectWordPressInFolder(folderPath: string): Promise<WordPressSite | null> {
-        this.outputChannel.appendLine(`   📁 Starting search from: ${folderPath}`);
+        this.debugLogger.log(`   📁 Starting search from: ${folderPath}`);
         
         // Strategy 1: Search upward from current folder
         let wpRoot = await this.findWordPressRoot(folderPath);
         
         // Strategy 2: If not found, search downward into common WordPress locations
         if (!wpRoot) {
-            this.outputChannel.appendLine(`   🔍 Searching downward into subdirectories...`);
+            this.debugLogger.log(`   🔍 Searching downward into subdirectories...`);
             wpRoot = await this.findWordPressInSubdirectories(folderPath);
         }
         
         if (!wpRoot) {
-            this.outputChannel.appendLine(`   ❌ wp-config.php not found`);
+            this.debugLogger.log(`   ❌ wp-config.php not found`);
             return null;
         }
 
-        this.outputChannel.appendLine(`   ✅ Found WordPress root: ${wpRoot}`);
+        this.debugLogger.log(`   ✅ Found WordPress root: ${wpRoot}`);
 
         // Check if Skylit plugin is installed
         const isSkylitInstalled = await this.checkSkylitPlugin(wpRoot);
         if (!isSkylitInstalled) {
-            this.outputChannel.appendLine(`   ⚠️ Skylit.DEV plugin not found or not activated`);
-            this.outputChannel.appendLine(`   ℹ️ Please install and activate the Skylit.DEV plugin in WordPress`);
+            this.debugLogger.log(`   ⚠️ Skylit.DEV plugin not found or not activated`);
+            this.debugLogger.log(`   ℹ️ Please install and activate the Skylit.DEV plugin in WordPress`);
             return null;
         }
 
-        this.outputChannel.appendLine(`   ✅ Skylit.DEV plugin detected and active!`);
+        this.debugLogger.log(`   ✅ Skylit.DEV plugin detected and active!`);
 
         try {
             const wpConfigPath = this.joinPath(wpRoot, 'wp-config.php');
@@ -205,7 +206,7 @@ export class WorkspaceManager {
             
             if (manualSiteUrl && manualSiteUrl.trim() !== '') {
                 config.siteUrl = manualSiteUrl.trim().replace(/\/$/, '');
-                this.outputChannel.appendLine(`   ✅ Using site URL from settings: ${config.siteUrl}`);
+                this.debugLogger.log(`   ✅ Using site URL from settings: ${config.siteUrl}`);
             }
             
             return {
@@ -215,7 +216,7 @@ export class WorkspaceManager {
                 devFolder: config.devFolder
             };
         } catch (error: any) {
-            this.outputChannel.appendLine(`   ⚠️ Error parsing wp-config.php: ${error.message}`);
+            this.debugLogger.log(`   ⚠️ Error parsing wp-config.php: ${error.message}`);
             return null;
         }
     }
@@ -239,10 +240,10 @@ export class WorkspaceManager {
             const fullPath = this.joinPath(startPath, subPath);
             const wpConfigPath = this.joinPath(fullPath, 'wp-config.php');
             
-            this.outputChannel.appendLine(`   🔎 Checking: ${wpConfigPath}`);
+            this.debugLogger.log(`   🔎 Checking: ${wpConfigPath}`);
             
             if (await this.fileExists(wpConfigPath)) {
-                this.outputChannel.appendLine(`   ✅ Found wp-config.php in subdirectory!`);
+                this.debugLogger.log(`   ✅ Found wp-config.php in subdirectory!`);
                 return fullPath;
             }
         }
@@ -263,7 +264,7 @@ export class WorkspaceManager {
 
         for (const pluginPath of pluginPaths) {
             if (await this.fileExists(pluginPath)) {
-                this.outputChannel.appendLine(`   🔌 Found plugin file: ${pluginPath}`);
+                this.debugLogger.log(`   🔌 Found plugin file: ${pluginPath}`);
                 
                 // Read plugin file to check if it's the right one
                 try {
@@ -277,13 +278,13 @@ export class WorkspaceManager {
                         // Extract version if available
                         const versionMatch = content.match(/Version:\s*([0-9.]+)/i);
                         if (versionMatch) {
-                            this.outputChannel.appendLine(`   ℹ️ Plugin version: ${versionMatch[1]}`);
+                            this.debugLogger.log(`   ℹ️ Plugin version: ${versionMatch[1]}`);
                         }
                         
                         return true;
                     }
                 } catch (error: any) {
-                    this.outputChannel.appendLine(`   ⚠️ Could not read plugin file: ${error.message}`);
+                    this.debugLogger.log(`   ⚠️ Could not read plugin file: ${error.message}`);
                 }
             }
         }
@@ -301,10 +302,10 @@ export class WorkspaceManager {
         for (let i = 0; i < maxLevels; i++) {
             const wpConfigPath = this.joinPath(currentPath, 'wp-config.php');
             
-            this.outputChannel.appendLine(`   🔎 Checking: ${wpConfigPath}`);
+            this.debugLogger.log(`   🔎 Checking: ${wpConfigPath}`);
             
             if (await this.fileExists(wpConfigPath)) {
-                this.outputChannel.appendLine(`   ✅ Found wp-config.php!`);
+                this.debugLogger.log(`   ✅ Found wp-config.php!`);
                 return currentPath;
             }
             
@@ -341,8 +342,8 @@ export class WorkspaceManager {
         // Final fallback
         if (!siteUrl) {
             siteUrl = 'http://localhost';
-            this.outputChannel.appendLine(`   ⚠️ Could not auto-detect site URL, defaulting to ${siteUrl}`);
-            this.outputChannel.appendLine(`   💡 Set "skylit.siteUrl" in VS Code settings to override`);
+            this.debugLogger.log(`   ⚠️ Could not auto-detect site URL, defaulting to ${siteUrl}`);
+            this.debugLogger.log(`   💡 Set "skylit.siteUrl" in VS Code settings to override`);
         }
 
         // Find dev folder
@@ -372,7 +373,7 @@ export class WorkspaceManager {
                 const wpCliContent = await this.readFile(wpCliPath);
                 const urlMatch = wpCliContent.match(/url:\s*['"]?([^'"\n]+)['"]?/);
                 if (urlMatch) {
-                    this.outputChannel.appendLine(`   🔍 Detected URL from .wp-cli.yml: ${urlMatch[1]}`);
+                    this.debugLogger.log(`   🔍 Detected URL from .wp-cli.yml: ${urlMatch[1]}`);
                     return urlMatch[1];
                 }
             } catch (e) {
@@ -418,7 +419,7 @@ export class WorkspaceManager {
                 if (item.endsWith('-dev-root')) {
                     const devPath = this.joinPath(wpContent, item);
                     if (await this.isDirectory(devPath)) {
-                        this.outputChannel.appendLine(`   📁 Dev folder: ${devPath}`);
+                        this.debugLogger.log(`   📁 Dev folder: ${devPath}`);
                         return devPath;
                     }
                 }
@@ -428,12 +429,12 @@ export class WorkspaceManager {
         // Strategy 3: Check for 'skylit-dev' folder (legacy)
         const legacyPath = this.joinPath(wpContent, 'skylit-dev');
         if (await this.fileExists(legacyPath)) {
-            this.outputChannel.appendLine(`   📁 Dev folder (legacy): ${legacyPath}`);
+            this.debugLogger.log(`   📁 Dev folder (legacy): ${legacyPath}`);
             return legacyPath;
         }
 
         // Strategy 4: Default to wp-content root
-        this.outputChannel.appendLine(`   ⚠️ Dev folder not found, defaulting to wp-content`);
+        this.debugLogger.log(`   ⚠️ Dev folder not found, defaulting to wp-content`);
         return wpContent;
     }
 

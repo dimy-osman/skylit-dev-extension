@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { RestClient } from './restClient';
 import { StatusBar } from './statusBar';
+import { DebugLogger } from './debugLogger';
 
 /**
  * Join paths using forward slashes (POSIX-style)
@@ -101,10 +102,10 @@ async function vsRename(oldPath: string, newPath: string): Promise<void> {
  */
 class FoldingStateManager {
     private foldingStates: Map<string, number[]> = new Map(); // file path -> folded line numbers
-    private outputChannel: vscode.OutputChannel;
+    private debugLogger: DebugLogger;
     
-    constructor(outputChannel: vscode.OutputChannel) {
-        this.outputChannel = outputChannel;
+    constructor(debugLogger: DebugLogger) {
+        this.debugLogger = debugLogger;
     }
     
     /**
@@ -147,7 +148,7 @@ class FoldingStateManager {
         }
         
         this.foldingStates.set(normalizedPath, foldedLines);
-        this.outputChannel.appendLine(`📁 Saved folding state: ${foldedLines.length} folded regions`);
+        this.debugLogger.log(`📁 Saved folding state: ${foldedLines.length} folded regions`);
     }
     
     /**
@@ -207,7 +208,7 @@ class FoldingStateManager {
             return;
         }
         
-        this.outputChannel.appendLine(`📂 Restoring ${foldsToRestore.length} folds for unchanged blocks`);
+        this.debugLogger.log(`📂 Restoring ${foldsToRestore.length} folds for unchanged blocks`);
         
         // Restore folds using VS Code fold command
         for (const line of foldsToRestore) {
@@ -261,7 +262,7 @@ export class FileWatcher {
     private themePath: string | null = null; // Theme folder path (fetched from WordPress)
     private restClient: RestClient;
     private statusBar: StatusBar;
-    private outputChannel: vscode.OutputChannel;
+    private debugLogger: DebugLogger;
     private debounceMs: number = 500;
     private folderActionDebounceMs: number = 1000; // Debounce folder actions
     private folderActionCooldownMs: number = 5000; // Don't re-process same post within 5 seconds
@@ -279,13 +280,13 @@ export class FileWatcher {
         devFolder: string,
         restClient: RestClient,
         statusBar: StatusBar,
-        outputChannel: vscode.OutputChannel
+        debugLogger: DebugLogger
     ) {
         this.devFolder = devFolder;
         this.restClient = restClient;
         this.statusBar = statusBar;
-        this.outputChannel = outputChannel;
-        this.foldingManager = new FoldingStateManager(outputChannel);
+        this.debugLogger = debugLogger;
+        this.foldingManager = new FoldingStateManager(debugLogger);
 
         // Get debounce setting
         const config = vscode.workspace.getConfiguration('skylit');
@@ -297,7 +298,7 @@ export class FileWatcher {
      * Start watching files
      */
     async start() {
-        this.outputChannel.appendLine(`👀 Starting file watcher for: ${this.devFolder}`);
+        this.debugLogger.log(`👀 Starting file watcher for: ${this.devFolder}`);
 
         // Main watcher for ALL file content changes (dynamic - watches everything except excluded)
         this.watcher = chokidar.watch(
@@ -323,7 +324,7 @@ export class FileWatcher {
 
         // Listen for file changes
         this.watcher.on('change', (filePath) => {
-            this.outputChannel.appendLine(`📝 File changed: ${filePath}`);
+            this.debugLogger.log(`📝 File changed: ${filePath}`);
             
             // Normalize path for cross-platform
             const normalizedPath = filePath.replace(/\\/g, '/');
@@ -342,14 +343,14 @@ export class FileWatcher {
         });
 
         this.watcher.on('error', (error) => {
-            this.outputChannel.appendLine(`❌ File watcher error: ${error.message}`);
+            this.debugLogger.log(`❌ File watcher error: ${error.message}`);
         });
 
         // Use VS Code's native FileSystemWatcher for trash operations
         // This properly handles SSH remotes through VS Code's virtual filesystem
         const postTypesPath = posixJoin(this.devFolder, 'post-types');
         
-        this.outputChannel.appendLine(`🔍 [Trash Watcher] Setting up VS Code native watcher for: ${postTypesPath}`);
+        this.debugLogger.log(`🔍 [Trash Watcher] Setting up VS Code native watcher for: ${postTypesPath}`);
         
         // Create a glob pattern that matches files in post-types folders
         // VS Code watcher works with Uri patterns
@@ -363,7 +364,7 @@ export class FileWatcher {
         // Listen for files/folders being created (could be trash or restore)
         this.vscodeTrashWatcher.onDidCreate((uri) => {
             const filePath = uri.fsPath;
-            this.outputChannel.appendLine(`🔍 [VS Code Watcher] Created: ${filePath}`);
+            this.debugLogger.log(`🔍 [VS Code Watcher] Created: ${filePath}`);
             
             // Check if this is a directory by looking at the path pattern
             // Folders with _ID suffix in post-types are what we care about
@@ -375,7 +376,7 @@ export class FileWatcher {
         // Listen for files/folders being deleted (could be trash or restore)
         this.vscodeTrashWatcher.onDidDelete((uri) => {
             const filePath = uri.fsPath;
-            this.outputChannel.appendLine(`🔍 [VS Code Watcher] Deleted: ${filePath}`);
+            this.debugLogger.log(`🔍 [VS Code Watcher] Deleted: ${filePath}`);
             
             // Check if this is a post folder being removed from _trash (restore)
             if (filePath.includes('_trash') || /_\d+$/.test(path.basename(filePath)) || /_\d+[\/\\]/.test(filePath)) {
@@ -383,7 +384,7 @@ export class FileWatcher {
             }
         });
         
-        this.outputChannel.appendLine('✅ File watcher started (including VS Code native _trash folder monitoring)');
+        this.debugLogger.log('✅ File watcher started (including VS Code native _trash folder monitoring)');
 
         // Start bi-directional theme watcher
         await this.startThemeWatcher();
@@ -409,16 +410,16 @@ export class FileWatcher {
     private async startNewFolderWatcher() {
         const postTypesPath = posixJoin(this.devFolder, 'post-types');
         
-        this.outputChannel.appendLine(`🔍 [New Folder Watcher] Setting up VS Code native watcher for: ${postTypesPath}`);
-        this.outputChannel.appendLine(`🔍 [New Folder Watcher] Dev folder: ${this.devFolder}`);
+        this.debugLogger.log(`🔍 [New Folder Watcher] Setting up VS Code native watcher for: ${postTypesPath}`);
+        this.debugLogger.log(`🔍 [New Folder Watcher] Dev folder: ${this.devFolder}`);
         
         // First, scan for existing folders without IDs (created before extension started)
         // This uses VS Code FS API for SSH compatibility
         try {
             await this.scanForNewFolders(postTypesPath);
         } catch (err: any) {
-            this.outputChannel.appendLine(`⚠️ Could not scan for existing folders: ${err.message}`);
-            this.outputChannel.appendLine(`ℹ️ Watcher will still monitor for new folders created after connection`);
+            this.debugLogger.log(`⚠️ Could not scan for existing folders: ${err.message}`);
+            this.debugLogger.log(`ℹ️ Watcher will still monitor for new folders created after connection`);
         }
         
         // Create VS Code native FileSystemWatcher (works on SSH)
@@ -440,7 +441,7 @@ export class FileWatcher {
             
             // Check if this is an HTML file
             if (filePath.endsWith('.html')) {
-                this.outputChannel.appendLine(`🔔 [VS Code Watcher] HTML file created: ${path.basename(filePath)}`);
+                this.debugLogger.log(`🔔 [VS Code Watcher] HTML file created: ${path.basename(filePath)}`);
                 const folderPath = path.dirname(filePath).replace(/\\/g, '/');
                 this.handlePotentialNewFolder(folderPath);
                 return;
@@ -449,7 +450,7 @@ export class FileWatcher {
             // Check if this is a folder (has no extension or is a known folder pattern)
             const baseName = path.basename(filePath);
             if (!baseName.includes('.') || /_\d+$/.test(baseName)) {
-                this.outputChannel.appendLine(`🔔 [VS Code Watcher] Folder created: ${baseName}`);
+                this.debugLogger.log(`🔔 [VS Code Watcher] Folder created: ${baseName}`);
                 
                 // Check if this is a rename completion (folder with _ID reappearing)
                 const postId = this.extractPostIdFromPath(filePath);
@@ -473,12 +474,12 @@ export class FileWatcher {
             // Check if this is a post folder (has _ID suffix)
             const baseName = path.basename(filePath);
             if (/_\d+$/.test(baseName)) {
-                this.outputChannel.appendLine(`🔔 [VS Code Watcher] Folder deleted: ${baseName}`);
+                this.debugLogger.log(`🔔 [VS Code Watcher] Folder deleted: ${baseName}`);
                 this.handlePotentialRenameStart(filePath);
             }
         });
         
-        this.outputChannel.appendLine('✅ New folder watcher started (VS Code native)');
+        this.debugLogger.log('✅ New folder watcher started (VS Code native)');
     }
     
     /**
@@ -488,47 +489,47 @@ export class FileWatcher {
     private async startMetadataWatcher() {
         const metadataPath = posixJoin(this.devFolder, '.skylit', 'metadata');
         
-        this.outputChannel.appendLine(`🔍 [Metadata Watcher] Checking for .skylit/metadata at: ${metadataPath}`);
+        this.debugLogger.log(`🔍 [Metadata Watcher] Checking for .skylit/metadata at: ${metadataPath}`);
         
         // Check if folder exists (may fail on SSH, that's OK - chokidar can still watch it)
         let folderExists = false;
         try {
             folderExists = fs.existsSync(metadataPath);
         } catch (err: any) {
-            this.outputChannel.appendLine(`🔍 [Metadata Watcher] Could not check folder existence (SSH?): ${err.message}`);
-            this.outputChannel.appendLine(`🔍 [Metadata Watcher] Will try to watch anyway (chokidar handles SSH paths)`);
+            this.debugLogger.log(`🔍 [Metadata Watcher] Could not check folder existence (SSH?): ${err.message}`);
+            this.debugLogger.log(`🔍 [Metadata Watcher] Will try to watch anyway (chokidar handles SSH paths)`);
         }
         
         if (!folderExists) {
-            this.outputChannel.appendLine(`⚠️ .skylit/metadata folder not found via fs.existsSync() at: ${metadataPath}`);
+            this.debugLogger.log(`⚠️ .skylit/metadata folder not found via fs.existsSync() at: ${metadataPath}`);
             
             // Try to list what's in .skylit folder if it exists (diagnostic)
             const skylitPath = posixJoin(this.devFolder, '.skylit');
             try {
                 if (fs.existsSync(skylitPath)) {
                     const contents = fs.readdirSync(skylitPath);
-                    this.outputChannel.appendLine(`🔍 [Metadata Watcher] .skylit folder contents: ${contents.join(', ')}`);
+                    this.debugLogger.log(`🔍 [Metadata Watcher] .skylit folder contents: ${contents.join(', ')}`);
                 } else {
-                    this.outputChannel.appendLine(`🔍 [Metadata Watcher] .skylit folder does not exist via fs at: ${skylitPath}`);
+                    this.debugLogger.log(`🔍 [Metadata Watcher] .skylit folder does not exist via fs at: ${skylitPath}`);
                 }
             } catch (err: any) {
-                this.outputChannel.appendLine(`🔍 [Metadata Watcher] Could not read .skylit folder with fs (SSH expected): ${err.message}`);
+                this.debugLogger.log(`🔍 [Metadata Watcher] Could not read .skylit folder with fs (SSH expected): ${err.message}`);
             }
             
             // On SSH, fs operations fail but chokidar can still watch the path
             // Try to start the watcher anyway
-            this.outputChannel.appendLine(`🔄 [Metadata Watcher] Attempting to start watcher anyway (SSH compatibility)`);
+            this.debugLogger.log(`🔄 [Metadata Watcher] Attempting to start watcher anyway (SSH compatibility)`);
         }
         
-        this.outputChannel.appendLine(`👀 Starting metadata watcher for: ${metadataPath}`);
+        this.debugLogger.log(`👀 Starting metadata watcher for: ${metadataPath}`);
         
         // Load initial metadata cache
         // This uses fs operations which may fail on SSH - that's OK
         try {
             await this.loadMetadataCache(metadataPath);
         } catch (err: any) {
-            this.outputChannel.appendLine(`⚠️ Could not load metadata cache (SSH expected): ${err.message}`);
-            this.outputChannel.appendLine(`ℹ️ Watcher will still monitor for metadata changes after connection`);
+            this.debugLogger.log(`⚠️ Could not load metadata cache (SSH expected): ${err.message}`);
+            this.debugLogger.log(`ℹ️ Watcher will still monitor for metadata changes after connection`);
         }
         
         this.metadataWatcher = chokidar.watch(`${metadataPath}/*.json`, {
@@ -545,10 +546,10 @@ export class FileWatcher {
         });
         
         this.metadataWatcher.on('error', (error) => {
-            this.outputChannel.appendLine(`❌ Metadata watcher error: ${error.message}`);
+            this.debugLogger.log(`❌ Metadata watcher error: ${error.message}`);
         });
         
-        this.outputChannel.appendLine('✅ Metadata watcher started (JSON → WordPress sync enabled)');
+        this.debugLogger.log('✅ Metadata watcher started (JSON → WordPress sync enabled)');
     }
     
     /**
@@ -560,7 +561,7 @@ export class FileWatcher {
         const skylitPath = posixJoin(this.devFolder, '.skylit');
         const requestFile = posixJoin(skylitPath, 'create-post-request.json');
         
-        this.outputChannel.appendLine(`🤖 [AI Request Watcher] Setting up watcher for: ${requestFile}`);
+        this.debugLogger.log(`🤖 [AI Request Watcher] Setting up watcher for: ${requestFile}`);
         
         // Ensure .skylit folder exists
         try {
@@ -569,10 +570,10 @@ export class FileWatcher {
                 await vscode.workspace.fs.stat(skylitUri);
             } catch {
                 await vscode.workspace.fs.createDirectory(skylitUri);
-                this.outputChannel.appendLine(`📁 Created .skylit folder at: ${skylitPath}`);
+                this.debugLogger.log(`📁 Created .skylit folder at: ${skylitPath}`);
             }
         } catch (err: any) {
-            this.outputChannel.appendLine(`⚠️ Could not create .skylit folder: ${err.message}`);
+            this.debugLogger.log(`⚠️ Could not create .skylit folder: ${err.message}`);
         }
         
         // Watch for the request file
@@ -586,20 +587,20 @@ export class FileWatcher {
         });
         
         aiRequestWatcher.on('add', (filePath) => {
-            this.outputChannel.appendLine(`🤖 [AI Request] Request file detected: ${filePath}`);
+            this.debugLogger.log(`🤖 [AI Request] Request file detected: ${filePath}`);
             this.processAICreatePostRequest(filePath);
         });
         
         aiRequestWatcher.on('change', (filePath) => {
-            this.outputChannel.appendLine(`🤖 [AI Request] Request file changed: ${filePath}`);
+            this.debugLogger.log(`🤖 [AI Request] Request file changed: ${filePath}`);
             this.processAICreatePostRequest(filePath);
         });
         
         aiRequestWatcher.on('error', (error) => {
-            this.outputChannel.appendLine(`❌ AI Request watcher error: ${error.message}`);
+            this.debugLogger.log(`❌ AI Request watcher error: ${error.message}`);
         });
         
-        this.outputChannel.appendLine('✅ AI Request watcher started (create-post-request.json → WordPress)');
+        this.debugLogger.log('✅ AI Request watcher started (create-post-request.json → WordPress)');
         
         // Add polling fallback for SSH/remote filesystems where watchers may not work
         // Poll continuously every 2 seconds to check if request file exists
@@ -610,7 +611,7 @@ export class FileWatcher {
                 
                 // File exists - process it (but keep polling for future requests)
                 if (stat.type === vscode.FileType.File) {
-                    this.outputChannel.appendLine(`🤖 [AI Request Polling] Found request file via polling`);
+                    this.debugLogger.log(`🤖 [AI Request Polling] Found request file via polling`);
                     await this.processAICreatePostRequest(requestFile);
                     // Note: processAICreatePostRequest deletes the file, so polling continues for next request
                 }
@@ -639,7 +640,7 @@ export class FileWatcher {
             const requestContent = await vsReadFile(requestFilePath);
             const request = JSON.parse(requestContent);
             
-            this.outputChannel.appendLine(`🤖 [AI Request] Processing: ${JSON.stringify(request)}`);
+            this.debugLogger.log(`🤖 [AI Request] Processing: ${JSON.stringify(request)}`);
             
             // Validate request
             if (!request.title) {
@@ -680,8 +681,8 @@ export class FileWatcher {
                 // Write result
                 await vsWriteFile(resultFile, JSON.stringify(resultData, null, 2));
                 
-                this.outputChannel.appendLine(`✅ [AI Request] Created ${postType}: ${title} → ${folderName}`);
-                this.outputChannel.appendLine(`   Result written to: ${resultFile}`);
+                this.debugLogger.log(`✅ [AI Request] Created ${postType}: ${title} → ${folderName}`);
+                this.debugLogger.log(`   Result written to: ${resultFile}`);
                 
                 // Show notification
                 vscode.window.showInformationMessage(
@@ -694,11 +695,11 @@ export class FileWatcher {
                     request: request
                 };
                 await vsWriteFile(resultFile, JSON.stringify(errorResult, null, 2));
-                this.outputChannel.appendLine(`❌ [AI Request] Failed: ${response.error}`);
+                this.debugLogger.log(`❌ [AI Request] Failed: ${response.error}`);
             }
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ [AI Request] Error: ${error.message}`);
+            this.debugLogger.log(`❌ [AI Request] Error: ${error.message}`);
             
             // Write error result
             const errorResult = {
@@ -717,15 +718,15 @@ export class FileWatcher {
             try {
                 const requestUri = pathToUri(requestFilePath);
                 await vscode.workspace.fs.delete(requestUri);
-                this.outputChannel.appendLine(`🗑️ [AI Request] Request file deleted`);
+                this.debugLogger.log(`🗑️ [AI Request] Request file deleted`);
             } catch (deleteError: any) {
-                this.outputChannel.appendLine(`⚠️ [AI Request] Could not delete request file: ${deleteError.message}`);
+                this.debugLogger.log(`⚠️ [AI Request] Could not delete request file: ${deleteError.message}`);
                 // If delete fails on SSH, try fs.unlink as fallback
                 try {
                     await fs.promises.unlink(requestFilePath);
-                    this.outputChannel.appendLine(`🗑️ [AI Request] Request file deleted via fs.unlink`);
+                    this.debugLogger.log(`🗑️ [AI Request] Request file deleted via fs.unlink`);
                 } catch (unlinkError) {
-                    this.outputChannel.appendLine(`❌ [AI Request] Failed to delete request file - manual cleanup needed`);
+                    this.debugLogger.log(`❌ [AI Request] Failed to delete request file - manual cleanup needed`);
                 }
             }
         }
@@ -763,9 +764,9 @@ export class FileWatcher {
                 }
             }
             
-            this.outputChannel.appendLine(`📦 Loaded ${this.metadataCache.size} metadata files into cache`);
+            this.debugLogger.log(`📦 Loaded ${this.metadataCache.size} metadata files into cache`);
         } catch (error: any) {
-            this.outputChannel.appendLine(`⚠️ Could not load metadata cache: ${error.message}`);
+            this.debugLogger.log(`⚠️ Could not load metadata cache: ${error.message}`);
         }
     }
     
@@ -788,7 +789,7 @@ export class FileWatcher {
             return; // Skip if recently synced (prevent loops)
         }
         
-        this.outputChannel.appendLine(`🔔 [Metadata] Change detected: ${fileName}`);
+        this.debugLogger.log(`🔔 [Metadata] Change detected: ${fileName}`);
         
         try {
             const content = await vsReadFile(normalizedPath);
@@ -804,18 +805,18 @@ export class FileWatcher {
                 if (newData.slug && newData.slug !== oldData.slug) {
                     changes.slug = newData.slug;
                     hasChanges = true;
-                    this.outputChannel.appendLine(`   📝 Slug changed: ${oldData.slug} → ${newData.slug}`);
+                    this.debugLogger.log(`   📝 Slug changed: ${oldData.slug} → ${newData.slug}`);
                 }
                 if (newData.title && newData.title !== oldData.title) {
                     changes.title = newData.title;
                     hasChanges = true;
-                    this.outputChannel.appendLine(`   📝 Title changed: ${oldData.title} → ${newData.title}`);
+                    this.debugLogger.log(`   📝 Title changed: ${oldData.title} → ${newData.title}`);
                 }
                 if (newData.status && newData.status !== oldData.status) {
                     changes.status = newData.status;
                     hasChanges = true;
-                    this.outputChannel.appendLine(`   📝 Status changed: ${oldData.status} → ${newData.status}`);
-                    this.outputChannel.appendLine(`   ℹ️  This change came from WordPress (not IDE)`);
+                    this.debugLogger.log(`   📝 Status changed: ${oldData.status} → ${newData.status}`);
+                    this.debugLogger.log(`   ℹ️  This change came from WordPress (not IDE)`);
                 }
             } else {
                 // First time seeing this file, just cache it
@@ -863,16 +864,16 @@ export class FileWatcher {
                     
                     // No popup notification - status bar is enough
                 } else {
-                    this.outputChannel.appendLine(`⚠️ Metadata sync failed: ${response.error}`);
+                    this.debugLogger.log(`⚠️ Metadata sync failed: ${response.error}`);
                     // Only log to output, no popup
                 }
             } catch (error: any) {
-                this.outputChannel.appendLine(`❌ Metadata sync error: ${error.message}`);
+                this.debugLogger.log(`❌ Metadata sync error: ${error.message}`);
                 // Only show error popups for critical errors
             }
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Failed to parse metadata: ${error.message}`);
+            this.debugLogger.log(`❌ Failed to parse metadata: ${error.message}`);
         }
     }
     
@@ -881,7 +882,7 @@ export class FileWatcher {
      * Uses VS Code's workspace.fs API for SSH compatibility
      */
     private async renamePostFiles(postId: number, oldSlug: string, newSlug: string, postType: string) {
-        this.outputChannel.appendLine(`📂 Renaming files for post ${postId}: ${oldSlug} → ${newSlug}`);
+        this.debugLogger.log(`📂 Renaming files for post ${postId}: ${oldSlug} → ${newSlug}`);
         
         try {
             // Build paths
@@ -896,13 +897,13 @@ export class FileWatcher {
             
             // Check if old folder exists (using VS Code FS API)
             if (!await vsExists(oldFolderPath)) {
-                this.outputChannel.appendLine(`⚠️ Old folder not found: ${oldFolderName}`);
+                this.debugLogger.log(`⚠️ Old folder not found: ${oldFolderName}`);
                 return;
             }
             
             // Check if new folder already exists
             if (await vsExists(newFolderPath)) {
-                this.outputChannel.appendLine(`⚠️ New folder already exists: ${newFolderName}`);
+                this.debugLogger.log(`⚠️ New folder already exists: ${newFolderName}`);
                 return;
             }
             
@@ -914,17 +915,17 @@ export class FileWatcher {
             
             if (await vsExists(oldHtmlPath)) {
                 await vsRename(oldHtmlPath, newHtmlPath);
-                this.outputChannel.appendLine(`   ✓ HTML: ${oldFolderName}.html → ${newFolderName}.html`);
+                this.debugLogger.log(`   ✓ HTML: ${oldFolderName}.html → ${newFolderName}.html`);
             }
             
             if (await vsExists(oldCssPath)) {
                 await vsRename(oldCssPath, newCssPath);
-                this.outputChannel.appendLine(`   ✓ CSS: ${oldFolderName}.css → ${newFolderName}.css`);
+                this.debugLogger.log(`   ✓ CSS: ${oldFolderName}.css → ${newFolderName}.css`);
             }
             
             // Rename the folder (using VS Code FS API)
             await vsRename(oldFolderPath, newFolderPath);
-            this.outputChannel.appendLine(`   ✓ Folder: ${oldFolderName} → ${newFolderName}`);
+            this.debugLogger.log(`   ✓ Folder: ${oldFolderName} → ${newFolderName}`);
             
             // Update JSON's file path to stay in sync
             const newFilePath = `post-types/${postTypeFolderName}/${newFolderName}/${newFolderName}.html`;
@@ -934,7 +935,7 @@ export class FileWatcher {
             await this.handleFileRename(oldFolderPath, `post-types/${postTypeFolderName}/${newFolderName}`, postId);
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Failed to rename files: ${error.message}`);
+            this.debugLogger.log(`❌ Failed to rename files: ${error.message}`);
         }
     }
     
@@ -960,10 +961,10 @@ export class FileWatcher {
             metadata.lastExported = new Date().toISOString().replace('T', ' ').substring(0, 19);
             
             await vsWriteFile(metadataPath, JSON.stringify(metadata, null, 4));
-            this.outputChannel.appendLine(`   ✓ JSON file path updated`);
+            this.debugLogger.log(`   ✓ JSON file path updated`);
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`⚠️ Could not update JSON file path: ${error.message}`);
+            this.debugLogger.log(`⚠️ Could not update JSON file path: ${error.message}`);
         }
     }
     
@@ -1003,7 +1004,7 @@ export class FileWatcher {
         
         const oldSlug = this.extractSlugFromFolderName(folderName);
         
-        this.outputChannel.appendLine(`🔄 Folder removed (potential rename): ${folderName}`);
+        this.debugLogger.log(`🔄 Folder removed (potential rename): ${folderName}`);
         
         // Store for matching with subsequent addDir
         this.pendingRenames.set(postId, {
@@ -1018,7 +1019,7 @@ export class FileWatcher {
                 const pending = this.pendingRenames.get(postId)!;
                 if (Date.now() - pending.timestamp >= this.renameCooldownMs) {
                     this.pendingRenames.delete(postId);
-                    this.outputChannel.appendLine(`🗑️ Folder delete confirmed (no rename): ${folderName}`);
+                    this.debugLogger.log(`🗑️ Folder delete confirmed (no rename): ${folderName}`);
                 }
             }
         }, this.renameCooldownMs + 100);
@@ -1042,11 +1043,11 @@ export class FileWatcher {
         
         // Check if slug actually changed
         if (pending.oldSlug === newSlug) {
-            this.outputChannel.appendLine(`🔄 Folder moved but slug unchanged: ${folderName}`);
+            this.debugLogger.log(`🔄 Folder moved but slug unchanged: ${folderName}`);
             return;
         }
         
-        this.outputChannel.appendLine(`📝 Folder renamed: ${pending.oldSlug}_${postId} → ${newSlug}_${postId}`);
+        this.debugLogger.log(`📝 Folder renamed: ${pending.oldSlug}_${postId} → ${newSlug}_${postId}`);
         this.statusBar.showSyncing('Updating slug...');
         
         try {
@@ -1054,7 +1055,7 @@ export class FileWatcher {
             
             if (response.success) {
                 this.statusBar.showSuccess('Slug updated');
-                this.outputChannel.appendLine(`✅ WordPress slug updated: ${pending.oldSlug} → ${newSlug}`);
+                this.debugLogger.log(`✅ WordPress slug updated: ${pending.oldSlug} → ${newSlug}`);
                 
                 // Update JSON metadata to stay in sync with folder
                 await this.updateJsonMetadata(postId, { slug: newSlug });
@@ -1074,10 +1075,10 @@ export class FileWatcher {
                     );
                 }
             } else {
-                this.outputChannel.appendLine(`⚠️ Could not update slug: ${response.error}`);
+                this.debugLogger.log(`⚠️ Could not update slug: ${response.error}`);
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Failed to update slug: ${error.message}`);
+            this.debugLogger.log(`❌ Failed to update slug: ${error.message}`);
             vscode.window.showErrorMessage(`Failed to update slug: ${error.message}`);
         }
     }
@@ -1090,7 +1091,7 @@ export class FileWatcher {
         const metadataPath = posixJoin(this.devFolder, '.skylit', 'metadata', `${postId}.json`);
         
         if (!await vsExists(metadataPath)) {
-            this.outputChannel.appendLine(`⚠️ Metadata file not found: ${postId}.json`);
+            this.debugLogger.log(`⚠️ Metadata file not found: ${postId}.json`);
             return;
         }
         
@@ -1129,10 +1130,10 @@ export class FileWatcher {
             
             // Write back (using VS Code FS API)
             await vsWriteFile(metadataPath, JSON.stringify(metadata, null, 4));
-            this.outputChannel.appendLine(`📦 JSON metadata updated: ${postId}.json`);
+            this.debugLogger.log(`📦 JSON metadata updated: ${postId}.json`);
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Failed to update JSON metadata: ${error.message}`);
+            this.debugLogger.log(`❌ Failed to update JSON metadata: ${error.message}`);
         }
     }
     
@@ -1144,8 +1145,8 @@ export class FileWatcher {
         // Remove trailing slash from devFolder for consistent matching
         const devFolderNormalized = this.devFolder.replace(/\\/g, '/').replace(/\/$/, '');
         
-        this.outputChannel.appendLine(`🔍 [New Folder] Checking: ${normalizedPath}`);
-        this.outputChannel.appendLine(`🔍 [New Folder] Dev folder: ${devFolderNormalized}`);
+        this.debugLogger.log(`🔍 [New Folder] Checking: ${normalizedPath}`);
+        this.debugLogger.log(`🔍 [New Folder] Dev folder: ${devFolderNormalized}`);
         
         // Get relative path from dev folder
         let relativePath = normalizedPath;
@@ -1158,14 +1159,14 @@ export class FileWatcher {
             }
         }
         
-        this.outputChannel.appendLine(`🔍 [New Folder] Relative path: ${relativePath}`);
+        this.debugLogger.log(`🔍 [New Folder] Relative path: ${relativePath}`);
         
         // Must be in post-types/[type]/[folder] format
         const parts = relativePath.split('/');
-        this.outputChannel.appendLine(`🔍 [New Folder] Parts: ${JSON.stringify(parts)} (length: ${parts.length})`);
+        this.debugLogger.log(`🔍 [New Folder] Parts: ${JSON.stringify(parts)} (length: ${parts.length})`);
         
         if (parts.length !== 3 || parts[0] !== 'post-types') {
-            this.outputChannel.appendLine(`🔍 [New Folder] Skipping - not a content folder (need parts.length=3, parts[0]=post-types)`);
+            this.debugLogger.log(`🔍 [New Folder] Skipping - not a content folder (need parts.length=3, parts[0]=post-types)`);
             return; // Not a content folder
         }
         
@@ -1174,13 +1175,13 @@ export class FileWatcher {
         
         // Skip if already has _ID suffix (already linked to a post)
         if (/_\d+$/.test(folderName)) {
-            this.outputChannel.appendLine(`🔍 [New Folder] Skipping - already has post ID: ${folderName}`);
+            this.debugLogger.log(`🔍 [New Folder] Skipping - already has post ID: ${folderName}`);
             return;
         }
         
         // Skip if in _trash
         if (folderName === '_trash' || relativePath.includes('/_trash/')) {
-            this.outputChannel.appendLine(`🔍 [New Folder] Skipping - in trash: ${folderName}`);
+            this.debugLogger.log(`🔍 [New Folder] Skipping - in trash: ${folderName}`);
             return;
         }
         
@@ -1189,27 +1190,30 @@ export class FileWatcher {
         const recentRename = this.recentlyRenamedFolders.get(folderName);
         if (recentRename) {
             const ageMs = Date.now() - recentRename.timestamp;
-            // If renamed within last 5 minutes, redirect to existing folder
-            if (ageMs < 5 * 60 * 1000) {
-                this.outputChannel.appendLine(`🔄 [Duplicate Prevention] "${folderName}" was recently renamed to "${recentRename.newFolder}"`);
-                this.outputChannel.appendLine(`   Redirecting to existing post (ID: ${recentRename.postId})`);
+            // If renamed within last 30 seconds, this is likely WordPress re-exporting
+            // After 30 seconds, treat as intentional new page creation
+            if (ageMs < 30 * 1000) {
+                this.debugLogger.log(`🔄 [Duplicate Prevention] "${folderName}" was recently renamed to "${recentRename.newFolder}" (${Math.round(ageMs / 1000)}s ago)`);
+                this.debugLogger.log(`   Redirecting to existing post (ID: ${recentRename.postId})`);
                 
                 // Auto-redirect: delete this duplicate folder and merge contents
+                // Don't await - let it run in background (function is already async)
                 this.redirectDuplicateFolder(normalizedPath, recentRename, postTypeFolder);
                 return;
             } else {
-                // Old entry, remove it
+                // Old entry, remove it - allow new page creation with same name
+                this.debugLogger.log(`🔍 [New Folder] Clearing old rename tracking for "${folderName}" (${Math.round(ageMs / 1000)}s ago)`);
                 this.recentlyRenamedFolders.delete(folderName);
             }
         }
         
         // Skip if already processed (but not if it's a duplicate - handled above)
         if (this.processedNewFolders.has(normalizedPath)) {
-            this.outputChannel.appendLine(`🔍 [New Folder] Skipping - already processed: ${folderName}`);
+            this.debugLogger.log(`🔍 [New Folder] Skipping - already processed: ${folderName}`);
             return;
         }
         
-        this.outputChannel.appendLine(`📁 New folder detected: ${relativePath}`);
+        this.debugLogger.log(`📁 New folder detected: ${relativePath}`);
         
         // Debounce to wait for HTML file to be created
         const debounceKey = `new-folder-${normalizedPath}`;
@@ -1234,41 +1238,41 @@ export class FileWatcher {
         folderName: string,
         relativePath: string
     ) {
-        this.outputChannel.appendLine(`🔍 [Create Post] Starting for: ${folderPath}`);
+        this.debugLogger.log(`🔍 [Create Post] Starting for: ${folderPath}`);
         
         // Check if folder still exists and has HTML file (using VS Code FS API)
         const folderExists = await vsExists(folderPath);
-        this.outputChannel.appendLine(`🔍 [Create Post] Folder exists: ${folderExists}`);
+        this.debugLogger.log(`🔍 [Create Post] Folder exists: ${folderExists}`);
         
         if (!folderExists) {
-            this.outputChannel.appendLine(`⚠️ Folder no longer exists: ${relativePath}`);
+            this.debugLogger.log(`⚠️ Folder no longer exists: ${relativePath}`);
             return;
         }
         
         // Look for HTML file (using VS Code FS API)
         const dirContents = await vsReadDir(folderPath);
-        this.outputChannel.appendLine(`🔍 [Create Post] Dir contents: ${JSON.stringify(dirContents.map(([n, t]) => `${n}(${t})`))}`);
+        this.debugLogger.log(`🔍 [Create Post] Dir contents: ${JSON.stringify(dirContents.map(([n, t]) => `${n}(${t})`))}`);
         
         const htmlFiles = dirContents
             .filter(([name, type]) => type === vscode.FileType.File && name.endsWith('.html'))
             .map(([name]) => name);
         
-        this.outputChannel.appendLine(`🔍 [Create Post] HTML files found: ${JSON.stringify(htmlFiles)}`);
+        this.debugLogger.log(`🔍 [Create Post] HTML files found: ${JSON.stringify(htmlFiles)}`);
         
         if (htmlFiles.length === 0) {
-            this.outputChannel.appendLine(`⏳ No HTML file yet in ${relativePath}, will retry when HTML is added...`);
+            this.debugLogger.log(`⏳ No HTML file yet in ${relativePath}, will retry when HTML is added...`);
             // Don't add to processedNewFolders - the HTML 'add' event will trigger another attempt
             return;
         }
         
         // Mark as processed to prevent duplicate calls
         this.processedNewFolders.add(folderPath);
-        this.outputChannel.appendLine(`✓ HTML file found: ${htmlFiles[0]}`);
+        this.debugLogger.log(`✓ HTML file found: ${htmlFiles[0]}`);
         
         // Map folder name to post type
         const postType = this.mapFolderToPostType(postTypeFolder);
         
-        this.outputChannel.appendLine(`📄 Creating ${postType} from: ${relativePath}`);
+        this.debugLogger.log(`📄 Creating ${postType} from: ${relativePath}`);
         this.statusBar.showSyncing(`Creating ${postType}...`);
         
         try {
@@ -1278,7 +1282,7 @@ export class FileWatcher {
             
             if (response.success && response.post_id) {
                 this.statusBar.showSuccess(`Created: ${response.title}`);
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `✅ Created ${postType} "${response.title}" (ID: ${response.post_id})`
                 );
                 
@@ -1292,14 +1296,14 @@ export class FileWatcher {
                     postId: response.post_id,
                     timestamp: Date.now()
                 });
-                this.outputChannel.appendLine(`   📝 Pre-tracking rename: "${folderName}" → "${newFolderName}"`);
+                this.debugLogger.log(`   📝 Pre-tracking rename: "${folderName}" → "${newFolderName}"`);
                 
                 // Mark the new folder as processed too (so we don't try to create again)
                 this.processedNewFolders.add(newFolderPath);
                 
                 await this.renameViaVSCode(folderPath, newFolderPath, folderName, newFolderName);
                 
-                this.outputChannel.appendLine(`   Folder renamed: ${folderName} → ${newFolderName}`);
+                this.debugLogger.log(`   Folder renamed: ${folderName} → ${newFolderName}`);
                 
                 // Update response with actual new folder path for notification
                 response.new_folder = `post-types/${postTypeFolder}/${newFolderName}`;
@@ -1316,13 +1320,15 @@ export class FileWatcher {
                     );
                 }
             } else {
-                this.outputChannel.appendLine(`⚠️ Could not create post: ${response.error}`);
+                this.debugLogger.log(`⚠️ Could not create post: ${response.error}`);
+                this.statusBar.showError(response.error || 'Failed to create post');
                 // Remove from processed so it can be retried
                 this.processedNewFolders.delete(folderPath);
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Failed to create post: ${error.message}`);
+            this.debugLogger.log(`❌ Failed to create post: ${error.message}`);
             this.processedNewFolders.delete(folderPath);
+            this.statusBar.showError(`Failed: ${error.message}`);
             vscode.window.showErrorMessage(`Failed to create ${postType}: ${error.message}`);
         }
     }
@@ -1337,7 +1343,7 @@ export class FileWatcher {
         oldFolderName: string,
         newFolderName: string
     ) {
-        this.outputChannel.appendLine(`🔄 [VS Code Rename] ${oldFolderName} → ${newFolderName}`);
+        this.debugLogger.log(`🔄 [VS Code Rename] ${oldFolderName} → ${newFolderName}`);
         
         try {
             // Check if target folder already exists (server already renamed)
@@ -1346,21 +1352,21 @@ export class FileWatcher {
             
             if (targetExists && !sourceExists) {
                 // Server already renamed the folder - just rename files inside
-                this.outputChannel.appendLine(`   ℹ️ Target folder already exists (server renamed). Renaming files inside...`);
+                this.debugLogger.log(`   ℹ️ Target folder already exists (server renamed). Renaming files inside...`);
                 await this.renameFilesInFolder(newFolderPath, oldFolderName, newFolderName);
                 return;
             }
             
             if (targetExists && sourceExists) {
                 // Both exist - merge source into target, then delete source
-                this.outputChannel.appendLine(`   ℹ️ Both folders exist. Merging...`);
+                this.debugLogger.log(`   ℹ️ Both folders exist. Merging...`);
                 await this.mergeAndRenameFolders(oldFolderPath, newFolderPath, oldFolderName, newFolderName);
                 return;
             }
             
             if (!sourceExists) {
                 // Source doesn't exist - nothing to rename
-                this.outputChannel.appendLine(`   ⚠️ Source folder doesn't exist. Skipping rename.`);
+                this.debugLogger.log(`   ⚠️ Source folder doesn't exist. Skipping rename.`);
                 return;
             }
             
@@ -1376,11 +1382,11 @@ export class FileWatcher {
             const folderSuccess = await vscode.workspace.applyEdit(edit);
             
             if (folderSuccess) {
-                this.outputChannel.appendLine(`   ✅ Folder renamed via VS Code API`);
+                this.debugLogger.log(`   ✅ Folder renamed via VS Code API`);
                 // Now rename files inside the new folder
                 await this.renameFilesInFolder(newFolderPath, oldFolderName, newFolderName);
             } else {
-                this.outputChannel.appendLine(`   ⚠️ VS Code folder rename failed, trying fs.rename...`);
+                this.debugLogger.log(`   ⚠️ VS Code folder rename failed, trying fs.rename...`);
                 
                 // Fallback to filesystem rename
                 await vscode.workspace.fs.rename(
@@ -1392,10 +1398,10 @@ export class FileWatcher {
                 await this.renameFilesInFolder(newFolderPath, oldFolderName, newFolderName);
             }
             
-            this.outputChannel.appendLine(`✅ [VS Code Rename] Complete`);
+            this.debugLogger.log(`✅ [VS Code Rename] Complete`);
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ [VS Code Rename] Error: ${error.message}`);
+            this.debugLogger.log(`❌ [VS Code Rename] Error: ${error.message}`);
             // Don't throw - the post was created successfully, rename is secondary
             // The folder might already be renamed by the server (old plugin version)
         }
@@ -1427,7 +1433,7 @@ export class FileWatcher {
                             { overwrite: true }
                         );
                         
-                        this.outputChannel.appendLine(`   📄 ${fileName} → ${newFileName}`);
+                        this.debugLogger.log(`   📄 ${fileName} → ${newFileName}`);
                         hasRenames = true;
                     }
                 }
@@ -1454,7 +1460,7 @@ export class FileWatcher {
                 }
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`   ⚠️ File rename error: ${error.message}`);
+            this.debugLogger.log(`   ⚠️ File rename error: ${error.message}`);
         }
     }
     
@@ -1485,7 +1491,7 @@ export class FileWatcher {
                             pathToUri(targetFilePath),
                             { overwrite: true }
                         );
-                        this.outputChannel.appendLine(`   📄 Merged: ${fileName} → ${newFileName}`);
+                        this.debugLogger.log(`   📄 Merged: ${fileName} → ${newFileName}`);
                     } catch (e) {
                         // File might already exist in target
                     }
@@ -1495,7 +1501,7 @@ export class FileWatcher {
             // Delete empty source folder
             try {
                 await vscode.workspace.fs.delete(pathToUri(sourcePath), { recursive: true });
-                this.outputChannel.appendLine(`   🗑️ Deleted source folder: ${path.basename(sourcePath)}`);
+                this.debugLogger.log(`   🗑️ Deleted source folder: ${path.basename(sourcePath)}`);
             } catch (e) {
                 // Non-critical
             }
@@ -1504,7 +1510,7 @@ export class FileWatcher {
             await this.renameFilesInFolder(targetPath, oldPrefix, newPrefix);
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`   ⚠️ Merge error: ${error.message}`);
+            this.debugLogger.log(`   ⚠️ Merge error: ${error.message}`);
         }
     }
     
@@ -1555,11 +1561,11 @@ export class FileWatcher {
             // Write result
             await vsWriteFile(resultFile, JSON.stringify(resultData, null, 2));
             
-            this.outputChannel.appendLine(`📝 [Folder Auto-Create] Notification written to: ${resultFile}`);
-            this.outputChannel.appendLine(`   AI can now read this to know the new path: ${folderName}`);
+            this.debugLogger.log(`📝 [Folder Auto-Create] Notification written to: ${resultFile}`);
+            this.debugLogger.log(`   AI can now read this to know the new path: ${folderName}`);
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`⚠️ Could not write notification file: ${error.message}`);
+            this.debugLogger.log(`⚠️ Could not write notification file: ${error.message}`);
             // Non-critical - don't throw
         }
     }
@@ -1580,12 +1586,12 @@ export class FileWatcher {
                 `/${renameInfo.newFolder}`
             );
             
-            this.outputChannel.appendLine(`🔄 [Redirect] Moving duplicate "${oldFolderName}" content to "${renameInfo.newFolder}"`);
+            this.debugLogger.log(`🔄 [Redirect] Moving duplicate "${oldFolderName}" content to "${renameInfo.newFolder}"`);
             
             // Check if target folder exists
             const targetExists = await vsExists(targetFolderPath);
             if (!targetExists) {
-                this.outputChannel.appendLine(`⚠️ [Redirect] Target folder doesn't exist: ${renameInfo.newFolder}`);
+                this.debugLogger.log(`⚠️ [Redirect] Target folder doesn't exist: ${renameInfo.newFolder}`);
                 return;
             }
             
@@ -1606,9 +1612,9 @@ export class FileWatcher {
                     try {
                         const content = await vsReadFile(srcPath);
                         await vsWriteFile(destPath, content);
-                        this.outputChannel.appendLine(`   ✅ Merged: ${fileName} → ${newFileName}`);
+                        this.debugLogger.log(`   ✅ Merged: ${fileName} → ${newFileName}`);
                     } catch (err: any) {
-                        this.outputChannel.appendLine(`   ⚠️ Could not merge ${fileName}: ${err.message}`);
+                        this.debugLogger.log(`   ⚠️ Could not merge ${fileName}: ${err.message}`);
                     }
                 }
             }
@@ -1616,9 +1622,9 @@ export class FileWatcher {
             // Delete the duplicate folder
             try {
                 await vscode.workspace.fs.delete(pathToUri(duplicateFolderPath), { recursive: true });
-                this.outputChannel.appendLine(`🗑️ [Redirect] Deleted duplicate folder: ${oldFolderName}`);
+                this.debugLogger.log(`🗑️ [Redirect] Deleted duplicate folder: ${oldFolderName}`);
             } catch (deleteErr: any) {
-                this.outputChannel.appendLine(`⚠️ [Redirect] Could not delete duplicate folder: ${deleteErr.message}`);
+                this.debugLogger.log(`⚠️ [Redirect] Could not delete duplicate folder: ${deleteErr.message}`);
             }
             
             // Write notification so AI knows where the files went
@@ -1628,12 +1634,17 @@ export class FileWatcher {
                 slug: renameInfo.newFolder.replace(/_\d+$/, '')
             }, postTypeFolder === 'pages' ? 'page' : 'post');
             
+            // IMPORTANT: Clear the tracking after successful merge
+            // This allows future folders with the same name to create NEW posts
+            this.recentlyRenamedFolders.delete(oldFolderName);
+            this.debugLogger.log(`🧹 [Redirect] Cleared rename tracking for "${oldFolderName}"`);
+            
             vscode.window.showInformationMessage(
                 `🔄 Merged duplicate folder "${oldFolderName}" into existing "${renameInfo.newFolder}"`
             );
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ [Redirect] Failed to redirect duplicate folder: ${error.message}`);
+            this.debugLogger.log(`❌ [Redirect] Failed to redirect duplicate folder: ${error.message}`);
         }
     }
     
@@ -1661,7 +1672,7 @@ export class FileWatcher {
                         
                         // Check if this file was from the old folder
                         if (uriPath.startsWith(oldFolderPathNormalized)) {
-                            this.outputChannel.appendLine(`📂 Closing old file: ${path.basename(uriPath)}`);
+                            this.debugLogger.log(`📂 Closing old file: ${path.basename(uriPath)}`);
                             
                             // Close the old tab
                             await vscode.window.tabGroups.close(tab);
@@ -1672,12 +1683,12 @@ export class FileWatcher {
             
             // Open the new file (using VS Code FS API for SSH compatibility)
             if (await vsExists(newHtmlPath)) {
-                this.outputChannel.appendLine(`📂 Opening new file: ${newFolderName}.html`);
+                this.debugLogger.log(`📂 Opening new file: ${newFolderName}.html`);
                 const newUri = vscode.Uri.file(newHtmlPath);
                 await vscode.window.showTextDocument(newUri);
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`⚠️ Could not update open editors: ${error.message}`);
+            this.debugLogger.log(`⚠️ Could not update open editors: ${error.message}`);
         }
     }
     
@@ -1703,7 +1714,7 @@ export class FileWatcher {
      * Uses VS Code's workspace.fs API for SSH compatibility
      */
     private async scanForNewFolders(postTypesPath: string) {
-        this.outputChannel.appendLine('🔍 Scanning for folders without post IDs...');
+        this.debugLogger.log('🔍 Scanning for folders without post IDs...');
         
         try {
             // Get all post type subdirectories (pages, posts, etc.) using VS Code FS API
@@ -1716,7 +1727,7 @@ export class FileWatcher {
                 );
             
             if (postTypeDirs.length === 0) {
-                this.outputChannel.appendLine('   ℹ️ No post-type folders found (pages, posts, etc.)');
+                this.debugLogger.log('   ℹ️ No post-type folders found (pages, posts, etc.)');
                 return;
             }
             
@@ -1752,12 +1763,12 @@ export class FileWatcher {
                     );
                     
                     if (!hasHtml) {
-                        this.outputChannel.appendLine(`   ⏭️ Skipping ${folderName} (no HTML file)`);
+                        this.debugLogger.log(`   ⏭️ Skipping ${folderName} (no HTML file)`);
                         continue;
                     }
                     
                     foundCount++;
-                    this.outputChannel.appendLine(`   📁 Found new folder: ${postTypeDirName}/${folderName}`);
+                    this.debugLogger.log(`   📁 Found new folder: ${postTypeDirName}/${folderName}`);
                     
                     // Build relative path for API call
                     const relativePath = `post-types/${postTypeDirName}/${folderName}`;
@@ -1768,33 +1779,33 @@ export class FileWatcher {
                         
                         if (response.success && response.post_id) {
                             createdCount++;
-                            this.outputChannel.appendLine(
+                            this.debugLogger.log(
                                 `   ✅ Created ${postType} "${response.title}" (ID: ${response.post_id})`
                             );
                             
                             // Mark as processed
                             this.processedNewFolders.add(folderPath);
                         } else {
-                            this.outputChannel.appendLine(`   ⚠️ Could not create: ${response.error}`);
+                            this.debugLogger.log(`   ⚠️ Could not create: ${response.error}`);
                         }
                     } catch (error: any) {
-                        this.outputChannel.appendLine(`   ❌ Error creating post: ${error.message}`);
+                        this.debugLogger.log(`   ❌ Error creating post: ${error.message}`);
                     }
                 }
             }
             
             if (foundCount === 0) {
-                this.outputChannel.appendLine('   ✅ No new folders found (all have post IDs)');
+                this.debugLogger.log('   ✅ No new folders found (all have post IDs)');
             } else {
-                this.outputChannel.appendLine(`🔍 Scan complete: ${createdCount}/${foundCount} posts created`);
+                this.debugLogger.log(`🔍 Scan complete: ${createdCount}/${foundCount} posts created`);
                 
                 // Log to output only, no popup
                 if (createdCount > 0) {
-                    this.outputChannel.appendLine(`✅ Created ${createdCount} new WordPress post(s) from dev folder`);
+                    this.debugLogger.log(`✅ Created ${createdCount} new WordPress post(s) from dev folder`);
                 }
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Scan error: ${error.message}`);
+            this.debugLogger.log(`❌ Scan error: ${error.message}`);
         }
     }
 
@@ -1809,11 +1820,11 @@ export class FileWatcher {
             this.themePath = assetStatus.theme_path;
 
             if (!this.themePath) {
-                this.outputChannel.appendLine('⚠️ Could not get theme path, bi-directional sync disabled');
+                this.debugLogger.log('⚠️ Could not get theme path, bi-directional sync disabled');
                 return;
             }
 
-            this.outputChannel.appendLine(`👀 Starting theme watcher for bi-directional sync: ${this.themePath}`);
+            this.debugLogger.log(`👀 Starting theme watcher for bi-directional sync: ${this.themePath}`);
 
             // Watch ALL theme files for bi-directional sync (dynamic)
             this.themeWatcher = chokidar.watch(
@@ -1847,14 +1858,14 @@ export class FileWatcher {
             });
 
             this.themeWatcher.on('error', (error) => {
-                this.outputChannel.appendLine(`❌ Theme watcher error: ${error.message}`);
+                this.debugLogger.log(`❌ Theme watcher error: ${error.message}`);
             });
 
-            this.outputChannel.appendLine('✅ Theme watcher started (bi-directional sync enabled)');
+            this.debugLogger.log('✅ Theme watcher started (bi-directional sync enabled)');
 
         } catch (error: any) {
-            this.outputChannel.appendLine(`⚠️ Could not start theme watcher: ${error.message}`);
-            this.outputChannel.appendLine('   Bi-directional sync will be disabled');
+            this.debugLogger.log(`⚠️ Could not start theme watcher: ${error.message}`);
+            this.debugLogger.log('   Bi-directional sync will be disabled');
         }
     }
 
@@ -1876,7 +1887,7 @@ export class FileWatcher {
         const timeSinceLastSync = now - lastSync;
         
         if (timeSinceLastSync < this.themeSyncCooldownMs) {
-            this.outputChannel.appendLine(
+            this.debugLogger.log(
                 `⏸️ Skipping theme→dev sync (cooldown: ${Math.round((this.themeSyncCooldownMs - timeSinceLastSync) / 1000)}s remaining)`
             );
             return;
@@ -1895,7 +1906,7 @@ export class FileWatcher {
         else if (fileName === 'style.css') fileType = 'theme stylesheet';
         else if (fileName === 'functions.php') fileType = 'theme functions';
         
-        this.outputChannel.appendLine(`🔄 Theme ${fileType} changed: ${relativePath}, syncing to dev folder...`);
+        this.debugLogger.log(`🔄 Theme ${fileType} changed: ${relativePath}, syncing to dev folder...`);
 
         // Debounce the sync
         const debounceKey = `theme-${normalizedPath}`;
@@ -1928,13 +1939,13 @@ export class FileWatcher {
             
             if (response.success) {
                 this.statusBar.showSuccess(`${fileName} synced to dev`);
-                this.outputChannel.appendLine(`✅ ${fileName} synced from theme to dev folder`);
+                this.debugLogger.log(`✅ ${fileName} synced from theme to dev folder`);
                 
                 // Show notification if enabled
                 // No popup notification - status bar shows connection
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Theme→dev sync error: ${error.message}`);
+            this.debugLogger.log(`❌ Theme→dev sync error: ${error.message}`);
         }
     }
 
@@ -1951,7 +1962,7 @@ export class FileWatcher {
         // Normalize path separators for cross-platform compatibility
         const normalizedPath = dirPath.replace(/\\/g, '/');
         
-        this.outputChannel.appendLine(`🔍 [Handle Trash] Processing ${eventType} for: ${normalizedPath}`);
+        this.debugLogger.log(`🔍 [Handle Trash] Processing ${eventType} for: ${normalizedPath}`);
         
         // Check if this is a post type folder (contains _ID suffix pattern)
         const folderName = path.basename(normalizedPath);
@@ -1959,16 +1970,16 @@ export class FileWatcher {
         
         if (!postIdMatch) {
             // Not a post folder (doesn't have _ID suffix), skip
-            this.outputChannel.appendLine(`🔍 [Handle Trash] Skipping - no _ID suffix in: ${folderName}`);
+            this.debugLogger.log(`🔍 [Handle Trash] Skipping - no _ID suffix in: ${folderName}`);
             return;
         }
 
         const postId = parseInt(postIdMatch[1], 10);
-        this.outputChannel.appendLine(`🔍 [Handle Trash] Found Post ID: ${postId}`);
+        this.debugLogger.log(`🔍 [Handle Trash] Found Post ID: ${postId}`);
 
         // Check if this folder is inside a _trash directory
         const isInTrash = normalizedPath.includes('/_trash/');
-        this.outputChannel.appendLine(`🔍 [Handle Trash] Is in trash: ${isInTrash}, Event type: ${eventType}`);
+        this.debugLogger.log(`🔍 [Handle Trash] Is in trash: ${isInTrash}, Event type: ${eventType}`);
         
         // Handle DELETE events - track for rename detection
         if (eventType === 'unlink' && !isInTrash) {
@@ -1980,8 +1991,8 @@ export class FileWatcher {
             if (pendingRestore) {
                 clearTimeout(pendingRestore);
                 this.pendingRestoreTimers.delete(postId);
-                this.outputChannel.appendLine(`🔄 [Handle Trash] RENAME detected (CREATE→DELETE): cancelled pending restore for post ${postId}`);
-                this.outputChannel.appendLine(`🔄 [Handle Trash] Skipping API call - WordPress initiated this rename`);
+                this.debugLogger.log(`🔄 [Handle Trash] RENAME detected (CREATE→DELETE): cancelled pending restore for post ${postId}`);
+                this.debugLogger.log(`🔄 [Handle Trash] Skipping API call - WordPress initiated this rename`);
                 return;
             }
             
@@ -1990,7 +2001,7 @@ export class FileWatcher {
                 path: normalizedPath,
                 timestamp: Date.now()
             });
-            this.outputChannel.appendLine(`🔍 [Handle Trash] Tracking potential rename (DELETE first) for post ${postId}`);
+            this.debugLogger.log(`🔍 [Handle Trash] Tracking potential rename (DELETE first) for post ${postId}`);
             
             // Clear after 3 seconds
             setTimeout(() => {
@@ -2008,19 +2019,19 @@ export class FileWatcher {
         if (eventType === 'add' && isInTrash) {
             // Folder appeared IN _trash → it was TRASHED
             action = 'trash';
-            this.outputChannel.appendLine(`🗑️ Detected folder moved TO trash: ${folderName} (Post ID: ${postId})`);
+            this.debugLogger.log(`🗑️ Detected folder moved TO trash: ${folderName} (Post ID: ${postId})`);
         } else if (eventType === 'unlink' && isInTrash) {
             // Folder disappeared FROM _trash → it was RESTORED
             action = 'restore';
-            this.outputChannel.appendLine(`♻️ Detected folder moved FROM trash: ${folderName} (Post ID: ${postId})`);
+            this.debugLogger.log(`♻️ Detected folder moved FROM trash: ${folderName} (Post ID: ${postId})`);
         } else if (eventType === 'add' && !isInTrash && normalizedPath.includes('/post-types/')) {
             // Folder appeared OUTSIDE _trash in post-types
             // Check if this is a rename (DELETE came first)
             const recentDelete = this.recentFolderDeletes.get(postId);
             if (recentDelete && (Date.now() - recentDelete.timestamp) < 3000) {
                 // DELETE came first → this is a rename (DELETE→CREATE)
-                this.outputChannel.appendLine(`🔄 [Handle Trash] RENAME detected (DELETE→CREATE): ${path.basename(recentDelete.path)} → ${folderName}`);
-                this.outputChannel.appendLine(`🔄 [Handle Trash] Skipping API call - WordPress initiated this rename`);
+                this.debugLogger.log(`🔄 [Handle Trash] RENAME detected (DELETE→CREATE): ${path.basename(recentDelete.path)} → ${folderName}`);
+                this.debugLogger.log(`🔄 [Handle Trash] Skipping API call - WordPress initiated this rename`);
                 this.recentFolderDeletes.delete(postId);
                 return;
             }
@@ -2031,14 +2042,14 @@ export class FileWatcher {
                 if (renameInfo.newFolder === folderName && renameInfo.postId === postId) {
                     const ageMs = Date.now() - renameInfo.timestamp;
                     if (ageMs < 30000) { // Within last 30 seconds
-                        this.outputChannel.appendLine(`🔄 [Handle Trash] Skipping - this is our own rename: ${oldName} → ${folderName}`);
+                        this.debugLogger.log(`🔄 [Handle Trash] Skipping - this is our own rename: ${oldName} → ${folderName}`);
                         return;
                     }
                 }
             }
             
             // No recent delete - might be restore, but wait to see if DELETE follows
-            this.outputChannel.appendLine(`🔍 [Handle Trash] Folder appeared outside trash - waiting to detect rename pattern...`);
+            this.debugLogger.log(`🔍 [Handle Trash] Folder appeared outside trash - waiting to detect rename pattern...`);
             
             // Schedule a delayed restore (can be cancelled if DELETE arrives)
             const existingTimer = this.pendingRestoreTimers.get(postId);
@@ -2054,25 +2065,25 @@ export class FileWatcher {
                     if (renameInfo.newFolder === folderName && renameInfo.postId === postId) {
                         const ageMs = Date.now() - renameInfo.timestamp;
                         if (ageMs < 30000) {
-                            this.outputChannel.appendLine(`🔄 [Handle Trash] Skipping restore - this was our rename: ${oldName} → ${folderName}`);
+                            this.debugLogger.log(`🔄 [Handle Trash] Skipping restore - this was our rename: ${oldName} → ${folderName}`);
                             return;
                         }
                     }
                 }
                 
-                this.outputChannel.appendLine(`♻️ Detected restore (no DELETE followed): ${folderName} (Post ID: ${postId})`);
+                this.debugLogger.log(`♻️ Detected restore (no DELETE followed): ${folderName} (Post ID: ${postId})`);
                 this.debounceFolderAction(postId, 'restore');
             }, 1000); // Wait 1 second for potential DELETE event
             
             this.pendingRestoreTimers.set(postId, timer);
             return; // Don't process immediately - wait for potential rename detection
         } else {
-            this.outputChannel.appendLine(`🔍 [Handle Trash] No action determined (eventType=${eventType}, isInTrash=${isInTrash})`);
+            this.debugLogger.log(`🔍 [Handle Trash] No action determined (eventType=${eventType}, isInTrash=${isInTrash})`);
         }
 
         if (!action) {
             // Not a trash-related action, skip
-            this.outputChannel.appendLine(`🔍 [Handle Trash] Skipping - no action determined`);
+            this.debugLogger.log(`🔍 [Handle Trash] Skipping - no action determined`);
             return;
         }
 
@@ -2093,7 +2104,7 @@ export class FileWatcher {
         const timeSinceLastAction = now - lastActionTime;
 
         if (timeSinceLastAction < this.folderActionCooldownMs) {
-            this.outputChannel.appendLine(
+            this.debugLogger.log(
                 `⏸️ Skipping folder action (cooldown: ${Math.round((this.folderActionCooldownMs - timeSinceLastAction) / 1000)}s remaining)`
             );
             return;
@@ -2118,7 +2129,7 @@ export class FileWatcher {
      */
     private async executeFolderAction(postId: number, action: 'trash' | 'restore') {
         try {
-            this.outputChannel.appendLine(`📤 Sending ${action} action for post ${postId}...`);
+            this.debugLogger.log(`📤 Sending ${action} action for post ${postId}...`);
 
             // Send folder action to WordPress
             const response = await this.restClient.sendFolderAction(postId, action);
@@ -2128,7 +2139,7 @@ export class FileWatcher {
 
             if (response.success) {
                 const actionVerb = action === 'trash' ? 'trashed' : 'restored';
-                this.outputChannel.appendLine(`✅ Post ${postId} ${actionVerb} successfully`);
+                this.debugLogger.log(`✅ Post ${postId} ${actionVerb} successfully`);
                 
                 // Show notification
                 const config = vscode.workspace.getConfiguration('skylit');
@@ -2140,7 +2151,7 @@ export class FileWatcher {
             }
 
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Folder action error: ${error.message}`);
+            this.debugLogger.log(`❌ Folder action error: ${error.message}`);
             vscode.window.showErrorMessage(`Failed to ${action} post ${postId}: ${error.message}`);
         }
     }
@@ -2163,7 +2174,7 @@ export class FileWatcher {
         const timeSinceLastSync = now - lastSync;
         
         if (timeSinceLastSync < this.syncCooldownMs) {
-            this.outputChannel.appendLine(
+            this.debugLogger.log(
                 `⏸️ Skipping dev→theme sync (cooldown: ${Math.round((this.syncCooldownMs - timeSinceLastSync) / 1000)}s remaining)`
             );
             return;
@@ -2182,7 +2193,7 @@ export class FileWatcher {
         else if (fileName === 'style.css') fileType = 'theme stylesheet';
         else if (fileName === 'functions.php') fileType = 'theme functions';
         
-        this.outputChannel.appendLine(`📦 ${fileType} changed: ${relativePath}, syncing to theme...`);
+        this.debugLogger.log(`📦 ${fileType} changed: ${relativePath}, syncing to theme...`);
         
         try {
             this.statusBar.showSyncing(fileName);
@@ -2201,7 +2212,7 @@ export class FileWatcher {
             
             if (response.success) {
                 this.statusBar.showSuccess(`${fileName} synced`);
-                this.outputChannel.appendLine(`✅ ${relativePath} synced to theme`);
+                this.debugLogger.log(`✅ ${relativePath} synced to theme`);
                 
                 const config = vscode.workspace.getConfiguration('skylit');
                 if (config.get<boolean>('showNotifications', true)) {
@@ -2209,7 +2220,7 @@ export class FileWatcher {
                 }
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Theme sync error: ${error.message}`);
+            this.debugLogger.log(`❌ Theme sync error: ${error.message}`);
             vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
         }
     }
@@ -2239,14 +2250,14 @@ export class FileWatcher {
         const timeSinceLastSync = now - lastSync;
         
         if (timeSinceLastSync < this.syncCooldownMs) {
-            this.outputChannel.appendLine(
+            this.debugLogger.log(
                 `⏸️ Skipping dev→theme sync (cooldown: ${Math.round((this.syncCooldownMs - timeSinceLastSync) / 1000)}s remaining)`
             );
             return;
         }
         
         const assetType = isCss ? 'CSS' : isJs ? 'JS' : 'asset';
-        this.outputChannel.appendLine(`📦 ${assetType} asset changed: ${fileName}, syncing to theme...`);
+        this.debugLogger.log(`📦 ${assetType} asset changed: ${fileName}, syncing to theme...`);
         
         try {
             this.statusBar.showSyncing(fileName);
@@ -2268,12 +2279,12 @@ export class FileWatcher {
             
             if (response.success) {
                 this.statusBar.showSuccess(`${fileName} synced to theme`);
-                this.outputChannel.appendLine(`✅ ${fileName} synced to active theme`);
+                this.debugLogger.log(`✅ ${fileName} synced to active theme`);
                 
                 // No popup notification - status bar is enough
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Asset sync error: ${error.message}`);
+            this.debugLogger.log(`❌ Asset sync error: ${error.message}`);
         }
     }
 
@@ -2291,13 +2302,13 @@ export class FileWatcher {
         const timeSinceLastSync = now - lastSync;
         
         if (timeSinceLastSync < this.syncCooldownMs) {
-            this.outputChannel.appendLine(
+            this.debugLogger.log(
                 `⏸️ Skipping dev→theme PHP sync (cooldown: ${Math.round((this.syncCooldownMs - timeSinceLastSync) / 1000)}s remaining)`
             );
             return;
         }
         
-        this.outputChannel.appendLine(`📄 PHP include changed: ${fileName}, syncing to theme...`);
+        this.debugLogger.log(`📄 PHP include changed: ${fileName}, syncing to theme...`);
         
         try {
             this.statusBar.showSyncing(fileName);
@@ -2319,12 +2330,12 @@ export class FileWatcher {
             
             if (response.success) {
                 this.statusBar.showSuccess(`${fileName} synced to theme`);
-                this.outputChannel.appendLine(`✅ ${fileName} synced to active theme`);
+                this.debugLogger.log(`✅ ${fileName} synced to active theme`);
                 
                 // No popup notification - status bar is enough
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ PHP sync error: ${error.message}`);
+            this.debugLogger.log(`❌ PHP sync error: ${error.message}`);
         }
     }
 
@@ -2363,7 +2374,7 @@ export class FileWatcher {
         const timeSinceLastSync = now - lastSync;
         
         if (timeSinceLastSync < this.syncCooldownMs) {
-            this.outputChannel.appendLine(
+            this.debugLogger.log(
                 `⏸️ Skipping theme structure sync (cooldown: ${Math.round((this.syncCooldownMs - timeSinceLastSync) / 1000)}s remaining)`
             );
             return;
@@ -2383,7 +2394,7 @@ export class FileWatcher {
             fileType = 'theme functions';
         }
         
-        this.outputChannel.appendLine(`🎨 ${fileType} changed: ${fileName}, syncing to theme...`);
+        this.debugLogger.log(`🎨 ${fileType} changed: ${fileName}, syncing to theme...`);
         
         try {
             this.statusBar.showSyncing(fileName);
@@ -2405,7 +2416,7 @@ export class FileWatcher {
             
             if (response.success) {
                 this.statusBar.showSuccess(`${fileName} synced to theme`);
-                this.outputChannel.appendLine(`✅ ${fileName} synced to active theme`);
+                this.debugLogger.log(`✅ ${fileName} synced to active theme`);
                 
                 const config = vscode.workspace.getConfiguration('skylit');
                 if (config.get<boolean>('showNotifications', true)) {
@@ -2413,7 +2424,7 @@ export class FileWatcher {
                 }
             }
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Theme structure sync error: ${error.message}`);
+            this.debugLogger.log(`❌ Theme structure sync error: ${error.message}`);
         }
     }
 
@@ -2446,7 +2457,7 @@ export class FileWatcher {
             const timeSinceLastSync = now - lastSync;
             
             if (timeSinceLastSync < this.syncCooldownMs) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `⏸️ Skipping sync (cooldown: ${Math.round((this.syncCooldownMs - timeSinceLastSync) / 1000)}s remaining)`
                 );
                 return;
@@ -2455,7 +2466,7 @@ export class FileWatcher {
             // Extract post info from file path
             const postInfo = this.extractPostInfo(filePath);
             if (!postInfo) {
-                this.outputChannel.appendLine(`⚠️ Cannot extract post info from: ${filePath}`);
+                this.debugLogger.log(`⚠️ Cannot extract post info from: ${filePath}`);
                 return;
             }
 
@@ -2467,7 +2478,7 @@ export class FileWatcher {
             try {
                 const checkResult = await this.restClient.checkForChanges(postId);
                 if (checkResult.skip_import) {
-                    this.outputChannel.appendLine(
+                    this.debugLogger.log(
                         `⏭️ Skipping sync (recent export - circular sync prevention)`
                     );
                     
@@ -2478,7 +2489,7 @@ export class FileWatcher {
                 }
             } catch (error) {
                 // If check fails, continue with sync (better to sync than skip)
-                this.outputChannel.appendLine(`⚠️ Could not check export status, proceeding with sync`);
+                this.debugLogger.log(`⚠️ Could not check export status, proceeding with sync`);
             }
             
             // Save folding state BEFORE syncing (in case WordPress exports back)
@@ -2522,7 +2533,7 @@ export class FileWatcher {
             }
 
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Sync error: ${error.message}`);
+            this.debugLogger.log(`❌ Sync error: ${error.message}`);
             vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
         }
     }
@@ -2540,24 +2551,24 @@ export class FileWatcher {
             const blockChanges = await this.restClient.getBlockChanges(postId);
             
             if (!blockChanges.success || !blockChanges.has_data) {
-                this.outputChannel.appendLine('📂 No block change data available for folding restoration');
+                this.debugLogger.log('📂 No block change data available for folding restoration');
                 return;
             }
             
             const unchangedBlocks = blockChanges.unchanged_blocks || [];
             
             if (unchangedBlocks.length === 0) {
-                this.outputChannel.appendLine('📂 No unchanged blocks to restore folds for');
+                this.debugLogger.log('📂 No unchanged blocks to restore folds for');
                 return;
             }
             
-            this.outputChannel.appendLine(
+            this.debugLogger.log(
                 `📂 Block changes: ${blockChanges.blocks_changed} changed, ${blockChanges.blocks_unchanged} unchanged`
             );
             
             // If file was unchanged, all blocks keep their folding
             if (blockChanges.file_unchanged) {
-                this.outputChannel.appendLine('📂 File unchanged - all folding preserved');
+                this.debugLogger.log('📂 File unchanged - all folding preserved');
                 return;
             }
             
@@ -2566,7 +2577,7 @@ export class FileWatcher {
             
         } catch (error: any) {
             // Don't fail silently but also don't spam errors
-            this.outputChannel.appendLine(`⚠️ Could not restore folding: ${error.message}`);
+            this.debugLogger.log(`⚠️ Could not restore folding: ${error.message}`);
         }
     }
 
@@ -2605,12 +2616,12 @@ export class FileWatcher {
      */
     private startCursorTracking() {
         if (!this.cursorTrackingEnabled) {
-            this.outputChannel.appendLine('⏭️ Cursor tracking disabled via settings');
+            this.debugLogger.log('⏭️ Cursor tracking disabled via settings');
             return;
         }
         
-        this.outputChannel.appendLine('🎯 Starting cursor tracking for Gutenberg sync');
-        this.outputChannel.appendLine(`   Dev folder: ${this.devFolder}`);
+        this.debugLogger.log('🎯 Starting cursor tracking for Gutenberg sync');
+        this.debugLogger.log(`   Dev folder: ${this.devFolder}`);
         
         this.cursorSelectionListener = vscode.window.onDidChangeTextEditorSelection((e) => {
             this.handleCursorChange(e);
@@ -2647,26 +2658,26 @@ export class FileWatcher {
             const filePath = editor.document.uri.fsPath.replace(/\\/g, '/');
             const cursorLine = editor.selection.active.line + 1; // 1-based
             
-            this.outputChannel.appendLine(`🎯 [Cursor] Processing: line ${cursorLine} in ${filePath.split('/').pop()}`);
+            this.debugLogger.log(`🎯 [Cursor] Processing: line ${cursorLine} in ${filePath.split('/').pop()}`);
             
             // Extract post ID from parent directory (e.g., "homepage_65/homepage_65.html" → 65)
             // The folder name contains the _ID suffix, not the file name
             const parentDir = path.dirname(filePath);
             const postId = this.extractPostIdFromPath(parentDir);
             if (!postId) {
-                this.outputChannel.appendLine(`🎯 [Cursor] ❌ Could not extract post ID from folder: ${path.basename(parentDir)}`);
+                this.debugLogger.log(`🎯 [Cursor] ❌ Could not extract post ID from folder: ${path.basename(parentDir)}`);
                 return;
             }
             
-            this.outputChannel.appendLine(`🎯 [Cursor] Post ID: ${postId}`);
+            this.debugLogger.log(`🎯 [Cursor] Post ID: ${postId}`);
             
             // Read metadata JSON for this post
             const metadataPath = posixJoin(this.devFolder, '.skylit', 'metadata', `${postId}.json`);
             
-            this.outputChannel.appendLine(`🎯 [Cursor] Metadata path: ${metadataPath}`);
+            this.debugLogger.log(`🎯 [Cursor] Metadata path: ${metadataPath}`);
             
             if (!await vsExists(metadataPath)) {
-                this.outputChannel.appendLine(`🎯 [Cursor] ❌ Metadata file does not exist`);
+                this.debugLogger.log(`🎯 [Cursor] ❌ Metadata file does not exist`);
                 return;
             }
             
@@ -2674,25 +2685,25 @@ export class FileWatcher {
             const metadata = JSON.parse(metadataContent);
             
             if (!metadata.blocks || metadata.blocks.length === 0) {
-                this.outputChannel.appendLine(`🎯 [Cursor] ❌ No blocks in metadata`);
+                this.debugLogger.log(`🎯 [Cursor] ❌ No blocks in metadata`);
                 return;
             }
             
-            this.outputChannel.appendLine(`🎯 [Cursor] Found ${metadata.blocks.length} blocks in metadata`);
+            this.debugLogger.log(`🎯 [Cursor] Found ${metadata.blocks.length} blocks in metadata`);
             
             // Find block for current cursor line
             const block = this.findBlockForLine(metadata.blocks, cursorLine);
             
             if (!block) {
-                this.outputChannel.appendLine(`🎯 [Cursor] ❌ No block found for line ${cursorLine}`);
+                this.debugLogger.log(`🎯 [Cursor] ❌ No block found for line ${cursorLine}`);
                 return;
             }
             
-            this.outputChannel.appendLine(`🎯 [Cursor] Found block: ${block.layoutBlockId} (${block.blockName}) at line ${block.line}`);
+            this.debugLogger.log(`🎯 [Cursor] Found block: ${block.layoutBlockId} (${block.blockName}) at line ${block.line}`);
             
             // Only write if block changed (avoid redundant writes)
             if (block.layoutBlockId === this.lastCursorBlockId) {
-                this.outputChannel.appendLine(`🎯 [Cursor] Same block, skipping write`);
+                this.debugLogger.log(`🎯 [Cursor] Same block, skipping write`);
                 return;
             }
             
@@ -2702,15 +2713,15 @@ export class FileWatcher {
             const activeBlockPath = posixJoin(this.devFolder, '.skylit', 'active-block.txt');
             const content = `${postId}:${block.layoutBlockId}`;
             
-            this.outputChannel.appendLine(`🎯 [Cursor] Writing to: ${activeBlockPath}`);
-            this.outputChannel.appendLine(`🎯 [Cursor] Content: ${content}`);
+            this.debugLogger.log(`🎯 [Cursor] Writing to: ${activeBlockPath}`);
+            this.debugLogger.log(`🎯 [Cursor] Content: ${content}`);
             
             await vsWriteFile(activeBlockPath, content);
             
-            this.outputChannel.appendLine(`🎯 [Cursor] ✅ Active block file written!`);
+            this.debugLogger.log(`🎯 [Cursor] ✅ Active block file written!`);
             
         } catch (error: any) {
-            this.outputChannel.appendLine(`🎯 [Cursor] ❌ Error: ${error.message}`);
+            this.debugLogger.log(`🎯 [Cursor] ❌ Error: ${error.message}`);
         }
     }
     
@@ -2751,43 +2762,43 @@ export class FileWatcher {
         // Stop main file watcher
         if (this.watcher) {
             this.watcher.close();
-            this.outputChannel.appendLine('👋 File watcher stopped');
+            this.debugLogger.log('👋 File watcher stopped');
         }
 
         // Stop trash folder watcher (chokidar)
         if (this.trashWatcher) {
             this.trashWatcher.close();
-            this.outputChannel.appendLine('👋 Trash folder watcher stopped');
+            this.debugLogger.log('👋 Trash folder watcher stopped');
         }
         
         // Stop VS Code native trash watcher
         if (this.vscodeTrashWatcher) {
             this.vscodeTrashWatcher.dispose();
-            this.outputChannel.appendLine('👋 VS Code trash watcher stopped');
+            this.debugLogger.log('👋 VS Code trash watcher stopped');
         }
 
         // Stop theme folder watcher (bi-directional sync)
         if (this.themeWatcher) {
             this.themeWatcher.close();
-            this.outputChannel.appendLine('👋 Theme watcher stopped');
+            this.debugLogger.log('👋 Theme watcher stopped');
         }
         
         // Stop new folder watcher (chokidar - legacy)
         if (this.newFolderWatcher) {
             this.newFolderWatcher.close();
-            this.outputChannel.appendLine('👋 New folder watcher stopped');
+            this.debugLogger.log('👋 New folder watcher stopped');
         }
         
         // Stop VS Code native new folder watcher
         if (this.vscodeNewFolderWatcher) {
             this.vscodeNewFolderWatcher.dispose();
-            this.outputChannel.appendLine('👋 VS Code new folder watcher stopped');
+            this.debugLogger.log('👋 VS Code new folder watcher stopped');
         }
         
         // Stop metadata watcher
         if (this.metadataWatcher) {
             this.metadataWatcher.close();
-            this.outputChannel.appendLine('👋 Metadata watcher stopped');
+            this.debugLogger.log('👋 Metadata watcher stopped');
         }
         
         // Clear metadata cache
@@ -2837,7 +2848,7 @@ export class FileWatcher {
         if (this.cursorSelectionListener) {
             this.cursorSelectionListener.dispose();
             this.cursorSelectionListener = null;
-            this.outputChannel.appendLine('👋 Cursor tracking stopped');
+            this.debugLogger.log('👋 Cursor tracking stopped');
         }
         if (this.cursorDebounceTimer) {
             clearTimeout(this.cursorDebounceTimer);

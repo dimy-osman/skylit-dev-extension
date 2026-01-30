@@ -4,12 +4,13 @@
  */
 
 import * as vscode from 'vscode';
+import { DebugLogger } from './debugLogger';
 
 export class ProtocolHandler {
-    private outputChannel: vscode.OutputChannel;
+    private debugLogger: DebugLogger;
 
-    constructor(outputChannel: vscode.OutputChannel) {
-        this.outputChannel = outputChannel;
+    constructor(debugLogger: DebugLogger) {
+        this.debugLogger = debugLogger;
     }
 
     /**
@@ -23,20 +24,20 @@ export class ProtocolHandler {
         });
 
         context.subscriptions.push(handler);
-        this.outputChannel.appendLine('✅ Protocol handler registered for skylit://');
+        this.debugLogger.log('✅ Protocol handler registered for skylit://');
     }
 
     /**
      * Handle skylit:// URI
      */
     private async handleUri(uri: vscode.Uri) {
-        this.outputChannel.appendLine(`📍 Received URI: ${uri.toString()}`);
+        this.debugLogger.log(`📍 Received URI: ${uri.toString()}`);
 
         // Parse URI: skylit://jump?file=/path/to/file.html&line=42
         if (uri.path === '/jump' || uri.path === 'jump') {
             await this.handleJumpToFile(uri);
         } else {
-            this.outputChannel.appendLine(`⚠️ Unknown protocol action: ${uri.path}`);
+            this.debugLogger.log(`⚠️ Unknown protocol action: ${uri.path}`);
         }
     }
 
@@ -52,14 +53,14 @@ export class ProtocolHandler {
             const columnStr = params.get('column');
 
             if (!filePath) {
-                this.outputChannel.appendLine('❌ Missing file parameter');
+                this.debugLogger.error('❌ Missing file parameter');
                 return;
             }
 
             const line = lineStr ? parseInt(lineStr, 10) : 1;
             const column = columnStr ? parseInt(columnStr, 10) : 0;
 
-            this.outputChannel.appendLine(`📂 Opening file: ${filePath} at line ${line}`);
+            this.debugLogger.log(`📂 Opening file: ${filePath} at line ${line}`);
 
             // Open file in editor
             const fileUri = vscode.Uri.file(filePath);
@@ -82,11 +83,11 @@ export class ProtocolHandler {
                 vscode.TextEditorRevealType.InCenter
             );
 
-            this.outputChannel.appendLine(`✅ Opened ${filePath} at line ${line}`);
+            this.debugLogger.info(`✅ Opened ${filePath} at line ${line}`);
             // No popup notification - status bar is enough
 
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Error opening file: ${error.message}`);
+            this.debugLogger.error(`❌ Error opening file: ${error.message}`);
         }
     }
 }

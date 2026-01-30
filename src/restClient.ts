@@ -5,6 +5,7 @@
 
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import * as vscode from 'vscode';
+import { DebugLogger } from './debugLogger';
 import {
     SyncResponse,
     FolderActionResponse,
@@ -16,18 +17,18 @@ import {
 
 export class RestClient {
     private client: AxiosInstance;
-    private outputChannel: vscode.OutputChannel;
+    private debugLogger: DebugLogger;
     private baseUrl: string;
     private token: string;
 
     constructor(
         siteUrl: string,
         token: string,
-        outputChannel: vscode.OutputChannel
+        debugLogger: DebugLogger
     ) {
         this.baseUrl = siteUrl.replace(/\/$/, ''); // Remove trailing slash
         this.token = token;
-        this.outputChannel = outputChannel;
+        this.debugLogger = debugLogger;
 
         // Create axios instance
         this.client = axios.create({
@@ -51,14 +52,14 @@ export class RestClient {
      */
     async validateToken(): Promise<boolean> {
         try {
-            this.outputChannel.appendLine('🔑 Validating auth token...');
+            this.debugLogger.log('🔑 Validating auth token...');
             
             const response = await this.client.get<TokenValidationResponse>(
                 '/sync/validate-token'
             );
 
             if (response.data.valid) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `✅ Token valid for user: ${response.data.user?.name || 'Unknown'}`
                 );
                 return true;
@@ -66,7 +67,7 @@ export class RestClient {
 
             return false;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Token validation failed: ${error.message}`);
+            this.debugLogger.log(`❌ Token validation failed: ${error.message}`);
             return false;
         }
     }
@@ -83,7 +84,7 @@ export class RestClient {
      * Sync file instantly to WordPress
      */
     async syncFile(postId: number, html: string, css: string): Promise<SyncResponse> {
-        this.outputChannel.appendLine(`📤 Syncing post ${postId}...`);
+        this.debugLogger.log(`📤 Syncing post ${postId}...`);
         
         try {
             const response = await this.client.post<SyncResponse>(
@@ -97,14 +98,14 @@ export class RestClient {
             );
 
             if (response.data.success) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `✅ Synced! ${response.data.blocks_updated || 0} blocks updated`
                 );
             }
 
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Sync failed: ${error.message}`);
+            this.debugLogger.log(`❌ Sync failed: ${error.message}`);
             throw error;
         }
     }
@@ -116,7 +117,7 @@ export class RestClient {
         postId: number,
         action: 'trash' | 'restore' | 'delete'
     ): Promise<FolderActionResponse> {
-        this.outputChannel.appendLine(`📁 Folder action: ${action} post ${postId}`);
+        this.debugLogger.log(`📁 Folder action: ${action} post ${postId}`);
         
         try {
             const response = await this.client.post<FolderActionResponse>(
@@ -128,12 +129,12 @@ export class RestClient {
             );
 
             if (response.data.success) {
-                this.outputChannel.appendLine(`✅ ${action} successful`);
+                this.debugLogger.log(`✅ ${action} successful`);
             }
 
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Folder action failed: ${error.message}`);
+            this.debugLogger.log(`❌ Folder action failed: ${error.message}`);
             throw error;
         }
     }
@@ -211,18 +212,18 @@ export class RestClient {
      * Sync theme.json from dev folder to active theme
      */
     async syncThemeJson(): Promise<{ success: boolean; message?: string }> {
-        this.outputChannel.appendLine('🎨 Syncing theme.json...');
+        this.debugLogger.log('🎨 Syncing theme.json...');
         
         try {
             const response = await this.client.post('/theme/sync-json');
             
             if (response.data.success) {
-                this.outputChannel.appendLine('✅ theme.json synced');
+                this.debugLogger.log('✅ theme.json synced');
             }
             
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ theme.json sync failed: ${error.message}`);
+            this.debugLogger.log(`❌ theme.json sync failed: ${error.message}`);
             throw error;
         }
     }
@@ -231,13 +232,13 @@ export class RestClient {
      * Import global CSS from file to database
      */
     async importGlobalCss(): Promise<{ success: boolean }> {
-        this.outputChannel.appendLine('🎨 Importing global CSS...');
+        this.debugLogger.log('🎨 Importing global CSS...');
         
         try {
             const response = await this.client.post('/global-css/import');
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Global CSS import failed: ${error.message}`);
+            this.debugLogger.log(`❌ Global CSS import failed: ${error.message}`);
             throw error;
         }
     }
@@ -248,7 +249,7 @@ export class RestClient {
      */
     async syncAssets(direction: 'to_theme' | 'from_theme' = 'to_theme'): Promise<AssetSyncResponse> {
         const directionLabel = direction === 'to_theme' ? 'dev → theme' : 'theme → dev';
-        this.outputChannel.appendLine(`📦 Syncing assets (${directionLabel})...`);
+        this.debugLogger.log(`📦 Syncing assets (${directionLabel})...`);
         
         try {
             const response = await this.client.post<AssetSyncResponse>('/assets/sync', {
@@ -256,12 +257,12 @@ export class RestClient {
             });
             
             if (response.data.success) {
-                this.outputChannel.appendLine(`✅ Assets synced (${directionLabel})`);
+                this.debugLogger.log(`✅ Assets synced (${directionLabel})`);
             }
             
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Asset sync failed: ${error.message}`);
+            this.debugLogger.log(`❌ Asset sync failed: ${error.message}`);
             throw error;
         }
     }
@@ -304,13 +305,13 @@ export class RestClient {
         skipped: string[];
         errors: string[];
     }> {
-        this.outputChannel.appendLine('📥 Importing new files from dev folder...');
+        this.debugLogger.log('📥 Importing new files from dev folder...');
         
         try {
             const response = await this.client.post('/sync/import-new');
             
             if (response.data.success) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `✅ Import complete: ${response.data.imported?.length || 0} imported, ` +
                     `${response.data.skipped?.length || 0} skipped`
                 );
@@ -318,7 +319,7 @@ export class RestClient {
             
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Import failed: ${error.message}`);
+            this.debugLogger.log(`❌ Import failed: ${error.message}`);
             throw error;
         }
     }
@@ -338,7 +339,7 @@ export class RestClient {
         folder_name?: string;
         error?: string;
     }> {
-        this.outputChannel.appendLine(`📄 Creating empty ${postType}: "${title}" (${slug})`);
+        this.debugLogger.log(`📄 Creating empty ${postType}: "${title}" (${slug})`);
         
         try {
             const response = await this.client.post('/sync/create-empty-post', {
@@ -348,14 +349,14 @@ export class RestClient {
             });
             
             if (response.data.success) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `✅ Created: ${response.data.title} (ID: ${response.data.post_id})`
                 );
             }
             
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Create empty post failed: ${error.message}`);
+            this.debugLogger.log(`❌ Create empty post failed: ${error.message}`);
             throw error;
         }
     }
@@ -380,7 +381,7 @@ export class RestClient {
         message?: string;
         error?: string;
     }> {
-        this.outputChannel.appendLine(`📄 Creating post from folder: ${folderPath} (${postType}, skipRename: ${skipRename})`);
+        this.debugLogger.log(`📄 Creating post from folder: ${folderPath} (${postType}, skipRename: ${skipRename})`);
         
         try {
             const response = await this.client.post('/sync/create-post', {
@@ -390,14 +391,14 @@ export class RestClient {
             });
             
             if (response.data.success) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `✅ Created: ${response.data.title} (ID: ${response.data.post_id})`
                 );
             }
             
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Create post failed: ${error.message}`);
+            this.debugLogger.log(`❌ Create post failed: ${error.message}`);
             throw error;
         }
     }
@@ -417,7 +418,7 @@ export class RestClient {
         message?: string;
         error?: string;
     }> {
-        this.outputChannel.appendLine(`📝 Updating slug for post ${postId}: ${newSlug}`);
+        this.debugLogger.log(`📝 Updating slug for post ${postId}: ${newSlug}`);
         
         try {
             const response = await this.client.post('/sync/update-slug', {
@@ -426,14 +427,14 @@ export class RestClient {
             });
             
             if (response.data.success) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `✅ Slug updated: ${response.data.old_slug} → ${response.data.new_slug}`
                 );
             }
             
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Update slug failed: ${error.message}`);
+            this.debugLogger.log(`❌ Update slug failed: ${error.message}`);
             throw error;
         }
     }
@@ -457,7 +458,7 @@ export class RestClient {
         message?: string;
         error?: string;
     }> {
-        this.outputChannel.appendLine(`📝 Updating post ${postId} from metadata`);
+        this.debugLogger.log(`📝 Updating post ${postId} from metadata`);
         
         try {
             const response = await this.client.post('/sync/update-from-metadata', {
@@ -466,14 +467,14 @@ export class RestClient {
             });
             
             if (response.data.success) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `✅ Metadata synced: ${response.data.message}`
                 );
             }
             
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`❌ Metadata sync failed: ${error.message}`);
+            this.debugLogger.log(`❌ Metadata sync failed: ${error.message}`);
             throw error;
         }
     }
@@ -511,7 +512,7 @@ export class RestClient {
             const response = await this.client.get('/sync/rename-notifications', { params });
             
             if (response.data.count > 0) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `📁 ${response.data.count} rename notification(s) received`
                 );
             }
@@ -542,23 +543,58 @@ export class RestClient {
         };
         message: string;
     }> {
-        this.outputChannel.appendLine('🔄 Processing pending folder renames...');
+        this.debugLogger.log('🔄 Processing pending folder renames...');
         
         try {
             const response = await this.client.post('/sync/process-pending-renames');
             
             if (response.data.results.success > 0) {
-                this.outputChannel.appendLine(
+                this.debugLogger.log(
                     `✅ ${response.data.results.success} pending rename(s) completed`
                 );
             }
             
             return response.data;
         } catch (error: any) {
-            this.outputChannel.appendLine(`⚠️ Could not process pending renames: ${error.message}`);
+            this.debugLogger.log(`⚠️ Could not process pending renames: ${error.message}`);
             return {
                 success: false,
                 results: { processed: 0, success: 0, failed: 0 },
+                message: error.message
+            };
+        }
+    }
+
+    /**
+     * Cleanup orphaned metadata files
+     * Removes metadata for posts/folders that no longer exist
+     */
+    async cleanupMetadata(): Promise<{
+        success: boolean;
+        deleted: number;
+        kept: number;
+        message: string;
+    }> {
+        this.debugLogger.log('🧹 Cleaning up orphaned metadata...');
+        
+        try {
+            const response = await this.client.post('/sync/cleanup-metadata');
+            
+            if (response.data.success && response.data.deleted > 0) {
+                this.debugLogger.log(
+                    `✅ ${response.data.message}`
+                );
+            } else if (response.data.deleted === 0) {
+                this.debugLogger.log('✅ No orphaned metadata found');
+            }
+            
+            return response.data;
+        } catch (error: any) {
+            this.debugLogger.log(`⚠️ Metadata cleanup failed: ${error.message}`);
+            return {
+                success: false,
+                deleted: 0,
+                kept: 0,
                 message: error.message
             };
         }
@@ -574,11 +610,11 @@ export class RestClient {
             const data = error.response.data as any;
             const message = data?.error || data?.message || error.message;
 
-            this.outputChannel.appendLine(`❌ API Error ${status}: ${message}`);
+            this.debugLogger.log(`❌ API Error ${status}: ${message}`);
             
             // Log additional details if available
             if (data?.error && data?.error !== message) {
-                this.outputChannel.appendLine(`   Details: ${data.error}`);
+                this.debugLogger.log(`   Details: ${data.error}`);
             }
 
             if (status === 401 || status === 403) {
@@ -587,17 +623,17 @@ export class RestClient {
                 );
             } else if (status === 404) {
                 // Log but don't popup for 404 - might be during plugin updates
-                this.outputChannel.appendLine('   Skylit plugin API not found. Ensure plugin is activated and updated.');
+                this.debugLogger.log('   Skylit plugin API not found. Ensure plugin is activated and updated.');
             }
             // Don't show popup for 400 errors during batch operations (scan)
             // The error is already logged to output channel
         } else if (error.request) {
             // Request made but no response
-            this.outputChannel.appendLine('❌ No response from WordPress');
+            this.debugLogger.log('❌ No response from WordPress');
             // Only log, don't popup - might be temporary network issue
         } else {
             // Error setting up request
-            this.outputChannel.appendLine(`❌ Request error: ${error.message}`);
+            this.debugLogger.log(`❌ Request error: ${error.message}`);
         }
 
         return Promise.reject(error);

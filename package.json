@@ -2,7 +2,7 @@
   "name": "skylit-dev-io",
   "displayName": "Skylit.DEV I/O - WordPress Sync",
   "description": "Instant sync between WordPress Gutenberg and your IDE. Solves WP Cron unreliability on local development.",
-	"version": "1.9.10",
+	"version": "1.10.1",
   "publisher": "dimy-osman",
   "license": "GPL-2.0-or-later",
   "engines": {
@@ -89,6 +89,11 @@
           "type": "string",
           "default": "",
           "description": "WordPress site URL (auto-detected from wp-config.php if empty)"
+        },
+        "skylit.debugOutput": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug output in the Output panel (useful for troubleshooting)"
         }
       }
     }

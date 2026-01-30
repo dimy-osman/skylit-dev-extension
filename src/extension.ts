@@ -10,6 +10,7 @@ import { FileWatcher } from './fileWatcher';
 import { RestClient } from './restClient';
 import { StatusBar } from './statusBar';
 import { ProtocolHandler } from './protocolHandler';
+import { DebugLogger } from './debugLogger';
 import { ConnectionState } from './types';
 
 let workspaceManager: WorkspaceManager;
@@ -18,22 +19,24 @@ let fileWatcher: FileWatcher | null = null;
 let restClient: RestClient | null = null;
 let statusBar: StatusBar;
 let protocolHandler: ProtocolHandler;
-let outputChannel: vscode.OutputChannel;
+let debugLogger: DebugLogger;
 let statusCheckInterval: NodeJS.Timeout | null = null;
+let metadataCleanupInterval: NodeJS.Timeout | null = null;
 let currentDevPath: string | null = null;
 
 /**
  * Extension activation
  */
 export async function activate(context: vscode.ExtensionContext) {
-    outputChannel = vscode.window.createOutputChannel('Skylit.DEV I/O');
-    outputChannel.appendLine('🚀 Skylit.DEV I/O extension activated');
+    const outputChannel = vscode.window.createOutputChannel('Skylit.DEV I/O');
+    debugLogger = new DebugLogger(outputChannel);
+    debugLogger.info('🚀 Skylit.DEV I/O extension activated');
 
     // Initialize managers
-    workspaceManager = new WorkspaceManager(outputChannel);
-    authManager = new AuthManager(context, outputChannel);
-    statusBar = new StatusBar(outputChannel);
-    protocolHandler = new ProtocolHandler(outputChannel);
+    workspaceManager = new WorkspaceManager(debugLogger);
+    authManager = new AuthManager(context, debugLogger);
+    statusBar = new StatusBar(debugLogger);
+    protocolHandler = new ProtocolHandler(debugLogger);
 
     // Register protocol handler
     protocolHandler.register(context);
@@ -45,10 +48,10 @@ export async function activate(context: vscode.ExtensionContext) {
     const sites = await workspaceManager.detectWordPressSites();
     
     if (sites.length === 0) {
-        outputChannel.appendLine('⚠️ No WordPress sites with Skylit.DEV plugin detected');
-        outputChannel.appendLine('ℹ️ Make sure:');
-        outputChannel.appendLine('   1. WordPress is in your workspace (or in a subdirectory like public_html/)');
-        outputChannel.appendLine('   2. Skylit.DEV plugin is installed and activated');
+        debugLogger.warn('⚠️ No WordPress sites with Skylit.DEV plugin detected');
+        debugLogger.info('ℹ️ Make sure:');
+        debugLogger.info('   1. WordPress is in your workspace (or in a subdirectory like public_html/)');
+        debugLogger.info('   2. Skylit.DEV plugin is installed and activated');
         statusBar.updateStatus('disconnected', 'No Skylit.DEV detected');
         
         // Show helpful notification
@@ -64,9 +67,9 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
     }
 
-    outputChannel.appendLine(`✅ Detected ${sites.length} WordPress site(s) with Skylit.DEV plugin`);
+    debugLogger.info(`✅ Detected ${sites.length} WordPress site(s) with Skylit.DEV plugin`);
     sites.forEach(site => {
-        outputChannel.appendLine(`   - ${site.name}: ${site.siteUrl}`);
+        debugLogger.log(`   - ${site.name}: ${site.siteUrl}`);
     });
 
     // Check if auto-connect is enabled (default: true)
@@ -74,7 +77,7 @@ export async function activate(context: vscode.ExtensionContext) {
     const autoConnect = config.get<boolean>('autoConnect', true);
 
     if (autoConnect) {
-        outputChannel.appendLine('🔄 Auto-connect enabled, attempting connection...');
+        debugLogger.log('🔄 Auto-connect enabled, attempting connection...');
         
         // Auto-connect to the first site (or let user choose if multiple)
         const siteToConnect = sites[0];
@@ -82,12 +85,12 @@ export async function activate(context: vscode.ExtensionContext) {
         try {
             await connectToWordPress(siteToConnect, context, true); // Pass true for isAutoConnect
         } catch (error: any) {
-            outputChannel.appendLine(`⚠️ Auto-connect failed: ${error.message}`);
-            outputChannel.appendLine('💡 You can manually connect by clicking the status bar or running "Skylit: Connect"');
+            debugLogger.warn(`⚠️ Auto-connect failed: ${error.message}`);
+            debugLogger.info('💡 You can manually connect by clicking the status bar or running "Skylit: Connect"');
             statusBar.updateStatus('disconnected', 'Auto-connect failed - Click to retry');
         }
     } else {
-        outputChannel.appendLine('ℹ️ Auto-connect disabled in settings');
+        debugLogger.log('ℹ️ Auto-connect disabled in settings');
         statusBar.updateStatus('disconnected', 'Click to connect to WordPress');
     }
 }
@@ -102,14 +105,20 @@ export function deactivate() {
         statusCheckInterval = null;
     }
     
+    // Stop metadata cleanup interval
+    if (metadataCleanupInterval) {
+        clearInterval(metadataCleanupInterval);
+        metadataCleanupInterval = null;
+    }
+    
     if (fileWatcher) {
         fileWatcher.dispose();
     }
     if (statusBar) {
         statusBar.dispose();
     }
-    outputChannel.appendLine('👋 Skylit.DEV I/O extension deactivated');
-    outputChannel.dispose();
+    debugLogger.info('👋 Skylit.DEV I/O extension deactivated');
+    debugLogger.dispose();
 }
 
 /**
@@ -119,8 +128,8 @@ function registerCommands(context: vscode.ExtensionContext) {
     // Scan for WordPress command
     context.subscriptions.push(
         vscode.commands.registerCommand('skylit.scanWorkspace', async () => {
-            outputChannel.show(); // Show output channel
-            outputChannel.appendLine('🔍 Manual WordPress scan triggered...');
+            debugLogger.show(); // Show output channel
+            debugLogger.log('🔍 Manual WordPress scan triggered...');
             
             const sites = await workspaceManager.detectWordPressSites();
             
@@ -130,7 +139,7 @@ function registerCommands(context: vscode.ExtensionContext) {
                     'View Output'
                 ).then(selection => {
                     if (selection === 'View Output') {
-                        outputChannel.show();
+                        debugLogger.show();
                     }
                 });
                 return;
@@ -153,7 +162,7 @@ function registerCommands(context: vscode.ExtensionContext) {
     // Connect command
     context.subscriptions.push(
         vscode.commands.registerCommand('skylit.connect', async () => {
-            outputChannel.appendLine('🔌 Manual connection requested...');
+            debugLogger.log('🔌 Manual connection requested...');
             
             const sites = await workspaceManager.detectWordPressSites();
             
@@ -196,6 +205,9 @@ function registerCommands(context: vscode.ExtensionContext) {
             // Stop jump polling
             stopJumpPolling();
             
+            // Stop metadata cleanup
+            stopMetadataCleanup();
+            
             if (fileWatcher) {
                 fileWatcher.dispose();
                 fileWatcher = null;
@@ -203,8 +215,7 @@ function registerCommands(context: vscode.ExtensionContext) {
             restClient = null;
             currentDevPath = null;
             statusBar.updateStatus('disconnected', 'Disconnected');
-            outputChannel.appendLine('Skylit.DEV I/O: Disconnected from WordPress');
-            outputChannel.appendLine('🔌 Disconnected from WordPress');
+            debugLogger.info('🔌 Disconnected from WordPress');
         })
     );
 
@@ -228,7 +239,7 @@ function registerCommands(context: vscode.ExtensionContext) {
             if (!token) return;
 
             await authManager.saveToken(site.siteUrl, token);
-            outputChannel.appendLine('✅ Auth token saved! Connecting...');
+            debugLogger.info('✅ Auth token saved! Connecting...');
             await connectToWordPress(site, context);
         })
     );
@@ -248,7 +259,7 @@ function registerCommands(context: vscode.ExtensionContext) {
             }
 
             const filePath = editor.document.uri.fsPath;
-            outputChannel.appendLine(`🔄 Manually syncing: ${filePath}`);
+            debugLogger.log(`🔄 Manually syncing: ${filePath}`);
             
             // Trigger file watcher sync
             if (fileWatcher) {
@@ -262,12 +273,12 @@ function registerCommands(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('skylit.createPost', async (args?: { title?: string; slug?: string; postType?: string }) => {
             if (!restClient) {
-                outputChannel.appendLine('❌ [createPost] Not connected to WordPress');
+                debugLogger.error('❌ [createPost] Not connected to WordPress');
                 return { success: false, error: 'Not connected to WordPress' };
             }
 
             if (!currentDevPath) {
-                outputChannel.appendLine('❌ [createPost] Dev path not available');
+                debugLogger.error('❌ [createPost] Dev path not available');
                 return { success: false, error: 'Dev path not available' };
             }
 
@@ -295,7 +306,7 @@ function registerCommands(context: vscode.ExtensionContext) {
                     .trim();
             }
 
-            outputChannel.appendLine(`📄 [createPost] Creating ${postType}: "${title}" (${slug})`);
+            debugLogger.log(`📄 [createPost] Creating ${postType}: "${title}" (${slug})`);
 
             try {
                 // Create empty post in WordPress to get the ID
@@ -307,9 +318,9 @@ function registerCommands(context: vscode.ExtensionContext) {
                     const folderPath = `post-types/${postTypeFolder}/${folderName}`;
                     const fullPath = `${currentDevPath.replace(/\\/g, '/')}/${folderPath}`;
 
-                    outputChannel.appendLine(`✅ [createPost] Created ${postType} ID: ${response.post_id}`);
-                    outputChannel.appendLine(`   Folder path: ${folderPath}`);
-                    outputChannel.appendLine(`   Full path: ${fullPath}`);
+                    debugLogger.info(`✅ [createPost] Created ${postType} ID: ${response.post_id}`);
+                    debugLogger.log(`   Folder path: ${folderPath}`);
+                    debugLogger.log(`   Full path: ${fullPath}`);
 
                     // Write result to file for AI to read
                     const resultFile = `${currentDevPath}/.skylit/last-created-post.json`;
@@ -348,11 +359,11 @@ function registerCommands(context: vscode.ExtensionContext) {
 
                     return resultData;
                 } else {
-                    outputChannel.appendLine(`❌ [createPost] Failed: ${response.error}`);
+                    debugLogger.error(`❌ [createPost] Failed: ${response.error}`);
                     return { success: false, error: response.error };
                 }
             } catch (error: any) {
-                outputChannel.appendLine(`❌ [createPost] Error: ${error.message}`);
+                debugLogger.error(`❌ [createPost] Error: ${error.message}`);
                 return { success: false, error: error.message };
             }
         })
@@ -401,18 +412,18 @@ function registerCommands(context: vscode.ExtensionContext) {
  * Connect to WordPress site
  */
 async function connectToWordPress(site: any, context: vscode.ExtensionContext, isAutoConnect: boolean = false) {
-    outputChannel.appendLine(`🔌 Connecting to ${site.name}...`);
+    debugLogger.info(`🔌 Connecting to ${site.name}...`);
     statusBar.updateStatus('connecting', 'Connecting...');
 
     try {
         // Check if site URL is localhost and prompt for actual URL
         let siteUrl = site.siteUrl;
         if (siteUrl === 'http://localhost' || siteUrl === 'https://localhost') {
-            outputChannel.appendLine(`⚠️ Default localhost URL detected`);
+            debugLogger.warn(`⚠️ Default localhost URL detected`);
             
             // Don't prompt during auto-connect, just fail gracefully
             if (isAutoConnect) {
-                outputChannel.appendLine('💡 Please set "skylit.siteUrl" in VS Code settings');
+                debugLogger.info('💡 Please set "skylit.siteUrl" in VS Code settings');
                 statusBar.updateStatus('disconnected', 'Configure site URL');
                 return;
             }
@@ -432,7 +443,7 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
             
             siteUrl = userUrl.trim().replace(/\/$/, '');
             site.siteUrl = siteUrl;
-            outputChannel.appendLine(`✅ Using URL: ${siteUrl}`);
+            debugLogger.info(`✅ Using URL: ${siteUrl}`);
             
             // Save to settings for future use
             const vscodeConfig = vscode.workspace.getConfiguration('skylit');
@@ -443,11 +454,11 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
         let token = await authManager.getToken(site.siteUrl);
         
         if (!token) {
-            outputChannel.appendLine('⚠️ No auth token found');
+            debugLogger.warn('⚠️ No auth token found');
             
             // Don't prompt during auto-connect, just fail gracefully
             if (isAutoConnect) {
-                outputChannel.appendLine('💡 Run "Skylit: Setup Auth Token" or click the status bar to connect');
+                debugLogger.info('💡 Run "Skylit: Setup Auth Token" or click the status bar to connect');
                 statusBar.updateStatus('disconnected', 'No auth token - Click to setup');
                 
                 // Show a non-intrusive info message
@@ -480,18 +491,18 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
         }
 
         // Create REST client
-        restClient = new RestClient(site.siteUrl, token, outputChannel);
+        restClient = new RestClient(site.siteUrl, token, debugLogger);
 
         // Validate token
         const isValid = await restClient.validateToken();
         if (!isValid) {
-            outputChannel.appendLine('❌ Invalid auth token');
+            debugLogger.error('❌ Invalid auth token');
             
             // Clear the invalid token
             await authManager.clearToken(site.siteUrl);
             
             if (isAutoConnect) {
-                outputChannel.appendLine('💡 Token is invalid or expired. Please setup a new token.');
+                debugLogger.info('💡 Token is invalid or expired. Please setup a new token.');
                 statusBar.updateStatus('error', 'Invalid token - Click to setup');
                 
                 vscode.window.showWarningMessage(
@@ -518,16 +529,16 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
             return;
         }
 
-        outputChannel.appendLine('✅ Token validated');
+        debugLogger.info('✅ Token validated');
 
         // Get plugin status and dev folder from WordPress
         const status = await restClient.getStatus();
-        outputChannel.appendLine(`✅ Connected to Skylit plugin v${status.version}`);
-        outputChannel.appendLine(`   Dev folder from WordPress: ${status.dev_path}`);
+        debugLogger.info(`✅ Connected to Skylit plugin v${status.version}`);
+        debugLogger.log(`   Dev folder from WordPress: ${status.dev_path}`);
 
         // Validate that WordPress provided a dev folder path
         if (!status.dev_path || status.dev_path.trim() === '') {
-            outputChannel.appendLine('❌ WordPress did not provide a dev folder path');
+            debugLogger.error('❌ WordPress did not provide a dev folder path');
             vscode.window.showErrorMessage(
                 'Dev folder not configured in WordPress. Please set it in Admin → Skylit.DEV → Dev Sync'
             );
@@ -541,13 +552,13 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
             fileWatcher.dispose();
         }
 
-        outputChannel.appendLine(`👀 Starting file watcher for: ${status.dev_path}`);
+        debugLogger.log(`👀 Starting file watcher for: ${status.dev_path}`);
 
         fileWatcher = new FileWatcher(
             status.dev_path,
             restClient,
             statusBar,
-            outputChannel
+            debugLogger
         );
 
         await fileWatcher.start();
@@ -568,8 +579,8 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
                 
                 // Check if dev folder location changed in WordPress
                 if (updatedStatus.dev_path !== currentDevPath) {
-                    outputChannel.appendLine(`🔄 Dev folder changed: ${currentDevPath} → ${updatedStatus.dev_path}`);
-                    outputChannel.appendLine(`   Restarting file watcher...`);
+                    debugLogger.log(`🔄 Dev folder changed: ${currentDevPath} → ${updatedStatus.dev_path}`);
+                    debugLogger.log(`   Restarting file watcher...`);
                     
                     // Restart file watcher with new path
                     if (fileWatcher) {
@@ -580,23 +591,28 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
                         updatedStatus.dev_path,
                         restClient,
                         statusBar,
-                        outputChannel
+                        debugLogger
                     );
                     
                     await fileWatcher.start();
                     currentDevPath = updatedStatus.dev_path;
                     
-                    outputChannel.appendLine(`✅ Dev folder location updated: ${updatedStatus.dev_path}`);
-                    outputChannel.appendLine('   Restarting file watcher...');
+                    debugLogger.info(`✅ Dev folder location updated: ${updatedStatus.dev_path}`);
                 }
             } catch (error: any) {
                 // Silently fail - don't spam errors if WordPress is temporarily unavailable
-                outputChannel.appendLine(`⚠️ Status check failed: ${error.message}`);
+                debugLogger.log(`⚠️ Status check failed: ${error.message}`);
             }
         }, 60000); // Check every 60 seconds
 
         // Start jump-to-code polling (every 500ms for responsiveness)
         startJumpPolling();
+
+        // Run initial metadata cleanup on startup
+        performMetadataCleanup();
+
+        // Start periodic metadata cleanup (every 5 minutes)
+        startMetadataCleanup();
 
         statusBar.updateStatus('connected', 'Connected');
         
@@ -619,9 +635,8 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
         vscode.window.showInformationMessage(displayMessage);
 
     } catch (error: any) {
-        outputChannel.appendLine(`❌ Connection failed: ${error.message}`);
+        debugLogger.error(`❌ Connection failed: ${error.message}`);
         statusBar.updateStatus('error', 'Connection failed');
-        outputChannel.appendLine(`❌ Failed to connect: ${error.message}`);
     }
 }
 
@@ -635,7 +650,7 @@ function startJumpPolling() {
         clearInterval(jumpPollingInterval);
     }
     
-    outputChannel.appendLine('📍 Starting jump-to-code polling...');
+    debugLogger.log('📍 Starting jump-to-code polling...');
     
     jumpPollingInterval = setInterval(async () => {
         if (!restClient) return;
@@ -644,19 +659,19 @@ function startJumpPolling() {
             const jumpData = await restClient.getPendingJump();
             
             if (jumpData.pending && jumpData.file && jumpData.line) {
-                outputChannel.appendLine(`📍 Jump request received: ${jumpData.file}:${jumpData.line}`);
-                outputChannel.appendLine(`   Current dev path from WordPress: ${currentDevPath}`);
+                debugLogger.log(`📍 Jump request received: ${jumpData.file}:${jumpData.line}`);
+                debugLogger.log(`   Current dev path from WordPress: ${currentDevPath}`);
                 
                 // Get workspace folders to determine if we're in a remote workspace
                 const workspaceFolders = vscode.workspace.workspaceFolders;
                 if (!workspaceFolders || workspaceFolders.length === 0) {
-                    outputChannel.appendLine(`   ❌ No workspace folder found`);
+                    debugLogger.log(`   ❌ No workspace folder found`);
                     return;
                 }
                 
                 const workspaceUri = workspaceFolders[0].uri;
-                outputChannel.appendLine(`   Workspace URI scheme: ${workspaceUri.scheme}`);
-                outputChannel.appendLine(`   Workspace path: ${workspaceUri.path}`);
+                debugLogger.log(`   Workspace URI scheme: ${workspaceUri.scheme}`);
+                debugLogger.log(`   Workspace path: ${workspaceUri.path}`);
                 
                 // For remote workspaces (SSH, WSL, etc.), construct URI with the same scheme
                 // For local workspaces, use file:// scheme
@@ -669,18 +684,18 @@ function startJumpPolling() {
                         authority: workspaceUri.authority,
                         path: jumpData.file
                     });
-                    outputChannel.appendLine(`   Using remote URI scheme: ${workspaceUri.scheme}`);
+                    debugLogger.log(`   Using remote URI scheme: ${workspaceUri.scheme}`);
                 } else {
                     // Local workspace - use file:// scheme
                     fileUri = vscode.Uri.file(jumpData.file);
-                    outputChannel.appendLine(`   Using local file scheme`);
+                    debugLogger.log(`   Using local file scheme`);
                 }
                 
-                outputChannel.appendLine(`   File URI: ${fileUri.toString()}`);
-                outputChannel.appendLine(`   Attempting to open file...`);
+                debugLogger.log(`   File URI: ${fileUri.toString()}`);
+                debugLogger.log(`   Attempting to open file...`);
                 
                 const document = await vscode.workspace.openTextDocument(fileUri);
-                outputChannel.appendLine(`   ✅ Document opened: ${document.fileName}`);
+                debugLogger.log(`   ✅ Document opened: ${document.fileName}`);
                 
                 // Show document with cursor at specified line
                 const editor = await vscode.window.showTextDocument(document, {
@@ -692,7 +707,7 @@ function startJumpPolling() {
                     ),
                     viewColumn: vscode.ViewColumn.One
                 });
-                outputChannel.appendLine(`   ✅ Editor opened, showing line ${jumpData.line}`);
+                debugLogger.log(`   ✅ Editor opened, showing line ${jumpData.line}`);
                 
                 // Reveal line at center of viewport
                 editor.revealRange(
@@ -700,12 +715,12 @@ function startJumpPolling() {
                     vscode.TextEditorRevealType.InCenter
                 );
                 
-                outputChannel.appendLine(`✅ Successfully jumped to ${jumpData.file}:${jumpData.line}`);
+                debugLogger.info(`✅ Successfully jumped to ${jumpData.file}:${jumpData.line}`);
             }
         } catch (error: any) {
             // Log actual errors (not just "no pending jumps")
             if (error.message && !error.message.includes('No pending') && !error.message.includes('404')) {
-                outputChannel.appendLine(`⚠️ Jump error: ${error.message}`);
+                debugLogger.warn(`⚠️ Jump error: ${error.message}`);
             }
         }
     }, 500); // Poll every 500ms for responsiveness
@@ -715,6 +730,53 @@ function stopJumpPolling() {
     if (jumpPollingInterval) {
         clearInterval(jumpPollingInterval);
         jumpPollingInterval = null;
-        outputChannel.appendLine('📍 Jump-to-code polling stopped');
+        debugLogger.log('📍 Jump-to-code polling stopped');
+    }
+}
+
+/**
+ * Perform metadata cleanup
+ * Removes orphaned metadata files for deleted posts/folders
+ */
+async function performMetadataCleanup() {
+    if (!restClient) {
+        return;
+    }
+    
+    try {
+        const result = await restClient.cleanupMetadata();
+        
+        if (result.deleted > 0) {
+            debugLogger.info(`🧹 Metadata cleanup: ${result.deleted} orphaned file(s) removed, ${result.kept} kept`);
+        }
+    } catch (error: any) {
+        // Silent fail - don't interrupt normal operation
+        debugLogger.log(`⚠️ Metadata cleanup error: ${error.message}`);
+    }
+}
+
+/**
+ * Start periodic metadata cleanup (every 5 minutes)
+ */
+function startMetadataCleanup() {
+    if (metadataCleanupInterval) {
+        clearInterval(metadataCleanupInterval);
+    }
+    
+    debugLogger.log('🧹 Starting periodic metadata cleanup (every 5 minutes)...');
+    
+    metadataCleanupInterval = setInterval(async () => {
+        await performMetadataCleanup();
+    }, 5 * 60 * 1000); // 5 minutes
+}
+
+/**
+ * Stop metadata cleanup interval
+ */
+function stopMetadataCleanup() {
+    if (metadataCleanupInterval) {
+        clearInterval(metadataCleanupInterval);
+        metadataCleanupInterval = null;
+        debugLogger.log('🧹 Metadata cleanup stopped');
     }
 }
