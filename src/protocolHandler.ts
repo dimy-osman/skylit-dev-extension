@@ -43,6 +43,7 @@ export class ProtocolHandler {
 
     /**
      * Handle jump-to-file action
+     * Security: Validates file is within workspace boundaries
      */
     private async handleJumpToFile(uri: vscode.Uri) {
         try {
@@ -57,8 +58,45 @@ export class ProtocolHandler {
                 return;
             }
 
-            const line = lineStr ? parseInt(lineStr, 10) : 1;
-            const column = columnStr ? parseInt(columnStr, 10) : 0;
+            // Validate line and column bounds (prevent NaN issues)
+            const line = Math.max(1, Math.min(1000000, parseInt(lineStr || '1', 10) || 1));
+            const column = Math.max(0, Math.min(10000, parseInt(columnStr || '0', 10) || 0));
+
+            // Security: Validate file is within workspace boundaries
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+                this.debugLogger.error('❌ No workspace folder found - cannot validate file path');
+                vscode.window.showErrorMessage('Cannot open file: No workspace folder is open');
+                return;
+            }
+
+            // Normalize path for comparison
+            const normalizedFilePath = filePath.replace(/\\/g, '/');
+            
+            // Check if file is within any workspace folder
+            const isInWorkspace = workspaceFolders.some(folder => {
+                const folderPath = folder.uri.fsPath.replace(/\\/g, '/');
+                return normalizedFilePath.startsWith(folderPath);
+            });
+
+            if (!isInWorkspace) {
+                // File is outside workspace - require user confirmation
+                this.debugLogger.warn(`⚠️ File outside workspace: ${filePath}`);
+                
+                const choice = await vscode.window.showWarningMessage(
+                    `Security: This file is outside your workspace.\n\n${filePath}\n\nDo you want to open it?`,
+                    { modal: true },
+                    'Open File',
+                    'Cancel'
+                );
+
+                if (choice !== 'Open File') {
+                    this.debugLogger.log('❌ User cancelled opening file outside workspace');
+                    return;
+                }
+                
+                this.debugLogger.log('✅ User approved opening file outside workspace');
+            }
 
             this.debugLogger.log(`📂 Opening file: ${filePath} at line ${line}`);
 
@@ -88,6 +126,7 @@ export class ProtocolHandler {
 
         } catch (error: any) {
             this.debugLogger.error(`❌ Error opening file: ${error.message}`);
+            vscode.window.showErrorMessage(`Could not open file: ${error.message}`);
         }
     }
 }

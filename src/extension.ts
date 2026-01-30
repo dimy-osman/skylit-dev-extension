@@ -349,6 +349,29 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
             await vscodeConfig.update('siteUrl', siteUrl, vscode.ConfigurationTarget.Workspace);
         }
 
+        // Security: Warn if connecting over HTTP (not HTTPS)
+        const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|::1)/i.test(siteUrl);
+        const isHttps = siteUrl.startsWith('https://');
+
+        if (!isHttps && !isLocalhost) {
+            debugLogger.warn('⚠️ Security Warning: Connecting over HTTP');
+            
+            const choice = await vscode.window.showWarningMessage(
+                '⚠️ Security Warning\n\nYou are connecting over HTTP instead of HTTPS. Your auth token will be transmitted in cleartext and could be intercepted.\n\nUse HTTPS in production for secure communication.',
+                { modal: true },
+                'Continue Anyway',
+                'Cancel'
+            );
+
+            if (choice !== 'Continue Anyway') {
+                debugLogger.info('❌ User cancelled HTTP connection');
+                statusBar.updateStatus('disconnected', 'Connection cancelled (use HTTPS)');
+                return;
+            }
+            
+            debugLogger.warn('⚠️ User acknowledged HTTP security risk and continued');
+        }
+
         // Check for saved token
         let token = await authManager.getToken(site.siteUrl);
         
@@ -540,95 +563,136 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
 }
 
 /**
- * Poll for jump-to-code requests
+ * Poll for jump-to-code requests with exponential backoff
  */
 let jumpPollingInterval: NodeJS.Timeout | null = null;
+let jumpPollIntervalMs: number = 500; // Start at 500ms
+const JUMP_POLL_MIN_INTERVAL = 500;
+const JUMP_POLL_MAX_INTERVAL = 30000; // Max 30 seconds
+let consecutiveErrors: number = 0;
 
 function startJumpPolling() {
     if (jumpPollingInterval) {
-        clearInterval(jumpPollingInterval);
+        clearTimeout(jumpPollingInterval);
     }
+    
+    // Reset to default interval
+    jumpPollIntervalMs = JUMP_POLL_MIN_INTERVAL;
+    consecutiveErrors = 0;
     
     debugLogger.log('📍 Starting jump-to-code polling...');
     
-    jumpPollingInterval = setInterval(async () => {
-        if (!restClient) return;
+    pollForJump();
+}
+
+async function pollForJump() {
+    if (!restClient) return;
+    
+    try {
+        const jumpData = await restClient.getPendingJump();
         
-        try {
-            const jumpData = await restClient.getPendingJump();
+        // Success - reset interval to fast polling
+        if (consecutiveErrors > 0) {
+            debugLogger.log(`✅ Jump polling recovered, resetting interval to ${JUMP_POLL_MIN_INTERVAL}ms`);
+        }
+        jumpPollIntervalMs = JUMP_POLL_MIN_INTERVAL;
+        consecutiveErrors = 0;
+        
+        if (jumpData.pending && jumpData.file && jumpData.line) {
+            debugLogger.log(`📍 Jump request received: ${jumpData.file}:${jumpData.line}`);
+            debugLogger.log(`   Current dev path from WordPress: ${currentDevPath}`);
             
-            if (jumpData.pending && jumpData.file && jumpData.line) {
-                debugLogger.log(`📍 Jump request received: ${jumpData.file}:${jumpData.line}`);
-                debugLogger.log(`   Current dev path from WordPress: ${currentDevPath}`);
-                
-                // Get workspace folders to determine if we're in a remote workspace
-                const workspaceFolders = vscode.workspace.workspaceFolders;
-                if (!workspaceFolders || workspaceFolders.length === 0) {
-                    debugLogger.log(`   ❌ No workspace folder found`);
-                    return;
-                }
-                
-                const workspaceUri = workspaceFolders[0].uri;
-                debugLogger.log(`   Workspace URI scheme: ${workspaceUri.scheme}`);
-                debugLogger.log(`   Workspace path: ${workspaceUri.path}`);
-                
-                // For remote workspaces (SSH, WSL, etc.), construct URI with the same scheme
-                // For local workspaces, use file:// scheme
-                let fileUri: vscode.Uri;
-                
-                if (workspaceUri.scheme !== 'file') {
-                    // Remote workspace - use the workspace's URI scheme
-                    fileUri = vscode.Uri.from({
-                        scheme: workspaceUri.scheme,
-                        authority: workspaceUri.authority,
-                        path: jumpData.file
-                    });
-                    debugLogger.log(`   Using remote URI scheme: ${workspaceUri.scheme}`);
-                } else {
-                    // Local workspace - use file:// scheme
-                    fileUri = vscode.Uri.file(jumpData.file);
-                    debugLogger.log(`   Using local file scheme`);
-                }
-                
-                debugLogger.log(`   File URI: ${fileUri.toString()}`);
-                debugLogger.log(`   Attempting to open file...`);
-                
-                const document = await vscode.workspace.openTextDocument(fileUri);
-                debugLogger.log(`   ✅ Document opened: ${document.fileName}`);
-                
-                // Show document with cursor at specified line
-                const editor = await vscode.window.showTextDocument(document, {
-                    selection: new vscode.Range(
-                        jumpData.line - 1, // VS Code uses 0-based line numbers
-                        jumpData.column || 0,
-                        jumpData.line - 1,
-                        jumpData.column || 0
-                    ),
-                    viewColumn: vscode.ViewColumn.One
+            // Get workspace folders to determine if we're in a remote workspace
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+                debugLogger.log(`   ❌ No workspace folder found`);
+                return;
+            }
+            
+            const workspaceUri = workspaceFolders[0].uri;
+            debugLogger.log(`   Workspace URI scheme: ${workspaceUri.scheme}`);
+            debugLogger.log(`   Workspace path: ${workspaceUri.path}`);
+            
+            // For remote workspaces (SSH, WSL, etc.), construct URI with the same scheme
+            // For local workspaces, use file:// scheme
+            let fileUri: vscode.Uri;
+            
+            if (workspaceUri.scheme !== 'file') {
+                // Remote workspace - use the workspace's URI scheme
+                fileUri = vscode.Uri.from({
+                    scheme: workspaceUri.scheme,
+                    authority: workspaceUri.authority,
+                    path: jumpData.file
                 });
-                debugLogger.log(`   ✅ Editor opened, showing line ${jumpData.line}`);
-                
-                // Reveal line at center of viewport
-                editor.revealRange(
-                    new vscode.Range(jumpData.line - 1, 0, jumpData.line - 1, 0),
-                    vscode.TextEditorRevealType.InCenter
+                debugLogger.log(`   Using remote URI scheme: ${workspaceUri.scheme}`);
+            } else {
+                // Local workspace - use file:// scheme
+                fileUri = vscode.Uri.file(jumpData.file);
+                debugLogger.log(`   Using local file scheme`);
+            }
+            
+            debugLogger.log(`   File URI: ${fileUri.toString()}`);
+            debugLogger.log(`   Attempting to open file...`);
+            
+            const document = await vscode.workspace.openTextDocument(fileUri);
+            debugLogger.log(`   ✅ Document opened: ${document.fileName}`);
+            
+            // Show document with cursor at specified line
+            const editor = await vscode.window.showTextDocument(document, {
+                selection: new vscode.Range(
+                    jumpData.line - 1, // VS Code uses 0-based line numbers
+                    jumpData.column || 0,
+                    jumpData.line - 1,
+                    jumpData.column || 0
+                ),
+                viewColumn: vscode.ViewColumn.One
+            });
+            debugLogger.log(`   ✅ Editor opened, showing line ${jumpData.line}`);
+            
+            // Reveal line at center of viewport
+            editor.revealRange(
+                new vscode.Range(jumpData.line - 1, 0, jumpData.line - 1, 0),
+                vscode.TextEditorRevealType.InCenter
+            );
+            
+            debugLogger.info(`✅ Successfully jumped to ${jumpData.file}:${jumpData.line}`);
+        }
+    } catch (error: any) {
+        // Log actual errors (not just "no pending jumps")
+        if (error.message && !error.message.includes('No pending') && !error.message.includes('404')) {
+            consecutiveErrors++;
+            
+            // Exponential backoff with jitter
+            if (consecutiveErrors > 1) {
+                jumpPollIntervalMs = Math.min(
+                    jumpPollIntervalMs * 2,
+                    JUMP_POLL_MAX_INTERVAL
                 );
                 
-                debugLogger.info(`✅ Successfully jumped to ${jumpData.file}:${jumpData.line}`);
-            }
-        } catch (error: any) {
-            // Log actual errors (not just "no pending jumps")
-            if (error.message && !error.message.includes('No pending') && !error.message.includes('404')) {
+                // Add jitter (±25%)
+                const jitter = jumpPollIntervalMs * 0.25 * (Math.random() - 0.5);
+                jumpPollIntervalMs = Math.round(jumpPollIntervalMs + jitter);
+                
+                debugLogger.warn(
+                    `⚠️ Jump polling error (${consecutiveErrors} consecutive): ${error.message}. ` +
+                    `Backing off to ${jumpPollIntervalMs}ms`
+                );
+            } else {
                 debugLogger.warn(`⚠️ Jump error: ${error.message}`);
             }
         }
-    }, 500); // Poll every 500ms for responsiveness
+    } finally {
+        // Schedule next poll
+        jumpPollingInterval = setTimeout(pollForJump, jumpPollIntervalMs);
+    }
 }
 
 function stopJumpPolling() {
     if (jumpPollingInterval) {
-        clearInterval(jumpPollingInterval);
+        clearTimeout(jumpPollingInterval);
         jumpPollingInterval = null;
+        jumpPollIntervalMs = JUMP_POLL_MIN_INTERVAL;
+        consecutiveErrors = 0;
         debugLogger.log('📍 Jump-to-code polling stopped');
     }
 }

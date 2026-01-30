@@ -2,6 +2,48 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.11.0] - 2026-01-30
+
+### 🔒 Security Hardening
+
+- **Protocol Handler Path Validation** (CRITICAL)
+  - Added workspace boundary validation for `skylit://jump` protocol
+  - Files outside workspace now require explicit user confirmation
+  - Line/column numbers validated and bounded (prevent NaN issues)
+  - Protects against arbitrary file access from external apps/malicious links
+  
+- **HTTP Connection Warning** (HIGH)
+  - Added security warning when connecting over HTTP instead of HTTPS
+  - Modal dialog explains token transmission risks
+  - Localhost connections bypass warning (safe for local dev)
+  - Prevents accidental cleartext token exposure on public WiFi/networks
+  
+- **Token Response Updated**
+  - Compatible with plugin v4.9.66+ minimal token response
+  - `TokenValidationResponse` now expects only `user_id` (no email/name)
+  - Reduced PII exposure in logs and API responses
+
+### ⚡ Performance & Reliability
+
+- **Smart Polling with Backoff**
+  - Jump-to-code polling now uses exponential backoff on errors
+  - Starts at 500ms, backs off to max 30s on consecutive failures
+  - ±25% jitter prevents thundering herd
+  - Auto-recovers to fast polling on success
+  - Reduces server load during network issues
+
+- **Mass Action Protection**
+  - Bulk folder operations (>5 folders) now require confirmation
+  - Modal dialog shows count and action type (trash/restore)
+  - User can cancel all pending operations
+  - Prevents accidental mass trash/restore
+
+### 🐛 Bug Fixes
+
+- Fixed protocol handler not showing errors to user
+- Improved error handling in jump-to-code with user feedback
+- Better logging for security-related decisions
+
 ## [1.10.0] - 2026-01-30
 
 ### Added

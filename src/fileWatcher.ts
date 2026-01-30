@@ -1912,8 +1912,9 @@ export class FileWatcher {
     /**
      * Debounce folder action to prevent duplicate API calls
      * Moving a folder can trigger multiple filesystem events
+     * Also checks for mass actions and prompts for confirmation
      */
-    private debounceFolderAction(postId: number, action: 'trash' | 'restore') {
+    private async debounceFolderAction(postId: number, action: 'trash' | 'restore') {
         const key = `${postId}-${action}`;
 
         // Check cooldown - don't process if we just processed this post
@@ -1936,6 +1937,30 @@ export class FileWatcher {
         // Set new timer
         const timer = setTimeout(async () => {
             this.folderActionTimers.delete(key);
+            
+            // Check for mass operations (safety feature)
+            const pendingActions = this.folderActionTimers.size;
+            if (pendingActions > 5) {
+                // Multiple folder actions queued - confirm with user
+                const actionVerb = action === 'trash' ? 'trash' : 'restore';
+                const choice = await vscode.window.showWarningMessage(
+                    `⚠️ Bulk Operation Detected\n\n${pendingActions} folders will be ${actionVerb}ed in WordPress.\n\nContinue?`,
+                    { modal: true },
+                    'Yes, Continue',
+                    'Cancel All'
+                );
+
+                if (choice !== 'Yes, Continue') {
+                    // Cancel all pending actions
+                    this.debugLogger.log(`❌ User cancelled bulk ${action} operation (${pendingActions} pending)`);
+                    this.folderActionTimers.forEach((t) => clearTimeout(t));
+                    this.folderActionTimers.clear();
+                    return;
+                }
+                
+                this.debugLogger.log(`✅ User confirmed bulk ${action} operation (${pendingActions} folders)`);
+            }
+            
             await this.executeFolderAction(postId, action);
         }, this.folderActionDebounceMs);
 

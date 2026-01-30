@@ -59,8 +59,9 @@ export class RestClient {
             );
 
             if (response.data.valid) {
+                const userId = response.data.user_id || 'Unknown';
                 this.debugLogger.log(
-                    `✅ Token valid for user: ${response.data.user?.name || 'Unknown'}`
+                    `✅ Token valid for user ID: ${userId}`
                 );
                 return true;
             }

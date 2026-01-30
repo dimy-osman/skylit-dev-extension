@@ -62,14 +62,11 @@ export interface FolderActionResponse {
 
 /**
  * Token validation REST API response
+ * Updated for v4.9.66: Returns minimal info (user_id only) for security
  */
 export interface TokenValidationResponse {
     valid: boolean;
-    user?: {
-        id: number;
-        name: string;
-        email: string;
-    };
+    user_id?: number; // Only user ID returned (no email/name for PII protection)
 }
 
 /**
