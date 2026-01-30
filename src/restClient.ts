@@ -325,43 +325,6 @@ export class RestClient {
     }
 
     /**
-     * Create an empty WordPress post and get the ID
-     * Used by AI to get the correct folder path BEFORE creating files
-     * This prevents the race condition where AI creates files in wrong folder
-     */
-    async createEmptyPost(
-        postType: string,
-        title: string,
-        slug: string
-    ): Promise<{
-        success: boolean;
-        post_id?: number;
-        folder_name?: string;
-        error?: string;
-    }> {
-        this.debugLogger.log(`📄 Creating empty ${postType}: "${title}" (${slug})`);
-        
-        try {
-            const response = await this.client.post('/sync/create-empty-post', {
-                post_type: postType,
-                title: title,
-                slug: slug
-            });
-            
-            if (response.data.success) {
-                this.debugLogger.log(
-                    `✅ Created: ${response.data.title} (ID: ${response.data.post_id})`
-                );
-            }
-            
-            return response.data;
-        } catch (error: any) {
-            this.debugLogger.log(`❌ Create empty post failed: ${error.message}`);
-            throw error;
-        }
-    }
-
-    /**
      * Create a new post from a specific folder
      * Used when a new folder is detected in post-types directory
      */
