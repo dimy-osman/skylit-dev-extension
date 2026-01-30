@@ -2,6 +2,26 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.10.4] - 2026-01-30
+
+### 📝 Marketplace-Ready Documentation
+
+- **Removed all technical internals** - No more API schemas, authentication details, or implementation code
+- **Tightened claims** - Removed marketing phrases like "perfect harmony" and "instant"
+- **Plugin dependency emphasized** - Clear warning that WordPress plugin is required
+- **Removed emoji icons** - Cleaner, more professional tone
+- **Fixed broken links** - Replaced placeholder URLs with GitHub links
+- **Safer language** - "Changes appear" vs "instant", "Optional sync" vs "automatic"
+
+## [1.10.3] - 2026-01-30
+
+### 📝 Documentation
+
+- **Simplified README** - Removed technical architecture details and code examples
+- Rewrote as straightforward user guide focusing on what it does, not how
+- Cleaner description in package.json
+- Removed obsolete `createPost` command from package.json
+
 ## [1.11.0] - 2026-01-30
 
 ### 🔒 Security Hardening

@@ -1,102 +1,95 @@
-# Skylit.DEV I/O - IDE Extension
+# Skylit.DEV I/O - WordPress Sync
 
-**Real-time file synchronization between your IDE and WordPress Gutenberg editor.**
+Real-time file synchronization between your IDE and WordPress Gutenberg.
 
-This VS Code/Cursor extension bypasses WordPress's unreliable WP Cron system by using native file system watching to detect changes and sync them instantly to WordPress via REST API.
+Work in your code editor and see changes appear in Gutenberg without manually triggering sync. Designed for local development and professional workflows where WordPress background tasks are unreliable.
 
----
+Requires the Skylit.DEV WordPress plugin. This extension will not work without the plugin installed on your WordPress site.
 
-## The Problem This Solves
+## What It Does
 
-WordPress's Skylit plugin relies on WP Cron for syncing files from the filesystem to the Gutenberg editor. On local development environments, WP Cron **does not run automatically** because there's no traffic triggering it. This means:
+- IDE → WordPress: Save HTML/CSS and sync into Gutenberg automatically
+- Optional WordPress → IDE sync (when supported by your setup)
+- Status bar controls for connect, disconnect, and quick actions
+- Folder-based workflows for creating, trashing, and restoring content (plugin-dependent)
 
-- You edit an HTML file in your IDE
-- You refresh Gutenberg
-- **Nothing happens** - your changes aren't there
-- You have to manually trigger sync from WordPress admin
+## Quick Start
 
-This extension eliminates this problem by **watching files directly in your IDE** and pushing changes to WordPress immediately.
+1. Install the Skylit.DEV WordPress plugin on your site (required)
+2. Open your WordPress project in VS Code or Cursor
+3. Click the Skylit status item in the status bar and connect
+4. Paste the auth token generated in WordPress (WP Admin → Skylit.DEV)
 
----
+## Features
 
-## How It Works
+- Automatic HTML/CSS sync to Gutenberg
+- Workspace detection for WordPress projects
+- Connection status and logs
+- Manual "Sync current file" command
+- Works on local, SSH, WSL (environment dependent)
 
-### Architecture Overview
+## Settings
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ YOUR IDE (VS Code / Cursor)                                  │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌──────────────────┐         ┌────────────────┐           │
-│  │  Chokidar        │────────▶│  REST Client   │           │
-│  │  File Watcher    │         │  (Axios)       │           │
-│  │                  │         │                │           │
-│  │  Watches:        │         │  Sends:        │           │
-│  │  - *.html        │         │  - POST sync   │           │
-│  │  - *.css         │         │  - Auth token  │           │
-│  │  - folder moves  │         │  - File data   │           │
-│  └──────────────────┘         └────────┬───────┘           │
-│                                         │                    │
-└─────────────────────────────────────────┼────────────────────┘
-                                          │
-                                          │ HTTPS
-                                          │ /wp-json/skylit/v1/
-                                          │
-                                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│ WORDPRESS SERVER                                             │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌────────────────────────────────────────────────────┐    │
-│  │  REST API Endpoint                                  │    │
-│  │  /wp-json/skylit/v1/sync/import-instant            │    │
-│  │                                                     │    │
-│  │  Receives: HTML/CSS content                        │    │
-│  │  Validates: Auth token                             │    │
-│  │  Processes: Converts HTML → Gutenberg blocks       │    │
-│  │  Updates: wp_posts table                           │    │
-│  │  Triggers: Gutenberg editor refresh                │    │
-│  └────────────────────────────────────────────────────┘    │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
-```
+File → Preferences → Settings → Skylit.DEV I/O
 
-### Component Breakdown
+- Auto Connect
+- Debounce Delay (default: 500ms)
+- Show Notifications
+- Cursor Tracking
+- Debug Output
 
-#### 1. File Watcher (`fileWatcher.ts`)
+## Commands
 
-**Technology:** Chokidar (cross-platform Node.js file watcher)
+Command Palette (Ctrl+Shift+P / Cmd+Shift+P)
 
-**What it does:**
-- Monitors the WordPress `prj-dev-root/` folder recursively
-- Detects file changes (create, modify, delete)
-- Detects folder movements (to/from `_trash/`)
-- Implements debouncing (500ms default) to avoid syncing on every keystroke
+- Skylit: Connect to WordPress
+- Skylit: Disconnect
+- Skylit: Sync Current File
+- Skylit: Setup Auth Token
+- Skylit: Scan for WordPress
+- Skylit: Show Menu
 
-**File watching logic:**
-```typescript
-// Watches these patterns
-watcher.watch('prj-dev-root/**/*.html')
-watcher.watch('prj-dev-root/**/*.css')
+## Status Bar
 
-// Ignores these
-- .git/
-- node_modules/
-- _trash/ (except for moves to/from)
+- Skylit: Connected
+- Skylit: Connecting...
+- Skylit: Disconnected
+- Skylit: Error
 
-// Events handled
-.on('change', filePath => syncFile(filePath))
-.on('add', dirPath => detectNewFolder(dirPath))
-.on('unlink', dirPath => detectFolderTrash(dirPath))
-```
+Click the status to see options and logs.
 
-**Debouncing:**
-- When you type in a file, changes fire constantly (every keystroke)
-- Extension waits 500ms after last change before syncing
-- Prevents 100s of API calls while you're typing
+## Troubleshooting
 
-#### 2. REST Client (`restClient.ts`)
+Extension won't connect
+- Confirm the WordPress plugin is installed and active
+- Regenerate the auth token in WordPress and re-enter it
+- Ensure REST API is reachable from your environment
+
+Files aren't syncing
+- Check the status bar shows "Connected"
+- Make sure you're editing files in the correct folder structure
+- Enable Debug Output to inspect logs
+
+Cursor sync not working
+- Enable Cursor Tracking in settings
+- Refresh the Gutenberg editor
+- Verify the plugin supports this feature
+
+## Requirements
+
+- VS Code or Cursor IDE (version 1.80.0 or higher)
+- Skylit.DEV WordPress plugin (required)
+- Local or remote WordPress installation
+
+## Documentation and Issues
+
+- Documentation: https://github.com/dimy-osman/skylit-dev-extension
+- Report Bugs: https://github.com/dimy-osman/skylit-dev-extension/issues
+- Plugin access: currently private while in early development
+
+## License
+
+GPL-2.0-or-later
 
 **Technology:** Axios (HTTP client)
 
