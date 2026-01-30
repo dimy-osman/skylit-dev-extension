@@ -1,8 +1,8 @@
 {
   "name": "skylit-dev-io",
   "displayName": "Skylit.DEV I/O - WordPress Sync",
-  "description": "Real-time file sync between your IDE and WordPress Gutenberg. Edit HTML/CSS and see changes instantly - no manual sync needed.",
-  "version": "1.10.4",
+  "description": "VS Code/Cursor extension for instant WordPress Gutenberg sync. Solves WP Cron unreliability on local development. Requires Skylit.DEV WordPress plugin.",
+  "version": "1.10.5",
   "publisher": "dimy-osman",
   "license": "GPL-2.0-or-later",
   "engines": {

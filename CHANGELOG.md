@@ -2,6 +2,13 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.10.5] - 2026-01-30
+
+### 📝 Updated Description
+
+- **Plugin requirement emphasized** - Description now explicitly states "Requires Skylit.DEV WordPress plugin"
+- **Clearer value proposition** - Mentions solving WP Cron unreliability on local development
+
 ## [1.10.4] - 2026-01-30
 
 ### 📝 Marketplace-Ready Documentation
