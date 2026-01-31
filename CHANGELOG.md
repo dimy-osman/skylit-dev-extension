@@ -2,6 +2,19 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.10.6] - 2026-01-30
+
+### ✨ Templates & Parts Auto-Creation Support
+
+- **Extension now watches templates and parts folders**
+  - Added watchers for `templates/` and `parts/` folders (in addition to `post-types/`)
+  - Creates WordPress templates/parts from IDE folders without IDs
+  - Example: Create `templates/archive/archive.html` → WordPress creates post, renames to `templates/archive_298/archive_298.html`
+  
+- **Folder structure detection updated**
+  - Handles: `post-types/pages/`, `templates/`, `parts/`
+  - Maps: `templates/` → `wp_template`, `parts/` → `wp_template_part`
+
 ## [1.10.5] - 2026-01-30
 
 ### 📝 Updated Description

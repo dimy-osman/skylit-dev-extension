@@ -405,78 +405,89 @@ export class FileWatcher {
      * Uses VS Code's native FileSystemWatcher for SSH compatibility
      */
     private async startNewFolderWatcher() {
-        const postTypesPath = posixJoin(this.devFolder, 'post-types');
+        // Watch post-types, templates, and parts folders
+        const foldersToWatch = [
+            { path: posixJoin(this.devFolder, 'post-types'), label: 'post-types' },
+            { path: posixJoin(this.devFolder, 'templates'), label: 'templates' },
+            { path: posixJoin(this.devFolder, 'parts'), label: 'parts' }
+        ];
         
-        this.debugLogger.log(`🔍 [New Folder Watcher] Setting up VS Code native watcher for: ${postTypesPath}`);
-        this.debugLogger.log(`🔍 [New Folder Watcher] Dev folder: ${this.devFolder}`);
-        
-        // First, scan for existing folders without IDs (created before extension started)
-        // This uses VS Code FS API for SSH compatibility
-        try {
-            await this.scanForNewFolders(postTypesPath);
-        } catch (err: any) {
-            this.debugLogger.log(`⚠️ Could not scan for existing folders: ${err.message}`);
-            this.debugLogger.log(`ℹ️ Watcher will still monitor for new folders created after connection`);
-        }
-        
-        // Create VS Code native FileSystemWatcher (works on SSH)
-        const newFolderPattern = new vscode.RelativePattern(
-            vscode.Uri.file(postTypesPath),
-            '**/*'  // Watch all files and folders
-        );
-        
-        this.vscodeNewFolderWatcher = vscode.workspace.createFileSystemWatcher(newFolderPattern, false, true, false);
-        
-        // Listen for files/folders being created (new folder or HTML file added)
-        this.vscodeNewFolderWatcher.onDidCreate((uri) => {
-            const filePath = uri.fsPath.replace(/\\/g, '/');
+        for (const folder of foldersToWatch) {
+            this.debugLogger.log(`🔍 [New Folder Watcher] Setting up VS Code native watcher for: ${folder.path}`);
             
-            // Skip trash folders
-            if (filePath.includes('/_trash/') || filePath.includes('\\_trash\\')) {
-                return;
+            // First, scan for existing folders without IDs (created before extension started)
+            // This uses VS Code FS API for SSH compatibility
+            try {
+                await this.scanForNewFolders(folder.path);
+            } catch (err: any) {
+                this.debugLogger.log(`⚠️ Could not scan for existing folders in ${folder.label}: ${err.message}`);
+                this.debugLogger.log(`ℹ️ Watcher will still monitor for new folders created after connection`);
             }
             
-            // Check if this is an HTML file
-            if (filePath.endsWith('.html')) {
-                this.debugLogger.log(`🔔 [VS Code Watcher] HTML file created: ${path.basename(filePath)}`);
-                const folderPath = path.dirname(filePath).replace(/\\/g, '/');
-                this.handlePotentialNewFolder(folderPath);
-                return;
-            }
+            // Create VS Code native FileSystemWatcher (works on SSH)
+            const newFolderPattern = new vscode.RelativePattern(
+                vscode.Uri.file(folder.path),
+                '**/*'  // Watch all files and folders
+            );
             
-            // Check if this is a folder (has no extension or is a known folder pattern)
-            const baseName = path.basename(filePath);
-            if (!baseName.includes('.') || /_\d+$/.test(baseName)) {
-                this.debugLogger.log(`🔔 [VS Code Watcher] Folder created: ${baseName}`);
+            const watcher = vscode.workspace.createFileSystemWatcher(newFolderPattern, false, true, false);
+            
+            // Listen for files/folders being created (new folder or HTML file added)
+            watcher.onDidCreate((uri) => {
+                const filePath = uri.fsPath.replace(/\\/g, '/');
                 
-                // Check if this is a rename completion (folder with _ID reappearing)
-                const postId = this.extractPostIdFromPath(filePath);
-                if (postId && this.pendingRenames.has(postId)) {
-                    this.handleRenameComplete(filePath, postId);
-                } else {
-                    this.handlePotentialNewFolder(filePath);
+                // Skip trash folders
+                if (filePath.includes('/_trash/') || filePath.includes('\\_trash\\')) {
+                    return;
                 }
-            }
-        });
-        
-        // Listen for files/folders being deleted (potential rename start)
-        this.vscodeNewFolderWatcher.onDidDelete((uri) => {
-            const filePath = uri.fsPath.replace(/\\/g, '/');
+                
+                // Check if this is an HTML file
+                if (filePath.endsWith('.html')) {
+                    this.debugLogger.log(`🔔 [VS Code Watcher] HTML file created: ${path.basename(filePath)}`);
+                    const folderPath = path.dirname(filePath).replace(/\\/g, '/');
+                    this.handlePotentialNewFolder(folderPath);
+                    return;
+                }
+                
+                // Check if this is a folder (has no extension or is a known folder pattern)
+                const baseName = path.basename(filePath);
+                if (!baseName.includes('.') || /_\d+$/.test(baseName)) {
+                    this.debugLogger.log(`🔔 [VS Code Watcher] Folder created: ${baseName}`);
+                    
+                    // Check if this is a rename completion (folder with _ID reappearing)
+                    const postId = this.extractPostIdFromPath(filePath);
+                    if (postId && this.pendingRenames.has(postId)) {
+                        this.handleRenameComplete(filePath, postId);
+                    } else {
+                        this.handlePotentialNewFolder(filePath);
+                    }
+                }
+            });
             
-            // Skip trash folders
-            if (filePath.includes('/_trash/') || filePath.includes('\\_trash\\')) {
-                return;
+            // Listen for files/folders being deleted (potential rename start)
+            watcher.onDidDelete((uri) => {
+                const filePath = uri.fsPath.replace(/\\/g, '/');
+                
+                // Skip trash folders
+                if (filePath.includes('/_trash/') || filePath.includes('\\_trash\\')) {
+                    return;
+                }
+                
+                // Check if this is a post folder (has _ID suffix)
+                const baseName = path.basename(filePath);
+                if (/_\d+$/.test(baseName)) {
+                    this.debugLogger.log(`🔔 [VS Code Watcher] Folder deleted: ${baseName}`);
+                    this.handlePotentialRenameStart(filePath);
+                }
+            });
+            
+            // Store watcher (reuse the same property for all watchers)
+            if (!this.vscodeNewFolderWatcher) {
+                this.vscodeNewFolderWatcher = watcher;
             }
             
-            // Check if this is a post folder (has _ID suffix)
-            const baseName = path.basename(filePath);
-            if (/_\d+$/.test(baseName)) {
-                this.debugLogger.log(`🔔 [VS Code Watcher] Folder deleted: ${baseName}`);
-                this.handlePotentialRenameStart(filePath);
-            }
-        });
-        
-        this.debugLogger.log('✅ New folder watcher started (VS Code native)');
+            this.debugLogger.log(`✅ New folder watcher started for ${folder.label} (VS Code native)`);
+        }
     }
     
     /**
@@ -979,17 +990,32 @@ export class FileWatcher {
         
         this.debugLogger.log(`🔍 [New Folder] Relative path: ${relativePath}`);
         
-        // Must be in post-types/[type]/[folder] format
+        // Handle different folder structures:
+        // - post-types/[type]/[folder] (pages, posts)
+        // - templates/[folder] (FSE templates)
+        // - parts/[folder] (FSE template parts)
         const parts = relativePath.split('/');
         this.debugLogger.log(`🔍 [New Folder] Parts: ${JSON.stringify(parts)} (length: ${parts.length})`);
         
-        if (parts.length !== 3 || parts[0] !== 'post-types') {
-            this.debugLogger.log(`🔍 [New Folder] Skipping - not a content folder (need parts.length=3, parts[0]=post-types)`);
+        let postTypeFolder: string;
+        let folderName: string;
+        
+        if (parts.length === 3 && parts[0] === 'post-types') {
+            // Regular post types: post-types/pages/about-us
+            postTypeFolder = parts[1]; // e.g., "pages", "posts"
+            folderName = parts[2];     // e.g., "about-us" or "about-us_123"
+        } else if (parts.length === 2 && parts[0] === 'templates') {
+            // FSE templates: templates/page
+            postTypeFolder = 'wp_template';
+            folderName = parts[1];
+        } else if (parts.length === 2 && parts[0] === 'parts') {
+            // FSE template parts: parts/header
+            postTypeFolder = 'wp_template_part';
+            folderName = parts[1];
+        } else {
+            this.debugLogger.log(`🔍 [New Folder] Skipping - not a content folder`);
             return; // Not a content folder
         }
-        
-        const postTypeFolder = parts[1]; // e.g., "pages", "posts"
-        const folderName = parts[2];     // e.g., "about-us" or "about-us_123"
         
         // Skip if already has _ID suffix (already linked to a post)
         if (/_\d+$/.test(folderName)) {
