@@ -2,6 +2,16 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.10.7] - 2026-01-30
+
+### 🐛 Fixed
+
+- **Templates/Parts Auto-Creation Paths**
+  - Fixed folder rename paths for `wp_template` and `wp_template_part`
+  - Now correctly renames: `templates/page/` → `templates/page_294/page_294.html`
+  - Now correctly renames: `parts/header/` → `parts/header_295/header_295.html`
+  - Fixed duplicate detection and merge for templates/parts (prevents double folders after migration)
+
 ## [1.10.6] - 2026-01-30
 
 ### ✨ Templates & Parts Auto-Creation Support

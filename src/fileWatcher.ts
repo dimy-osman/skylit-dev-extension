@@ -1132,7 +1132,18 @@ export class FileWatcher {
                 
                 // Do the rename via VS Code API - this updates all open editors automatically!
                 const newFolderName = `${response.slug}_${response.post_id}`;
-                const newFolderPath = posixJoin(this.devFolder, `post-types/${postTypeFolder}/${newFolderName}`);
+                
+                // Determine correct path based on post type
+                let basePath: string;
+                if (postTypeFolder === 'wp_template') {
+                    basePath = 'templates';
+                } else if (postTypeFolder === 'wp_template_part') {
+                    basePath = 'parts';
+                } else {
+                    basePath = `post-types/${postTypeFolder}`;
+                }
+                
+                const newFolderPath = posixJoin(this.devFolder, `${basePath}/${newFolderName}`);
                 
                 // IMPORTANT: Track the rename BEFORE we start, so trash handler knows to skip it
                 this.recentlyRenamedFolders.set(folderName, {
@@ -1150,7 +1161,7 @@ export class FileWatcher {
                 this.debugLogger.log(`   Folder renamed: ${folderName} → ${newFolderName}`);
                 
                 // Update response with actual new folder path for notification
-                response.new_folder = `post-types/${postTypeFolder}/${newFolderName}`;
+                response.new_folder = `${basePath}/${newFolderName}`;
                 
                 // Write notification for AI - same format as AI request flow
                 // This allows AI to know the new folder path after auto-rename
@@ -1472,11 +1483,21 @@ export class FileWatcher {
             }
             
             // Write notification so AI knows where the files went
+            // Determine correct path based on post type
+            let basePath: string;
+            if (postTypeFolder === 'wp_template') {
+                basePath = 'templates';
+            } else if (postTypeFolder === 'wp_template_part') {
+                basePath = 'parts';
+            } else {
+                basePath = `post-types/${postTypeFolder}`;
+            }
+            
             await this.writePostCreationNotification({
                 post_id: renameInfo.postId,
-                new_folder: `post-types/${postTypeFolder}/${renameInfo.newFolder}`,
+                new_folder: `${basePath}/${renameInfo.newFolder}`,
                 slug: renameInfo.newFolder.replace(/_\d+$/, '')
-            }, postTypeFolder === 'pages' ? 'page' : 'post');
+            }, postTypeFolder === 'pages' ? 'page' : postTypeFolder === 'posts' ? 'post' : postTypeFolder);
             
             // IMPORTANT: Clear the tracking after successful merge
             // This allows future folders with the same name to create NEW posts
