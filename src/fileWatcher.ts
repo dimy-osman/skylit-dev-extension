@@ -1074,6 +1074,55 @@ export class FileWatcher {
     }
     
     /**
+     * Find existing folder with ID for a given slug
+     * Used to detect folders migrated by the plugin
+     */
+    private async findExistingFolderWithId(
+        folderName: string,
+        postTypeFolder: string
+    ): Promise<{ folderName: string; postId: number } | null> {
+        try {
+            // Determine correct parent path based on post type
+            let parentPath: string;
+            if (postTypeFolder === 'wp_template') {
+                parentPath = posixJoin(this.devFolder, 'templates');
+            } else if (postTypeFolder === 'wp_template_part') {
+                parentPath = posixJoin(this.devFolder, 'parts');
+            } else {
+                parentPath = posixJoin(this.devFolder, `post-types/${postTypeFolder}`);
+            }
+            
+            // Check if parent exists
+            const parentExists = await vsExists(parentPath);
+            if (!parentExists) {
+                return null;
+            }
+            
+            // Read parent directory
+            const contents = await vsReadDir(parentPath);
+            
+            // Look for folders matching pattern: {folderName}_{ID}
+            const pattern = new RegExp(`^${folderName}_(\\d+)$`);
+            
+            for (const [name, type] of contents) {
+                if (type === vscode.FileType.Directory) {
+                    const match = name.match(pattern);
+                    if (match) {
+                        const postId = parseInt(match[1]);
+                        this.debugLogger.log(`✓ Found existing folder: ${name} (ID: ${postId})`);
+                        return { folderName: name, postId };
+                    }
+                }
+            }
+            
+            return null;
+        } catch (err: any) {
+            this.debugLogger.log(`⚠️ Error finding existing folder: ${err.message}`);
+            return null;
+        }
+    }
+    
+    /**
      * Create a WordPress post from a new folder
      */
     private async createPostFromNewFolder(
@@ -1112,6 +1161,22 @@ export class FileWatcher {
         // Mark as processed to prevent duplicate calls
         this.processedNewFolders.add(folderPath);
         this.debugLogger.log(`✓ HTML file found: ${htmlFiles[0]}`);
+        
+        // IMPORTANT: Check if a folder with ID already exists for this slug
+        // This catches folders migrated by the plugin (not tracked in recentlyRenamedFolders)
+        const existingIdFolder = await this.findExistingFolderWithId(folderName, postTypeFolder);
+        if (existingIdFolder) {
+            this.debugLogger.log(`🔄 [Duplicate Detection] Found existing folder with ID: ${existingIdFolder.folderName}`);
+            this.debugLogger.log(`   Merging duplicate "${folderName}" → "${existingIdFolder.folderName}"`);
+            
+            // Redirect to existing folder
+            await this.redirectDuplicateFolder(folderPath, {
+                newFolder: existingIdFolder.folderName,
+                postId: existingIdFolder.postId,
+                timestamp: Date.now()
+            }, postTypeFolder);
+            return;
+        }
         
         // Map folder name to post type
         const postType = this.mapFolderToPostType(postTypeFolder);

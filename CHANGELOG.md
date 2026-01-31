@@ -2,6 +2,16 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.10.8] - 2026-01-30
+
+### 🐛 Fixed
+
+- **Duplicate Detection for Migrated Folders**
+  - Extension now checks for existing ID-based folders before creating posts
+  - Detects folders migrated by plugin (e.g., `templates/page.html` → `templates/page_294/`)
+  - Automatically merges duplicate flat folders into existing ID-based folders
+  - Fixes issue where `index.html` and `page.html` without IDs persisted after migration
+
 ## [1.10.7] - 2026-01-30
 
 ### 🐛 Fixed
