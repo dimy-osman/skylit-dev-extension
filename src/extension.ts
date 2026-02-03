@@ -11,6 +11,7 @@ import { RestClient } from './restClient';
 import { StatusBar } from './statusBar';
 import { ProtocolHandler } from './protocolHandler';
 import { DebugLogger } from './debugLogger';
+import { PostTypeConverter } from './postTypeConverter';
 import { ConnectionState } from './types';
 
 let workspaceManager: WorkspaceManager;
@@ -20,6 +21,7 @@ let restClient: RestClient | null = null;
 let statusBar: StatusBar;
 let protocolHandler: ProtocolHandler;
 let debugLogger: DebugLogger;
+let postTypeConverter: PostTypeConverter | null = null;
 let statusCheckInterval: NodeJS.Timeout | null = null;
 let metadataCleanupInterval: NodeJS.Timeout | null = null;
 let currentDevPath: string | null = null;
@@ -113,6 +115,9 @@ export function deactivate() {
     
     if (fileWatcher) {
         fileWatcher.dispose();
+    }
+    if (postTypeConverter) {
+        postTypeConverter.dispose();
     }
     if (statusBar) {
         statusBar.dispose();
@@ -211,6 +216,10 @@ function registerCommands(context: vscode.ExtensionContext) {
             if (fileWatcher) {
                 fileWatcher.dispose();
                 fileWatcher = null;
+            }
+            if (postTypeConverter) {
+                postTypeConverter.dispose();
+                postTypeConverter = null;
             }
             restClient = null;
             currentDevPath = null;
@@ -488,6 +497,14 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
         // Store the current dev path
         currentDevPath = status.dev_path;
 
+        // Initialize post type converter
+        if (postTypeConverter) {
+            postTypeConverter.dispose();
+        }
+        postTypeConverter = new PostTypeConverter(restClient, status.dev_path, debugLogger);
+        postTypeConverter.startWatching();
+        debugLogger.log('🔄 Post type converter initialized');
+
         // Start periodic status check (every 60 seconds) to detect dev folder changes
         if (statusCheckInterval) {
             clearInterval(statusCheckInterval);
@@ -518,6 +535,13 @@ async function connectToWordPress(site: any, context: vscode.ExtensionContext, i
                     
                     await fileWatcher.start();
                     currentDevPath = updatedStatus.dev_path;
+                    
+                    // Restart post type converter with new path
+                    if (postTypeConverter) {
+                        postTypeConverter.dispose();
+                    }
+                    postTypeConverter = new PostTypeConverter(restClient, updatedStatus.dev_path, debugLogger);
+                    postTypeConverter.startWatching();
                     
                     debugLogger.info(`✅ Dev folder location updated: ${updatedStatus.dev_path}`);
                 }

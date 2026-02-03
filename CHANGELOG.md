@@ -2,6 +2,49 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.11.0] - 2026-02-03
+
+### ✨ New Feature: Universal Post Type Converter
+
+- **Folder Move Detection**
+  - Automatically detects when folders are moved between post type directories
+  - Supports: pages, posts, templates, template parts, patterns
+  - Instant detection with VS Code native UI
+
+- **Conversion Prompt**
+  - Shows confirmation dialog when post type change is detected
+  - Options: Convert in WordPress, Undo Move, Ignore
+  - Non-intrusive modal with clear explanations
+
+- **WordPress Integration**
+  - Calls new REST API endpoint `/skylit/v1/convert-post-type`
+  - Updates post type in WordPress database
+  - Preserves metadata automatically
+
+- **Local Metadata Updates**
+  - Updates HTML metadata comments after conversion
+  - Synchronizes file system with WordPress state
+  - Maintains data consistency
+
+- **Safety Features**
+  - User confirmation required for all conversions
+  - Easy undo capability (moves folder back)
+  - Progress feedback during conversion
+  - Error handling and recovery
+
+### 🔧 Technical Details
+
+- New component: `PostTypeConverter` class
+- Integrated with existing FileWatcher system
+- REST API client integration
+- Metadata backup/restore support
+- Works with Git operations and manual moves
+
+### 📋 Requires
+
+- WordPress plugin version 5.1.0 or higher
+- New REST API endpoint in plugin
+
 ## [1.10.8] - 2026-01-30
 
 ### 🐛 Fixed
