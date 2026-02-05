@@ -48,6 +48,10 @@ Command Palette (Ctrl+Shift+P / Cmd+Shift+P)
 - Skylit: Setup Auth Token
 - Skylit: Scan for WordPress
 - Skylit: Show Menu
+- Skylit: Request WordPress ID (create post for folder)
+- Skylit: Manage Post (change status, slug, title, schedule)
+- Skylit: Delete Post (trash or permanently delete)
+- Skylit: Convert Post Type (for moved folders)
 
 ## Status Bar
 
@@ -426,6 +430,16 @@ Access via Command Palette (Ctrl+Shift+P / Cmd+Shift+P):
 | `Skylit: Setup Auth Token` | Enter/update WordPress authentication token |
 | `Skylit: Sync Current File` | Force immediate sync of currently open file |
 | `Skylit: Show Menu` | Open quick menu from status bar |
+| `Skylit: Request WordPress ID` | Create WordPress post for folder without ID |
+| `Skylit: Manage Post` | Change status, slug, title, or schedule post |
+| `Skylit: Delete Post` | Trash or permanently delete post + folder |
+| `Skylit: Convert Post Type` | Convert post type (e.g., page → template) |
+
+### Context Menu (Right-click folder or HTML file)
+
+- Skylit: Request WordPress ID
+- Skylit: Manage Post
+- Skylit: Delete Post
 
 ---
 
@@ -622,6 +636,6 @@ GPL-2.0-or-later
 
 ---
 
-**Version**: 1.3.1  
-**Last Updated**: January 2026  
+**Version**: 1.13.0  
+**Last Updated**: February 2026  
 **Made by**: Skylit.DEV

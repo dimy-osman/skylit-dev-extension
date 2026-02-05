@@ -21,6 +21,12 @@ npm-debug.log*
 *.tmp
 *.temp
 
+# Secrets and tokens
+.tokens
+.env
+*.key
+*.pem
+
 # Development docs (optional - remove these lines if you want to include them)
 BUILD-COMPLETE.md
 IMPLEMENTATION-COMPLETE.md

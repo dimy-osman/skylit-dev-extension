@@ -14,6 +14,7 @@ export class PostTypeConverter {
     private restClient: RestClient;
     private devFolderPath: string;
     private logger: DebugLogger;
+    private disposables: vscode.Disposable[] = [];
     
     // Track folder moves (VS Code doesn't give us old/new paths directly)
     private pendingMoves: Map<string, { oldPath: string, timestamp: number }> = new Map();
@@ -42,21 +43,26 @@ export class PostTypeConverter {
             return;
         }
         
-        // Watch all post type folders for changes
+        this.logger.log(`Post Type Converter: Starting watcher for ${this.devFolderPath}`);
+        
+        // Watch all files/folders in the dev folder - use broad pattern
+        // We'll filter by path in the handlers
         const pattern = new vscode.RelativePattern(
             this.devFolderPath,
-            '{post-types/{pages,posts},templates,parts,patterns}/**/*_[0-9]*'
+            '**/*'
         );
         
-        this.watcher = vscode.workspace.createFileSystemWatcher(pattern);
+        this.watcher = vscode.workspace.createFileSystemWatcher(pattern, false, true, false);
         
         // Track folder deletions (part of move operation)
         this.watcher.onDidDelete(async (uri) => {
             const folderPath = uri.fsPath;
             
-            // Only track if it's a folder with _ID suffix
-            if (this.isFolderWithId(folderPath)) {
-                this.logger.log(`Post Type Converter: Folder deleted (potential move): ${folderPath}`);
+            this.logger.log(`Post Type Converter: onDidDelete fired: ${folderPath}`);
+            
+            // Only track if it's a folder with _ID suffix in a post type directory
+            if (this.isFolderWithId(folderPath) && this.isPostTypeFolder(folderPath)) {
+                this.logger.log(`Post Type Converter: Tracking potential move: ${folderPath}`);
                 
                 // Store for potential move detection
                 this.pendingMoves.set(path.basename(folderPath), {
@@ -64,16 +70,23 @@ export class PostTypeConverter {
                     timestamp: Date.now()
                 });
                 
-                // Clean up old pending moves after 5 seconds
+                // Clean up old pending moves after 10 seconds
                 setTimeout(() => {
                     this.pendingMoves.delete(path.basename(folderPath));
-                }, 5000);
+                }, 10000);
             }
         });
         
         // Track folder creations (part of move operation)
         this.watcher.onDidCreate(async (uri) => {
             const folderPath = uri.fsPath;
+            
+            this.logger.log(`Post Type Converter: onDidCreate fired: ${folderPath}`);
+            
+            // Only process if it's in a post type directory
+            if (!this.isPostTypeFolder(folderPath)) {
+                return;
+            }
             
             // Check if this is part of a move operation
             const folderName = path.basename(folderPath);
@@ -90,7 +103,78 @@ export class PostTypeConverter {
             }
         });
         
-        this.logger.log('Post Type Converter: Started watching for folder moves');
+        this.logger.log('Post Type Converter: Started file watcher');
+        
+        // Also listen to workspace rename events (more reliable for drag-drop)
+        const renameHandler = vscode.workspace.onDidRenameFiles((event) => {
+            this.logger.log(`Post Type Converter: onDidRenameFiles fired with ${event.files.length} files`);
+            
+            for (const file of event.files) {
+                const oldPath = file.oldUri.fsPath;
+                const newPath = file.newUri.fsPath;
+                
+                this.logger.log(`Post Type Converter: Rename detected: ${oldPath} -> ${newPath}`);
+                
+                // Check if this is a post type folder move
+                if (this.isFolderWithId(newPath) && 
+                    this.isPostTypeFolder(oldPath) && 
+                    this.isPostTypeFolder(newPath)) {
+                    
+                    // Check if post types are different
+                    const oldPostType = this.extractPostType(oldPath);
+                    const newPostType = this.extractPostType(newPath);
+                    
+                    this.logger.log(`Post Type Converter: ${oldPostType} -> ${newPostType}`);
+                    
+                    if (oldPostType && newPostType && oldPostType !== newPostType) {
+                        this.handleFolderMove(oldPath, newPath);
+                    }
+                }
+            }
+        });
+        this.disposables.push(renameHandler);
+        
+        // Also listen to workspace file create/delete events
+        const deleteHandler = vscode.workspace.onDidDeleteFiles((event) => {
+            this.logger.log(`Post Type Converter: onDidDeleteFiles fired with ${event.files.length} files`);
+            
+            for (const file of event.files) {
+                const folderPath = file.fsPath;
+                
+                if (this.isFolderWithId(folderPath) && this.isPostTypeFolder(folderPath)) {
+                    this.logger.log(`Post Type Converter: Workspace delete - tracking: ${folderPath}`);
+                    
+                    this.pendingMoves.set(path.basename(folderPath), {
+                        oldPath: folderPath,
+                        timestamp: Date.now()
+                    });
+                    
+                    setTimeout(() => {
+                        this.pendingMoves.delete(path.basename(folderPath));
+                    }, 10000);
+                }
+            }
+        });
+        this.disposables.push(deleteHandler);
+        
+        const createHandler = vscode.workspace.onDidCreateFiles((event) => {
+            this.logger.log(`Post Type Converter: onDidCreateFiles fired with ${event.files.length} files`);
+            
+            for (const file of event.files) {
+                const folderPath = file.fsPath;
+                const folderName = path.basename(folderPath);
+                const pending = this.pendingMoves.get(folderName);
+                
+                if (pending && this.isFolderWithId(folderPath) && this.isPostTypeFolder(folderPath)) {
+                    this.logger.log(`Post Type Converter: Workspace create - move detected: ${folderPath}`);
+                    this.handleFolderMove(pending.oldPath, folderPath);
+                    this.pendingMoves.delete(folderName);
+                }
+            }
+        });
+        this.disposables.push(createHandler);
+        
+        this.logger.log('Post Type Converter: All watchers started');
     }
     
     /**
@@ -98,7 +182,22 @@ export class PostTypeConverter {
      */
     private isFolderWithId(folderPath: string): boolean {
         const folderName = path.basename(folderPath);
-        return /_\d+$/.test(folderName);
+        const hasId = /_\d+$/.test(folderName);
+        this.logger.log(`Post Type Converter: isFolderWithId(${folderName}) = ${hasId}`);
+        return hasId;
+    }
+    
+    /**
+     * Check if path is in a post type folder
+     */
+    private isPostTypeFolder(folderPath: string): boolean {
+        const normalizedPath = folderPath.replace(/\\/g, '/');
+        const isPostType = normalizedPath.includes('/post-types/pages') ||
+                          normalizedPath.includes('/post-types/posts') ||
+                          normalizedPath.includes('/templates') ||
+                          normalizedPath.includes('/parts') ||
+                          normalizedPath.includes('/patterns');
+        return isPostType;
     }
     
     /**
@@ -239,23 +338,19 @@ export class PostTypeConverter {
             }, async (progress) => {
                 progress.report({ increment: 0, message: 'Calling WordPress API...' });
                 
-                // Call WordPress API directly using restClient's internal client
-                const response = await (this.restClient as any).client.post('/convert-post-type', {
-                    post_id: postId,
-                    target_type: targetType,
-                    options: {
-                        preserve_metadata: true,
-                        delete_original: true
-                    }
-                });
+                // Call WordPress API using restClient's convertPostType method
+                const folderName = path.basename(newPath);
+                const result = await this.restClient.convertPostType(postId, targetType, folderName);
                 
                 progress.report({ increment: 50, message: 'Updating local files...' });
                 
-                const result = response.data;
-                
                 if (result.success) {
                     // Update local file metadata
-                    await this.updateLocalMetadata(newPath, result.data);
+                    await this.updateLocalMetadata(newPath, {
+                        post_id: result.post_id || postId,
+                        old_type: result.old_type,
+                        new_type: result.new_type
+                    });
                     
                     progress.report({ increment: 100 });
                     
@@ -265,7 +360,7 @@ export class PostTypeConverter {
                     
                     this.logger.log(`Post Type Converter: Conversion successful (ID: ${postId})`);
                 } else {
-                    throw new Error(result.error || 'Conversion failed');
+                    throw new Error(result.message || 'Conversion failed');
                 }
             });
         } catch (error: any) {
@@ -393,6 +488,10 @@ Modified: ${now}
             this.watcher.dispose();
             this.watcher = undefined;
         }
+        for (const disposable of this.disposables) {
+            disposable.dispose();
+        }
+        this.disposables = [];
         this.pendingMoves.clear();
         this.logger.log('Post Type Converter: Disposed');
     }
