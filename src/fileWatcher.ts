@@ -1921,6 +1921,10 @@ export class FileWatcher {
 			// FSE template parts: parts/header
 			postTypeFolder = "wp_template_part";
 			folderName = parts[1];
+		} else if (parts.length === 3 && parts[0] === "patterns" && (parts[1] === "synced" || parts[1] === "unsynced")) {
+			// Patterns: patterns/synced/my-pattern or patterns/unsynced/my-pattern
+			postTypeFolder = "wp_block";
+			folderName = parts[2];
 		} else {
 			this.debugLogger.log(
 				`🔍 [New Folder] Skipping - not a content folder`
@@ -2201,6 +2205,11 @@ export class FileWatcher {
 					postTypeFolder === "wp_template_part"
 				) {
 					basePath = "parts";
+				} else if (postTypeFolder === "wp_block") {
+					// Patterns - use the original path (patterns/synced or patterns/unsynced)
+					// relativePath is like "patterns/synced/my-pattern"
+					const patternParts = relativePath.split("/");
+					basePath = `${patternParts[0]}/${patternParts[1]}`; // "patterns/synced" or "patterns/unsynced"
 				} else {
 					basePath = `post-types/${postTypeFolder}`;
 				}

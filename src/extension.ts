@@ -689,8 +689,18 @@ function registerCommands(context: vscode.ExtensionContext) {
 						// If the server didn't rename (skip_rename was false), open the new file
 						if (response.new_folder) {
 							// Determine new file path
+							// response.new_folder is already a full relative path like:
+							// - "patterns/synced/my-pattern_123"
+							// - "templates/page_123"
+							// - "post-types/pages/about_123"
 							let newBasePath: string;
-							if (
+							if (response.new_folder.startsWith("patterns/") ||
+								response.new_folder.startsWith("templates/") ||
+								response.new_folder.startsWith("parts/") ||
+								response.new_folder.startsWith("post-types/")) {
+								// Server returned full relative path
+								newBasePath = response.new_folder;
+							} else if (
 								postType ===
 								"wp_template"
 							) {
@@ -704,16 +714,19 @@ function registerCommands(context: vscode.ExtensionContext) {
 								postType ===
 								"wp_block"
 							) {
-								newBasePath = `patterns/${response.new_folder}`;
+								// Fallback - shouldn't happen with updated server
+								newBasePath = `patterns/synced/${response.new_folder}`;
 							} else {
 								newBasePath = `post-types/${postType}s/${response.new_folder}`;
 							}
 
+							// Extract just the folder name from the path for the HTML filename
+							const newFolderName = response.new_folder.split("/").pop() || response.new_folder;
 							const newHtmlPath =
 								path.join(
 									currentDevPath,
 									newBasePath,
-									`${response.new_folder}.html`
+									`${newFolderName}.html`
 								);
 
 							// Try to open the new file
