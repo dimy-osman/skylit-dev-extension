@@ -2,9 +2,9 @@
 	"name": "skylit-dev-io",
 	"displayName": "Skylit.DEV I/O - WordPress Sync",
 	"description": "VS Code/Cursor extension for instant WordPress Gutenberg sync. Solves WP Cron unreliability on local development. Requires Skylit.DEV WordPress plugin.",
-	"version": "1.13.0",
+	"version": "1.16.2",
 	"publisher": "dimy-osman",
-	"license": "GPL-2.0-or-later",
+	"license": "SEE LICENSE IN LICENSE",
 	"engines": {
 		"vscode": "^1.80.0"
 	},
@@ -72,6 +72,18 @@
 			{
 				"command": "skylit.deletePost",
 				"title": "Skylit: Delete Post (trash or permanently delete)"
+			},
+			{
+				"command": "skylit.connectRemote",
+				"title": "Skylit: Connect to Remote WordPress"
+			},
+			{
+				"command": "skylit.syncFromRemote",
+				"title": "Skylit: Sync All Posts from Remote"
+			},
+			{
+				"command": "skylit.relocateDevFolder",
+				"title": "Skylit: Relocate Dev Folder (move to local or another location)"
 			}
 		],
 		"menus": {
@@ -136,7 +148,12 @@
 				"skylit.siteUrl": {
 					"type": "string",
 					"default": "",
-					"description": "WordPress site URL (auto-detected from wp-config.php if empty)"
+					"description": "WordPress site URL (auto-detected from wp-config.php if empty). Required for remote dev folder mode."
+				},
+				"skylit.localDevPath": {
+					"type": "string",
+					"default": "",
+					"description": "Local dev folder path for remote mode. When set with siteUrl, enables remote dev folder (WordPress runs elsewhere, files stay local)."
 				},
 				"skylit.debugOutput": {
 					"type": "boolean",

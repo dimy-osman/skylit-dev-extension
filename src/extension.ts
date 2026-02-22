@@ -2195,15 +2195,17 @@ function stopMetadataCleanup() {
 async function promptForLocalDevFolder(
 	prompt: string
 ): Promise<string | undefined> {
-	// Always use native folder picker -- showOpenDialog opens on the
-	// local (UI) side even when connected via Remote SSH.
+	// Force the dialog to show the LOCAL filesystem even in Remote SSH sessions.
+	// `availableFileSystems: ['file']` is the same internal option VS Code's
+	// own "Install from VSIX → Show Local" button uses.
 	const folderUri = await vscode.window.showOpenDialog({
 		canSelectFolders: true,
 		canSelectFiles: false,
 		canSelectMany: false,
 		openLabel: "Select Dev Folder",
 		title: prompt,
-	});
+		availableFileSystems: ["file"],
+	} as any);
 
 	if (!folderUri || folderUri.length === 0) return undefined;
 
