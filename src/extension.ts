@@ -14,6 +14,8 @@ import { ProtocolHandler } from "./protocolHandler";
 import { DebugLogger } from "./debugLogger";
 import { PostTypeConverter } from "./postTypeConverter";
 import { ConnectionState } from "./types";
+import { InstanceAttributeGuard } from "./instanceAttributeGuard";
+import { ExportPoller } from "./exportPoller";
 
 let workspaceManager: WorkspaceManager;
 let authManager: AuthManager;
@@ -23,16 +25,19 @@ let statusBar: StatusBar;
 let protocolHandler: ProtocolHandler;
 let debugLogger: DebugLogger;
 let postTypeConverter: PostTypeConverter | null = null;
+let instanceAttributeGuard: InstanceAttributeGuard | null = null;
+let exportPoller: ExportPoller | null = null;
 let statusCheckInterval: NodeJS.Timeout | null = null;
 let metadataCleanupInterval: NodeJS.Timeout | null = null;
+let relocatePollingInterval: NodeJS.Timeout | null = null;
 let currentDevPath: string | null = null;
+let isRemoteMode: boolean = false;
 
 /**
  * Extension activation
  */
 export async function activate(context: vscode.ExtensionContext) {
-	const outputChannel =
-		vscode.window.createOutputChannel("Skylit.DEV I/O");
+	const outputChannel = vscode.window.createOutputChannel("Skylit.DEV I/O");
 	debugLogger = new DebugLogger(outputChannel);
 	debugLogger.info("🚀 Skylit.DEV I/O extension activated");
 
@@ -45,41 +50,88 @@ export async function activate(context: vscode.ExtensionContext) {
 	// Register protocol handler
 	protocolHandler.register(context);
 
+	// Start instance attribute guard IMMEDIATELY (before connection).
+	// It uses content-based detection (no REST API needed), so it can
+	// protect pattern instance tags from the moment the editor opens.
+	if (instanceAttributeGuard) {
+		instanceAttributeGuard.dispose();
+	}
+	instanceAttributeGuard = new InstanceAttributeGuard("", debugLogger);
+	instanceAttributeGuard.start();
+
 	// Register commands
 	registerCommands(context);
 
-	// Detect WordPress sites in workspace
+	// Check for remote dev folder mode: siteUrl + localDevPath both configured
+	const config = vscode.workspace.getConfiguration("skylit");
+	const configuredSiteUrl = config.get<string>("siteUrl", "").trim();
+	const configuredLocalDevPath = config.get<string>("localDevPath", "").trim();
+
+	if (configuredSiteUrl && configuredLocalDevPath) {
+		// Remote dev folder mode: skip local WordPress detection
+		debugLogger.info("🌐 Remote dev folder mode detected");
+		debugLogger.log(`   Site URL: ${configuredSiteUrl}`);
+		debugLogger.log(`   Local dev path: ${configuredLocalDevPath}`);
+
+		isRemoteMode = true;
+
+		const remoteSite = {
+			name: new URL(configuredSiteUrl).hostname,
+			path: configuredLocalDevPath,
+			siteUrl: configuredSiteUrl,
+			devFolder: configuredLocalDevPath,
+		};
+
+		const autoConnect = config.get<boolean>("autoConnect", true);
+
+		if (autoConnect) {
+			try {
+				await connectToWordPress(remoteSite, context, true);
+			} catch (error: any) {
+				debugLogger.warn(`⚠️ Remote auto-connect failed: ${error.message}`);
+				statusBar.updateStatus(
+					"disconnected",
+					"Remote connect failed - Click to retry"
+				);
+			}
+		} else {
+			statusBar.updateStatus(
+				"disconnected",
+				"Click to connect to remote WordPress"
+			);
+		}
+
+		return;
+	}
+
+	// Local mode: detect WordPress sites in workspace
 	const sites = await workspaceManager.detectWordPressSites();
 
 	if (sites.length === 0) {
-		debugLogger.warn(
-			"⚠️ No WordPress sites with Skylit.DEV plugin detected"
-		);
+		debugLogger.warn("⚠️ No WordPress sites with Skylit.DEV plugin detected");
 		debugLogger.info("ℹ️ Make sure:");
 		debugLogger.info(
 			"   1. WordPress is in your workspace (or in a subdirectory like public_html/)"
 		);
+		debugLogger.info("   2. Skylit.DEV plugin is installed and activated");
 		debugLogger.info(
-			"   2. Skylit.DEV plugin is installed and activated"
+			"   3. Or configure skylit.siteUrl + skylit.localDevPath for remote mode"
 		);
-		statusBar.updateStatus(
-			"disconnected",
-			"No Skylit.DEV detected"
-		);
+		statusBar.updateStatus("disconnected", "No Skylit.DEV detected");
 
-		// Show helpful notification
 		vscode.window
 			.showWarningMessage(
-				"Skylit.DEV plugin not detected. Install and activate the plugin in WordPress.",
+				"Skylit.DEV plugin not detected. Install locally or use 'Skylit: Connect to Remote WordPress' for remote mode.",
+				"Connect Remote",
 				"Learn More"
 			)
 			.then((selection) => {
 				if (selection === "Learn More") {
 					vscode.env.openExternal(
-						vscode.Uri.parse(
-							"https://skylit.dev/docs/getting-started"
-						)
+						vscode.Uri.parse("https://skylit.dev/docs/getting-started")
 					);
+				} else if (selection === "Connect Remote") {
+					vscode.commands.executeCommand("skylit.connectRemote");
 				}
 			});
 
@@ -93,24 +145,17 @@ export async function activate(context: vscode.ExtensionContext) {
 		debugLogger.log(`   - ${site.name}: ${site.siteUrl}`);
 	});
 
-	// Check if auto-connect is enabled (default: true)
-	const config = vscode.workspace.getConfiguration("skylit");
 	const autoConnect = config.get<boolean>("autoConnect", true);
 
 	if (autoConnect) {
-		debugLogger.log(
-			"🔄 Auto-connect enabled, attempting connection..."
-		);
+		debugLogger.log("🔄 Auto-connect enabled, attempting connection...");
 
-		// Auto-connect to the first site (or let user choose if multiple)
 		const siteToConnect = sites[0];
 
 		try {
-			await connectToWordPress(siteToConnect, context, true); // Pass true for isAutoConnect
+			await connectToWordPress(siteToConnect, context, true);
 		} catch (error: any) {
-			debugLogger.warn(
-				`⚠️ Auto-connect failed: ${error.message}`
-			);
+			debugLogger.warn(`⚠️ Auto-connect failed: ${error.message}`);
 			debugLogger.info(
 				'💡 You can manually connect by clicking the status bar or running "Skylit: Connect"'
 			);
@@ -121,10 +166,7 @@ export async function activate(context: vscode.ExtensionContext) {
 		}
 	} else {
 		debugLogger.log("ℹ️ Auto-connect disabled in settings");
-		statusBar.updateStatus(
-			"disconnected",
-			"Click to connect to WordPress"
-		);
+		statusBar.updateStatus("disconnected", "Click to connect to WordPress");
 	}
 }
 
@@ -144,8 +186,19 @@ export function deactivate() {
 		metadataCleanupInterval = null;
 	}
 
+	// Stop relocate polling
+	stopRelocatePolling();
+
 	if (fileWatcher) {
 		fileWatcher.dispose();
+	}
+	if (exportPoller) {
+		exportPoller.dispose();
+		exportPoller = null;
+	}
+	if (instanceAttributeGuard) {
+		instanceAttributeGuard.dispose();
+		instanceAttributeGuard = null;
 	}
 	if (postTypeConverter) {
 		postTypeConverter.dispose();
@@ -163,59 +216,40 @@ export function deactivate() {
 function registerCommands(context: vscode.ExtensionContext) {
 	// Scan for WordPress command
 	context.subscriptions.push(
-		vscode.commands.registerCommand(
-			"skylit.scanWorkspace",
-			async () => {
-				debugLogger.show(); // Show output channel
-				debugLogger.log(
-					"🔍 Manual WordPress scan triggered..."
-				);
+		vscode.commands.registerCommand("skylit.scanWorkspace", async () => {
+			debugLogger.show(); // Show output channel
+			debugLogger.log("🔍 Manual WordPress scan triggered...");
 
-				const sites =
-					await workspaceManager.detectWordPressSites();
+			const sites = await workspaceManager.detectWordPressSites();
 
-				if (sites.length === 0) {
-					vscode.window
-						.showWarningMessage(
-							"No WordPress sites with Skylit.DEV plugin found. Check Output panel for details.",
-							"View Output"
-						)
-						.then((selection) => {
-							if (
-								selection ===
-								"View Output"
-							) {
-								debugLogger.show();
-							}
-						});
-					return;
-				}
-
+			if (sites.length === 0) {
 				vscode.window
-					.showInformationMessage(
-						`Found ${sites.length} WordPress site(s) with Skylit.DEV plugin!`,
-						"Connect Now",
-						"Setup Token"
+					.showWarningMessage(
+						"No WordPress sites with Skylit.DEV plugin found. Check Output panel for details.",
+						"View Output"
 					)
 					.then((selection) => {
-						if (
-							selection ===
-							"Connect Now"
-						) {
-							vscode.commands.executeCommand(
-								"skylit.connect"
-							);
-						} else if (
-							selection ===
-							"Setup Token"
-						) {
-							vscode.commands.executeCommand(
-								"skylit.setupToken"
-							);
+						if (selection === "View Output") {
+							debugLogger.show();
 						}
 					});
+				return;
 			}
-		)
+
+			vscode.window
+				.showInformationMessage(
+					`Found ${sites.length} WordPress site(s) with Skylit.DEV plugin!`,
+					"Connect Now",
+					"Setup Token"
+				)
+				.then((selection) => {
+					if (selection === "Connect Now") {
+						vscode.commands.executeCommand("skylit.connect");
+					} else if (selection === "Setup Token") {
+						vscode.commands.executeCommand("skylit.setupToken");
+					}
+				});
+		})
 	);
 
 	// Connect command
@@ -223,8 +257,7 @@ function registerCommands(context: vscode.ExtensionContext) {
 		vscode.commands.registerCommand("skylit.connect", async () => {
 			debugLogger.log("🔌 Manual connection requested...");
 
-			const sites =
-				await workspaceManager.detectWordPressSites();
+			const sites = await workspaceManager.detectWordPressSites();
 
 			if (sites.length === 0) {
 				vscode.window
@@ -233,13 +266,8 @@ function registerCommands(context: vscode.ExtensionContext) {
 						"Scan Workspace"
 					)
 					.then((selection) => {
-						if (
-							selection ===
-							"Scan Workspace"
-						) {
-							vscode.commands.executeCommand(
-								"skylit.scanWorkspace"
-							);
+						if (selection === "Scan Workspace") {
+							vscode.commands.executeCommand("skylit.scanWorkspace");
 						}
 					});
 				return;
@@ -248,18 +276,16 @@ function registerCommands(context: vscode.ExtensionContext) {
 			// If multiple sites, let user choose
 			let selectedSite = sites[0];
 			if (sites.length > 1) {
-				const choice =
-					await vscode.window.showQuickPick(
-						sites.map((s) => ({
-							label: s.name,
-							description: s.siteUrl,
-							site: s,
-						})),
-						{
-							placeHolder:
-								"Select WordPress site to connect",
-						}
-					);
+				const choice = await vscode.window.showQuickPick(
+					sites.map((s) => ({
+						label: s.name,
+						description: s.siteUrl,
+						site: s,
+					})),
+					{
+						placeHolder: "Select WordPress site to connect",
+					}
+				);
 				if (!choice) return;
 				selectedSite = choice.site;
 			}
@@ -270,93 +296,77 @@ function registerCommands(context: vscode.ExtensionContext) {
 
 	// Disconnect command
 	context.subscriptions.push(
-		vscode.commands.registerCommand(
-			"skylit.disconnect",
-			async () => {
-				// Stop status check interval
-				if (statusCheckInterval) {
-					clearInterval(statusCheckInterval);
-					statusCheckInterval = null;
-				}
-
-				// Stop jump polling
-				stopJumpPolling();
-
-				// Stop metadata cleanup
-				stopMetadataCleanup();
-
-				if (fileWatcher) {
-					fileWatcher.dispose();
-					fileWatcher = null;
-				}
-				if (postTypeConverter) {
-					postTypeConverter.dispose();
-					postTypeConverter = null;
-				}
-				restClient = null;
-				currentDevPath = null;
-				statusBar.updateStatus(
-					"disconnected",
-					"Disconnected"
-				);
-				debugLogger.info(
-					"🔌 Disconnected from WordPress"
-				);
+		vscode.commands.registerCommand("skylit.disconnect", async () => {
+			// Stop status check interval
+			if (statusCheckInterval) {
+				clearInterval(statusCheckInterval);
+				statusCheckInterval = null;
 			}
-		)
+
+			// Stop jump polling
+			stopJumpPolling();
+
+			// Stop relocate polling
+			stopRelocatePolling();
+
+			// Stop metadata cleanup
+			stopMetadataCleanup();
+
+			if (fileWatcher) {
+				fileWatcher.dispose();
+				fileWatcher = null;
+			}
+			if (instanceAttributeGuard) {
+				instanceAttributeGuard.dispose();
+				instanceAttributeGuard = null;
+			}
+			if (postTypeConverter) {
+				postTypeConverter.dispose();
+				postTypeConverter = null;
+			}
+			restClient = null;
+			currentDevPath = null;
+			statusBar.updateStatus("disconnected", "Disconnected");
+			debugLogger.info("🔌 Disconnected from WordPress");
+		})
 	);
 
 	// Setup token command
 	context.subscriptions.push(
-		vscode.commands.registerCommand(
-			"skylit.setupToken",
-			async () => {
-				const sites =
-					await workspaceManager.detectWordPressSites();
-				if (sites.length === 0) {
-					vscode.window.showErrorMessage(
-						"No WordPress sites found in workspace"
-					);
-					return;
-				}
-
-				const site = sites[0]; // TODO: Support multiple sites
-				const token = await vscode.window.showInputBox({
-					prompt: `Enter auth token for ${site.name}`,
-					placeHolder: "skylit_abc123...",
-					password: true,
-					ignoreFocusOut: true,
-				});
-
-				if (!token) return;
-
-				await authManager.saveToken(
-					site.siteUrl,
-					token
-				);
-				debugLogger.info(
-					"✅ Auth token saved! Connecting..."
-				);
-				await connectToWordPress(site, context);
+		vscode.commands.registerCommand("skylit.setupToken", async () => {
+			const sites = await workspaceManager.detectWordPressSites();
+			if (sites.length === 0) {
+				vscode.window.showErrorMessage("No WordPress sites found in workspace");
+				return;
 			}
-		)
+
+			const site = sites[0]; // TODO: Support multiple sites
+			const token = await vscode.window.showInputBox({
+				prompt: `Enter auth token for ${site.name}`,
+				placeHolder: "skylit_abc123...",
+				password: true,
+				ignoreFocusOut: true,
+			});
+
+			if (!token) return;
+
+			await authManager.saveToken(site.siteUrl, token);
+			debugLogger.info("✅ Auth token saved! Connecting...");
+			await connectToWordPress(site, context);
+		})
 	);
 
 	// Sync current file command
 	context.subscriptions.push(
 		vscode.commands.registerCommand("skylit.syncNow", async () => {
 			if (!restClient) {
-				vscode.window.showErrorMessage(
-					"Not connected to WordPress"
-				);
+				vscode.window.showErrorMessage("Not connected to WordPress");
 				return;
 			}
 
 			const editor = vscode.window.activeTextEditor;
 			if (!editor) {
-				vscode.window.showWarningMessage(
-					"No file open"
-				);
+				vscode.window.showWarningMessage("No file open");
 				return;
 			}
 
@@ -372,149 +382,121 @@ function registerCommands(context: vscode.ExtensionContext) {
 
 	// Convert post type command (for manually triggering post type conversion)
 	context.subscriptions.push(
-		vscode.commands.registerCommand(
-			"skylit.convertPostType",
-			async () => {
-				if (!restClient) {
-					vscode.window.showErrorMessage(
-						"Not connected to WordPress"
-					);
-					return;
-				}
-
-				// Get current folder from explorer or active editor
-				let folderPath: string | undefined;
-
-				// Check if the user has a folder selected in the explorer
-				const explorerSelection =
-					vscode.window.activeTextEditor?.document
-						.uri.fsPath;
-				if (explorerSelection) {
-					folderPath =
-						path.dirname(explorerSelection);
-				}
-
-				// Prompt user to enter/confirm folder name
-				const folderName =
-					await vscode.window.showInputBox({
-						prompt: "Enter the folder name with ID suffix (e.g., service_549)",
-						placeHolder: "folder_123",
-						value: folderPath
-							? path.basename(
-									folderPath
-							  )
-							: "",
-						validateInput: (value) => {
-							if (
-								!/_\d+$/.test(
-									value
-								)
-							) {
-								return "Folder must have ID suffix (e.g., service_549)";
-							}
-							return null;
-						},
-					});
-
-				if (!folderName) {
-					return;
-				}
-
-				// Extract post ID
-				const match = folderName.match(/_(\d+)$/);
-				if (!match) {
-					vscode.window.showErrorMessage(
-						"Invalid folder name - must have _ID suffix"
-					);
-					return;
-				}
-				const postId = parseInt(match[1]);
-
-				// Ask what post type to convert to
-				const postTypeOptions = [
-					{
-						label: "Page",
-						description: "post-types/pages",
-						value: "page",
-					},
-					{
-						label: "Post",
-						description: "post-types/posts",
-						value: "post",
-					},
-					{
-						label: "Template",
-						description: "templates",
-						value: "wp_template",
-					},
-					{
-						label: "Template Part",
-						description: "parts",
-						value: "wp_template_part",
-					},
-					{
-						label: "Pattern",
-						description: "patterns",
-						value: "wp_block",
-					},
-				];
-
-				const targetType =
-					await vscode.window.showQuickPick(
-						postTypeOptions,
-						{
-							placeHolder:
-								"Select the target post type",
-						}
-					);
-
-				if (!targetType) {
-					return;
-				}
-
-				// Confirm with user
-				const confirm =
-					await vscode.window.showWarningMessage(
-						`Convert post ID ${postId} to "${targetType.label}"?`,
-						{ modal: true },
-						"Convert"
-					);
-
-				if (confirm !== "Convert") {
-					return;
-				}
-
-				try {
-					debugLogger.log(
-						`Converting post ${postId} to ${targetType.value}`
-					);
-
-					const response =
-						await restClient.convertPostType(
-							postId,
-							targetType.value,
-							folderName
-						);
-
-					if (response.success) {
-						vscode.window.showInformationMessage(
-							`✅ Post converted to ${targetType.label}!`
-						);
-					} else {
-						vscode.window.showErrorMessage(
-							`Failed to convert: ${
-								response.message ||
-								"Unknown error"
-							}`
-						);
-					}
-				} catch (error: any) {
-					vscode.window.showErrorMessage(
-						`Failed to convert post type: ${error.message}`
-					);
-				}
+		vscode.commands.registerCommand("skylit.convertPostType", async () => {
+			if (!restClient) {
+				vscode.window.showErrorMessage("Not connected to WordPress");
+				return;
 			}
-		)
+
+			// Get current folder from explorer or active editor
+			let folderPath: string | undefined;
+
+			// Check if the user has a folder selected in the explorer
+			const explorerSelection =
+				vscode.window.activeTextEditor?.document.uri.fsPath;
+			if (explorerSelection) {
+				folderPath = path.dirname(explorerSelection);
+			}
+
+			// Prompt user to enter/confirm folder name
+			const folderName = await vscode.window.showInputBox({
+				prompt: "Enter the folder name with ID suffix (e.g., service_549)",
+				placeHolder: "folder_123",
+				value: folderPath ? path.basename(folderPath) : "",
+				validateInput: (value) => {
+					if (!/_\d+$/.test(value)) {
+						return "Folder must have ID suffix (e.g., service_549)";
+					}
+					return null;
+				},
+			});
+
+			if (!folderName) {
+				return;
+			}
+
+			// Extract post ID
+			const match = folderName.match(/_(\d+)$/);
+			if (!match) {
+				vscode.window.showErrorMessage(
+					"Invalid folder name - must have _ID suffix"
+				);
+				return;
+			}
+			const postId = parseInt(match[1]);
+
+			// Ask what post type to convert to
+			const postTypeOptions = [
+				{
+					label: "Page",
+					description: "post-types/pages",
+					value: "page",
+				},
+				{
+					label: "Post",
+					description: "post-types/posts",
+					value: "post",
+				},
+				{
+					label: "Template",
+					description: "templates",
+					value: "wp_template",
+				},
+				{
+					label: "Template Part",
+					description: "parts",
+					value: "wp_template_part",
+				},
+				{
+					label: "Pattern",
+					description: "patterns",
+					value: "wp_block",
+				},
+			];
+
+			const targetType = await vscode.window.showQuickPick(postTypeOptions, {
+				placeHolder: "Select the target post type",
+			});
+
+			if (!targetType) {
+				return;
+			}
+
+			// Confirm with user
+			const confirm = await vscode.window.showWarningMessage(
+				`Convert post ID ${postId} to "${targetType.label}"?`,
+				{ modal: true },
+				"Convert"
+			);
+
+			if (confirm !== "Convert") {
+				return;
+			}
+
+			try {
+				debugLogger.log(`Converting post ${postId} to ${targetType.value}`);
+
+				const response = await restClient.convertPostType(
+					postId,
+					targetType.value,
+					folderName
+				);
+
+				if (response.success) {
+					vscode.window.showInformationMessage(
+						`✅ Post converted to ${targetType.label}!`
+					);
+				} else {
+					vscode.window.showErrorMessage(
+						`Failed to convert: ${response.message || "Unknown error"}`
+					);
+				}
+			} catch (error: any) {
+				vscode.window.showErrorMessage(
+					`Failed to convert post type: ${error.message}`
+				);
+			}
+		})
 	);
 
 	// Request WordPress ID command (create post for folder without valid ID)
@@ -523,16 +505,12 @@ function registerCommands(context: vscode.ExtensionContext) {
 			"skylit.requestPostId",
 			async (uri?: vscode.Uri) => {
 				if (!restClient) {
-					vscode.window.showErrorMessage(
-						"Not connected to WordPress"
-					);
+					vscode.window.showErrorMessage("Not connected to WordPress");
 					return;
 				}
 
 				if (!currentDevPath) {
-					vscode.window.showErrorMessage(
-						"Dev folder not configured"
-					);
+					vscode.window.showErrorMessage("Dev folder not configured");
 					return;
 				}
 
@@ -544,20 +522,13 @@ function registerCommands(context: vscode.ExtensionContext) {
 					folderPath = uri.fsPath;
 					// If it's a file, get its parent folder
 					if (path.extname(folderPath)) {
-						folderPath =
-							path.dirname(
-								folderPath
-							);
+						folderPath = path.dirname(folderPath);
 					}
 				} else {
 					// Try to get from active editor
-					const editor =
-						vscode.window.activeTextEditor;
+					const editor = vscode.window.activeTextEditor;
 					if (editor) {
-						folderPath = path.dirname(
-							editor.document.uri
-								.fsPath
-						);
+						folderPath = path.dirname(editor.document.uri.fsPath);
 					}
 				}
 
@@ -574,66 +545,52 @@ function registerCommands(context: vscode.ExtensionContext) {
 				const folderName = path.basename(folderPath);
 
 				// Determine post type from folder location
-				const relativePath = folderPath.replace(
-					currentDevPath.replace(/\\/g, "/") +
-						"/",
-					""
-				);
+				// Normalize dev path - remove trailing slash before adding one
+				const normalizedDevPath = currentDevPath
+					.replace(/\\/g, "/")
+					.replace(/\/+$/, "");
+				const relativePath = folderPath.replace(normalizedDevPath + "/", "");
 				let postType: string;
 
-				if (
-					relativePath.startsWith(
-						"post-types/pages/"
-					)
-				) {
+				if (relativePath.startsWith("post-types/pages/")) {
 					postType = "page";
-				} else if (
-					relativePath.startsWith(
-						"post-types/posts/"
-					)
-				) {
+				} else if (relativePath.startsWith("post-types/posts/")) {
 					postType = "post";
-				} else if (
-					relativePath.startsWith("templates/")
-				) {
+				} else if (relativePath.startsWith("templates/")) {
 					postType = "wp_template";
 				} else if (relativePath.startsWith("parts/")) {
 					postType = "wp_template_part";
-				} else if (
-					relativePath.startsWith("patterns/")
-				) {
+				} else if (relativePath.startsWith("patterns/")) {
 					postType = "wp_block";
 				} else {
 					// Ask user for post type
-					const typeChoice =
-						await vscode.window.showQuickPick(
-							[
-								{
-									label: "Page",
-									value: "page",
-								},
-								{
-									label: "Post",
-									value: "post",
-								},
-								{
-									label: "Template",
-									value: "wp_template",
-								},
-								{
-									label: "Template Part",
-									value: "wp_template_part",
-								},
-								{
-									label: "Pattern",
-									value: "wp_block",
-								},
-							],
+					const typeChoice = await vscode.window.showQuickPick(
+						[
 							{
-								placeHolder:
-									"Select post type for this folder",
-							}
-						);
+								label: "Page",
+								value: "page",
+							},
+							{
+								label: "Post",
+								value: "post",
+							},
+							{
+								label: "Template",
+								value: "wp_template",
+							},
+							{
+								label: "Template Part",
+								value: "wp_template_part",
+							},
+							{
+								label: "Pattern",
+								value: "wp_block",
+							},
+						],
+						{
+							placeHolder: "Select post type for this folder",
+						}
+					);
 
 					if (!typeChoice) return;
 					postType = typeChoice.value;
@@ -643,39 +600,33 @@ function registerCommands(context: vscode.ExtensionContext) {
 				const slug = folderName.replace(/_\d+$/, "");
 
 				// Confirm with user
-				const confirm =
-					await vscode.window.showWarningMessage(
-						`Create WordPress ${postType} from "${folderName}"?`,
-						{
-							modal: true,
-							detail: `This will:\n1. Create a new ${postType} in WordPress with slug "${slug}"\n2. Rename the folder to include the new post ID\n3. Update all files to match`,
-						},
-						"Create Post",
-						"Cancel"
-					);
+				const confirm = await vscode.window.showWarningMessage(
+					`Create WordPress ${postType} from "${folderName}"?`,
+					{
+						modal: true,
+						detail: `This will:\n1. Create a new ${postType} in WordPress with slug "${slug}"\n2. Rename the folder to include the new post ID\n3. Update all files to match`,
+					},
+					"Create Post",
+					"Cancel"
+				);
 
 				if (confirm !== "Create Post") {
 					return;
 				}
 
 				try {
-					debugLogger.log(
-						`📄 Creating ${postType} for folder: ${folderName}`
-					);
+					debugLogger.log(`📄 Creating ${postType} for folder: ${folderName}`);
 
 					// Call REST API to create post
-					const response =
-						await restClient.createPostFromFolder(
-							relativePath,
-							postType,
-							false // Don't skip rename - let server do it
-						);
+					const response = await restClient.createPostFromFolder(
+						relativePath,
+						postType,
+						false // Don't skip rename - let server do it
+					);
 
 					if (response.success) {
 						const newId = response.post_id;
-						const newFolder =
-							response.new_folder ||
-							`${slug}_${newId}`;
+						const newFolder = response.new_folder || `${slug}_${newId}`;
 
 						vscode.window.showInformationMessage(
 							`✅ Created ${postType} "${response.title}" (ID: ${newId})`
@@ -694,26 +645,19 @@ function registerCommands(context: vscode.ExtensionContext) {
 							// - "templates/page_123"
 							// - "post-types/pages/about_123"
 							let newBasePath: string;
-							if (response.new_folder.startsWith("patterns/") ||
+							if (
+								response.new_folder.startsWith("patterns/") ||
 								response.new_folder.startsWith("templates/") ||
 								response.new_folder.startsWith("parts/") ||
-								response.new_folder.startsWith("post-types/")) {
+								response.new_folder.startsWith("post-types/")
+							) {
 								// Server returned full relative path
 								newBasePath = response.new_folder;
-							} else if (
-								postType ===
-								"wp_template"
-							) {
+							} else if (postType === "wp_template") {
 								newBasePath = `templates/${response.new_folder}`;
-							} else if (
-								postType ===
-								"wp_template_part"
-							) {
+							} else if (postType === "wp_template_part") {
 								newBasePath = `parts/${response.new_folder}`;
-							} else if (
-								postType ===
-								"wp_block"
-							) {
+							} else if (postType === "wp_block") {
 								// Fallback - shouldn't happen with updated server
 								newBasePath = `patterns/synced/${response.new_folder}`;
 							} else {
@@ -721,23 +665,20 @@ function registerCommands(context: vscode.ExtensionContext) {
 							}
 
 							// Extract just the folder name from the path for the HTML filename
-							const newFolderName = response.new_folder.split("/").pop() || response.new_folder;
-							const newHtmlPath =
-								path.join(
-									currentDevPath,
-									newBasePath,
-									`${newFolderName}.html`
-								);
+							const newFolderName =
+								response.new_folder.split("/").pop() || response.new_folder;
+							const newHtmlPath = path.join(
+								currentDevPath,
+								newBasePath,
+								`${newFolderName}.html`
+							);
 
 							// Try to open the new file
 							try {
-								const doc =
-									await vscode.workspace.openTextDocument(
-										newHtmlPath
-									);
-								await vscode.window.showTextDocument(
-									doc
+								const doc = await vscode.workspace.openTextDocument(
+									newHtmlPath
 								);
+								await vscode.window.showTextDocument(doc);
 							} catch (e) {
 								// File might not exist yet, that's OK
 								debugLogger.log(
@@ -748,9 +689,7 @@ function registerCommands(context: vscode.ExtensionContext) {
 					} else {
 						vscode.window.showErrorMessage(
 							`Failed to create post: ${
-								response.error ||
-								response.message ||
-								"Unknown error"
+								response.error || response.message || "Unknown error"
 							}`
 						);
 					}
@@ -758,9 +697,7 @@ function registerCommands(context: vscode.ExtensionContext) {
 					vscode.window.showErrorMessage(
 						`Failed to create post: ${error.message}`
 					);
-					debugLogger.log(
-						`❌ Request post ID failed: ${error.message}`
-					);
+					debugLogger.log(`❌ Request post ID failed: ${error.message}`);
 				}
 			}
 		)
@@ -772,16 +709,12 @@ function registerCommands(context: vscode.ExtensionContext) {
 			"skylit.managePost",
 			async (uri?: vscode.Uri) => {
 				if (!restClient) {
-					vscode.window.showErrorMessage(
-						"Not connected to WordPress"
-					);
+					vscode.window.showErrorMessage("Not connected to WordPress");
 					return;
 				}
 
 				if (!currentDevPath) {
-					vscode.window.showErrorMessage(
-						"Dev folder not configured"
-					);
+					vscode.window.showErrorMessage("Dev folder not configured");
 					return;
 				}
 
@@ -793,20 +726,13 @@ function registerCommands(context: vscode.ExtensionContext) {
 					folderPath = uri.fsPath;
 					// If it's a file, get its parent folder
 					if (path.extname(folderPath)) {
-						folderPath =
-							path.dirname(
-								folderPath
-							);
+						folderPath = path.dirname(folderPath);
 					}
 				} else {
 					// Try to get from active editor
-					const editor =
-						vscode.window.activeTextEditor;
+					const editor = vscode.window.activeTextEditor;
 					if (editor) {
-						folderPath = path.dirname(
-							editor.document.uri
-								.fsPath
-						);
+						folderPath = path.dirname(editor.document.uri.fsPath);
 					}
 				}
 
@@ -840,38 +766,33 @@ function registerCommands(context: vscode.ExtensionContext) {
 				const scheduleOption = "Schedule Post";
 				const cancelOption = "Cancel";
 
-				const choice =
-					await vscode.window.showQuickPick(
-						[
-							{
-								label: "$(edit) Change Status",
-								description:
-									"Publish, Draft, Pending, Private, or Schedule",
-								value: statusOption,
-							},
-							{
-								label: "$(symbol-text) Rename Slug",
-								description:
-									"Change the URL slug (e.g., my-page → new-page)",
-								value: slugOption,
-							},
-							{
-								label: "$(whole-word) Rename Title",
-								description:
-									"Change the post title",
-								value: titleOption,
-							},
-							{
-								label: "$(calendar) Schedule Post",
-								description:
-									"Set a future publish date/time",
-								value: scheduleOption,
-							},
-						],
+				const choice = await vscode.window.showQuickPick(
+					[
 						{
-							placeHolder: `Manage post: ${folderName}`,
-						}
-					);
+							label: "$(edit) Change Status",
+							description: "Publish, Draft, Pending, Private, or Schedule",
+							value: statusOption,
+						},
+						{
+							label: "$(symbol-text) Rename Slug",
+							description: "Change the URL slug (e.g., my-page → new-page)",
+							value: slugOption,
+						},
+						{
+							label: "$(whole-word) Rename Title",
+							description: "Change the post title",
+							value: titleOption,
+						},
+						{
+							label: "$(calendar) Schedule Post",
+							description: "Set a future publish date/time",
+							value: scheduleOption,
+						},
+					],
+					{
+						placeHolder: `Manage post: ${folderName}`,
+					}
+				);
 
 				if (!choice) {
 					return;
@@ -880,102 +801,70 @@ function registerCommands(context: vscode.ExtensionContext) {
 				try {
 					if (choice.value === statusOption) {
 						// Change post status
-						const statusChoice =
-							await vscode.window.showQuickPick(
-								[
-									{
-										label: "$(check) Publish",
-										description:
-											"Make post public",
-										value: "publish",
-									},
-									{
-										label: "$(edit) Draft",
-										description:
-											"Save as draft",
-										value: "draft",
-									},
-									{
-										label: "$(clock) Pending Review",
-										description:
-											"Submit for review",
-										value: "pending",
-									},
-									{
-										label: "$(lock) Private",
-										description:
-											"Only visible to admins",
-										value: "private",
-									},
-									{
-										label: "$(calendar) Schedule for Later",
-										description:
-											"Set future publish date",
-										value: "future",
-									},
-								],
+						const statusChoice = await vscode.window.showQuickPick(
+							[
 								{
-									placeHolder:
-										"Select new status",
-								}
-							);
+									label: "$(check) Publish",
+									description: "Make post public",
+									value: "publish",
+								},
+								{
+									label: "$(edit) Draft",
+									description: "Save as draft",
+									value: "draft",
+								},
+								{
+									label: "$(clock) Pending Review",
+									description: "Submit for review",
+									value: "pending",
+								},
+								{
+									label: "$(lock) Private",
+									description: "Only visible to admins",
+									value: "private",
+								},
+								{
+									label: "$(calendar) Schedule for Later",
+									description: "Set future publish date",
+									value: "future",
+								},
+							],
+							{
+								placeHolder: "Select new status",
+							}
+						);
 
 						if (!statusChoice) return;
 
-						let scheduledDate:
-							| string
-							| undefined;
+						let scheduledDate: string | undefined;
 
-						if (
-							statusChoice.value ===
-							"future"
-						) {
+						if (statusChoice.value === "future") {
 							// Prompt for date and time
-							const dateStr =
-								await vscode.window.showInputBox(
-									{
-										prompt: "Enter publish date and time",
-										placeHolder:
-											"YYYY-MM-DD HH:MM:SS (e.g., 2026-02-10 14:30:00)",
-										validateInput:
-											(
-												value
-											) => {
-												// Basic validation for date format
-												if (
-													!/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/.test(
-														value
-													)
-												) {
-													return "Invalid format. Use: YYYY-MM-DD HH:MM:SS";
-												}
-												return null;
-											},
+							const dateStr = await vscode.window.showInputBox({
+								prompt: "Enter publish date and time",
+								placeHolder: "YYYY-MM-DD HH:MM:SS (e.g., 2026-02-10 14:30:00)",
+								validateInput: (value) => {
+									// Basic validation for date format
+									if (!/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/.test(value)) {
+										return "Invalid format. Use: YYYY-MM-DD HH:MM:SS";
 									}
-								);
+									return null;
+								},
+							});
 
 							if (!dateStr) return;
 							scheduledDate = dateStr;
 						}
 
-						statusBar.showSyncing(
-							"Updating status..."
-						);
+						statusBar.showSyncing("Updating status...");
 
-						const response =
-							await restClient.updatePostMeta(
-								postId,
-								{
-									status: statusChoice.value,
-									scheduled_date:
-										scheduledDate,
-								}
-							);
+						const response = await restClient.updatePostMeta(postId, {
+							status: statusChoice.value,
+							scheduled_date: scheduledDate,
+						});
 
 						if (response.success) {
-							statusBar.showSuccess(
-								"Status updated"
-							);
+							statusBar.showSuccess("Status updated");
 							vscode.window.showInformationMessage(
 								`✅ Post status changed to "${statusChoice.label.replace(
 									/\$\(.*?\)\s*/,
@@ -983,207 +872,119 @@ function registerCommands(context: vscode.ExtensionContext) {
 								)}"`
 							);
 						} else {
-							statusBar.showError(
-								"Update failed"
-							);
+							statusBar.showError("Update failed");
 							vscode.window.showErrorMessage(
 								`Failed to update status: ${
-									response.message ||
-									"Unknown error"
+									response.message || "Unknown error"
 								}`
 							);
 						}
-					} else if (
-						choice.value === slugOption
-					) {
+					} else if (choice.value === slugOption) {
 						// Rename slug
-						const currentSlug =
-							folderName.replace(
-								/_\d+$/,
-								""
-							);
-						const newSlug =
-							await vscode.window.showInputBox(
-								{
-									prompt: "Enter new slug (URL-friendly name)",
-									placeHolder:
-										"my-new-slug",
-									value: currentSlug,
-									validateInput:
-										(
-											value
-										) => {
-											if (
-												!/^[a-z0-9-]+$/.test(
-													value
-												)
-											) {
-												return "Slug must contain only lowercase letters, numbers, and hyphens";
-											}
-											return null;
-										},
+						const currentSlug = folderName.replace(/_\d+$/, "");
+						const newSlug = await vscode.window.showInputBox({
+							prompt: "Enter new slug (URL-friendly name)",
+							placeHolder: "my-new-slug",
+							value: currentSlug,
+							validateInput: (value) => {
+								if (!/^[a-z0-9-]+$/.test(value)) {
+									return "Slug must contain only lowercase letters, numbers, and hyphens";
 								}
-							);
+								return null;
+							},
+						});
 
-						if (
-							!newSlug ||
-							newSlug === currentSlug
-						) {
+						if (!newSlug || newSlug === currentSlug) {
 							return;
 						}
 
-						statusBar.showSyncing(
-							"Renaming slug..."
-						);
+						statusBar.showSyncing("Renaming slug...");
 
-						const response =
-							await restClient.updatePostMeta(
-								postId,
-								{
-									slug: newSlug,
-								}
-							);
+						const response = await restClient.updatePostMeta(postId, {
+							slug: newSlug,
+						});
 
 						if (response.success) {
-							statusBar.showSuccess(
-								"Slug updated"
-							);
+							statusBar.showSuccess("Slug updated");
 							vscode.window.showInformationMessage(
 								`✅ Slug changed to "${newSlug}". Folder will be renamed automatically.`
 							);
-							debugLogger.log(
-								`✅ Slug updated: ${currentSlug} → ${newSlug}`
-							);
+							debugLogger.log(`✅ Slug updated: ${currentSlug} → ${newSlug}`);
 						} else {
-							statusBar.showError(
-								"Update failed"
-							);
+							statusBar.showError("Update failed");
 							vscode.window.showErrorMessage(
-								`Failed to update slug: ${
-									response.message ||
-									"Unknown error"
-								}`
+								`Failed to update slug: ${response.message || "Unknown error"}`
 							);
 						}
-					} else if (
-						choice.value === titleOption
-					) {
+					} else if (choice.value === titleOption) {
 						// Rename title
-						const newTitle =
-							await vscode.window.showInputBox(
-								{
-									prompt: "Enter new title",
-									placeHolder:
-										"My New Title",
-								}
-							);
+						const newTitle = await vscode.window.showInputBox({
+							prompt: "Enter new title",
+							placeHolder: "My New Title",
+						});
 
 						if (!newTitle) return;
 
-						statusBar.showSyncing(
-							"Updating title..."
-						);
+						statusBar.showSyncing("Updating title...");
 
-						const response =
-							await restClient.updatePostMeta(
-								postId,
-								{
-									title: newTitle,
-								}
-							);
+						const response = await restClient.updatePostMeta(postId, {
+							title: newTitle,
+						});
 
 						if (response.success) {
-							statusBar.showSuccess(
-								"Title updated"
-							);
+							statusBar.showSuccess("Title updated");
 							vscode.window.showInformationMessage(
 								`✅ Title changed to "${newTitle}"`
 							);
-							debugLogger.log(
-								`✅ Title updated for post ${postId}`
-							);
+							debugLogger.log(`✅ Title updated for post ${postId}`);
 						} else {
-							statusBar.showError(
-								"Update failed"
-							);
+							statusBar.showError("Update failed");
 							vscode.window.showErrorMessage(
-								`Failed to update title: ${
-									response.message ||
-									"Unknown error"
-								}`
+								`Failed to update title: ${response.message || "Unknown error"}`
 							);
 						}
-					} else if (
-						choice.value === scheduleOption
-					) {
+					} else if (choice.value === scheduleOption) {
 						// Schedule post
-						const dateStr =
-							await vscode.window.showInputBox(
-								{
-									prompt: "Enter publish date and time",
-									placeHolder:
-										"YYYY-MM-DD HH:MM:SS (e.g., 2026-02-10 14:30:00)",
-									validateInput:
-										(
-											value
-										) => {
-											if (
-												!/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/.test(
-													value
-												)
-											) {
-												return "Invalid format. Use: YYYY-MM-DD HH:MM:SS";
-											}
-											return null;
-										},
+						const dateStr = await vscode.window.showInputBox({
+							prompt: "Enter publish date and time",
+							placeHolder: "YYYY-MM-DD HH:MM:SS (e.g., 2026-02-10 14:30:00)",
+							validateInput: (value) => {
+								if (!/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/.test(value)) {
+									return "Invalid format. Use: YYYY-MM-DD HH:MM:SS";
 								}
-							);
+								return null;
+							},
+						});
 
 						if (!dateStr) return;
 
-						statusBar.showSyncing(
-							"Scheduling post..."
-						);
+						statusBar.showSyncing("Scheduling post...");
 
-						const response =
-							await restClient.updatePostMeta(
-								postId,
-								{
-									status: "future",
-									scheduled_date:
-										dateStr,
-								}
-							);
+						const response = await restClient.updatePostMeta(postId, {
+							status: "future",
+							scheduled_date: dateStr,
+						});
 
 						if (response.success) {
-							statusBar.showSuccess(
-								"Post scheduled"
-							);
+							statusBar.showSuccess("Post scheduled");
 							vscode.window.showInformationMessage(
 								`✅ Post scheduled for ${dateStr}`
 							);
 						} else {
-							statusBar.showError(
-								"Scheduling failed"
-							);
+							statusBar.showError("Scheduling failed");
 							vscode.window.showErrorMessage(
 								`Failed to schedule post: ${
-									response.message ||
-									"Unknown error"
+									response.message || "Unknown error"
 								}`
 							);
 						}
 					}
 				} catch (error: any) {
-					statusBar.showError(
-						`Failed: ${error.message}`
-					);
+					statusBar.showError(`Failed: ${error.message}`);
 					vscode.window.showErrorMessage(
 						`Failed to update post: ${error.message}`
 					);
-					debugLogger.log(
-						`❌ Manage post failed: ${error.message}`
-					);
+					debugLogger.log(`❌ Manage post failed: ${error.message}`);
 				}
 			}
 		)
@@ -1195,16 +996,12 @@ function registerCommands(context: vscode.ExtensionContext) {
 			"skylit.deletePost",
 			async (uri?: vscode.Uri) => {
 				if (!restClient) {
-					vscode.window.showErrorMessage(
-						"Not connected to WordPress"
-					);
+					vscode.window.showErrorMessage("Not connected to WordPress");
 					return;
 				}
 
 				if (!currentDevPath) {
-					vscode.window.showErrorMessage(
-						"Dev folder not configured"
-					);
+					vscode.window.showErrorMessage("Dev folder not configured");
 					return;
 				}
 
@@ -1216,20 +1013,13 @@ function registerCommands(context: vscode.ExtensionContext) {
 					folderPath = uri.fsPath;
 					// If it's a file, get its parent folder
 					if (path.extname(folderPath)) {
-						folderPath =
-							path.dirname(
-								folderPath
-							);
+						folderPath = path.dirname(folderPath);
 					}
 				} else {
 					// Try to get from active editor
-					const editor =
-						vscode.window.activeTextEditor;
+					const editor = vscode.window.activeTextEditor;
 					if (editor) {
-						folderPath = path.dirname(
-							editor.document.uri
-								.fsPath
-						);
+						folderPath = path.dirname(editor.document.uri.fsPath);
 					}
 				}
 
@@ -1261,77 +1051,48 @@ function registerCommands(context: vscode.ExtensionContext) {
 				const deleteOption = "Delete Permanently";
 				const cancelOption = "Cancel";
 
-				const choice =
-					await vscode.window.showWarningMessage(
-						`Delete "${folderName}" from WordPress?`,
-						{
-							modal: true,
-							detail: `Post ID: ${postId}\n\n• Move to Trash: Post goes to WordPress trash (recoverable). Local folder will be deleted.\n• Delete Permanently: Post removed from database, local folder and metadata deleted.\n• Cancel: No changes.`,
-						},
-						trashOption,
-						deleteOption,
-						cancelOption
-					);
+				const choice = await vscode.window.showWarningMessage(
+					`Delete "${folderName}" from WordPress?`,
+					{
+						modal: true,
+						detail: `Post ID: ${postId}\n\n• Move to Trash: Post goes to WordPress trash (recoverable). Local folder will be deleted.\n• Delete Permanently: Post removed from database, local folder and metadata deleted.\n• Cancel: No changes.`,
+					},
+					trashOption,
+					deleteOption,
+					cancelOption
+				);
 
 				if (!choice || choice === cancelOption) {
 					return;
 				}
 
-				const action =
-					choice === trashOption
-						? "trash"
-						: "delete";
+				const action = choice === trashOption ? "trash" : "delete";
 
 				try {
 					// Mark this post to skip the FileWatcher prompt (already confirmed by user)
 					if (fileWatcher) {
-						fileWatcher.markPostForDeletion(
-							postId
-						);
+						fileWatcher.markPostForDeletion(postId);
 					}
 
 					statusBar.showSyncing(
-						`${
-							action === "trash"
-								? "Trashing"
-								: "Deleting"
-						}...`
+						`${action === "trash" ? "Trashing" : "Deleting"}...`
 					);
 
-					const response =
-						await restClient.sendFolderAction(
-							postId,
-							action
-						);
+					const response = await restClient.sendFolderAction(postId, action);
 
 					if (response.success) {
 						const actionVerb =
-							action === "trash"
-								? "moved to trash"
-								: "permanently deleted";
-						debugLogger.log(
-							`✅ Post ${postId} ${actionVerb}`
-						);
+							action === "trash" ? "moved to trash" : "permanently deleted";
+						debugLogger.log(`✅ Post ${postId} ${actionVerb}`);
 
 						// Delete local folder
 						try {
-							const fs = await import(
-								"fs"
-							);
-							if (
-								fs.existsSync(
-									folderPath
-								)
-							) {
-								fs.rmSync(
-									folderPath,
-									{
-										recursive: true,
-									}
-								);
-								debugLogger.log(
-									`🗑️ Deleted local folder: ${folderName}`
-								);
+							const fs = await import("fs");
+							if (fs.existsSync(folderPath)) {
+								fs.rmSync(folderPath, {
+									recursive: true,
+								});
+								debugLogger.log(`🗑️ Deleted local folder: ${folderName}`);
 							}
 						} catch (fsError: any) {
 							debugLogger.log(
@@ -1342,28 +1103,16 @@ function registerCommands(context: vscode.ExtensionContext) {
 						// Delete metadata file for permanent deletes
 						if (action === "delete") {
 							try {
-								const fs =
-									await import(
-										"fs"
-									);
-								const metadataPath =
-									path.join(
-										currentDevPath,
-										".skylit",
-										"metadata",
-										`${postId}.json`
-									);
-								if (
-									fs.existsSync(
-										metadataPath
-									)
-								) {
-									fs.unlinkSync(
-										metadataPath
-									);
-									debugLogger.log(
-										`🗑️ Deleted metadata file: ${postId}.json`
-									);
+								const fs = await import("fs");
+								const metadataPath = path.join(
+									currentDevPath,
+									".skylit",
+									"metadata",
+									`${postId}.json`
+								);
+								if (fs.existsSync(metadataPath)) {
+									fs.unlinkSync(metadataPath);
+									debugLogger.log(`🗑️ Deleted metadata file: ${postId}.json`);
 								}
 							} catch (metaError: any) {
 								debugLogger.log(
@@ -1372,36 +1121,349 @@ function registerCommands(context: vscode.ExtensionContext) {
 							}
 						}
 
-						statusBar.showSuccess(
-							`Post ${actionVerb}`
-						);
+						statusBar.showSuccess(`Post ${actionVerb}`);
 						vscode.window.showInformationMessage(
 							`✅ Post ${postId} ${actionVerb} from WordPress`
 						);
 					} else {
-						statusBar.showError(
-							"Action failed"
-						);
+						statusBar.showError("Action failed");
 						vscode.window.showErrorMessage(
-							`Failed to ${action} post: ${
-								response.message ||
-								"Unknown error"
-							}`
+							`Failed to ${action} post: ${response.message || "Unknown error"}`
 						);
 					}
 				} catch (error: any) {
-					statusBar.showError(
-						`Failed: ${error.message}`
-					);
+					statusBar.showError(`Failed: ${error.message}`);
 					vscode.window.showErrorMessage(
 						`Failed to ${action} post ${postId}: ${error.message}`
 					);
-					debugLogger.log(
-						`❌ Delete post failed: ${error.message}`
-					);
+					debugLogger.log(`❌ Delete post failed: ${error.message}`);
 				}
 			}
 		)
+	);
+
+	// Connect to Remote WordPress (prompts for URL, token, local path)
+	context.subscriptions.push(
+		vscode.commands.registerCommand("skylit.connectRemote", async () => {
+			debugLogger.show();
+
+			const siteUrl = await vscode.window.showInputBox({
+				prompt: "Enter your remote WordPress site URL",
+				placeHolder: "https://mysite.com",
+				ignoreFocusOut: true,
+				validateInput: (value) => {
+					if (!value.trim()) return "URL is required";
+					try {
+						new URL(value.trim());
+					} catch {
+						return "Invalid URL format";
+					}
+					return null;
+				},
+			});
+			if (!siteUrl) return;
+
+			const token = await vscode.window.showInputBox({
+				prompt: `Enter auth token for ${siteUrl}`,
+				placeHolder: "skylit_abc123...",
+				password: true,
+				ignoreFocusOut: true,
+			});
+			if (!token) return;
+
+			const localPath = await vscode.window.showInputBox({
+				prompt: "Enter local dev folder path (where files will be stored)",
+				placeHolder: "C:\\projects\\mysite-dev-root",
+				ignoreFocusOut: true,
+				validateInput: (value) => {
+					if (!value.trim()) return "Path is required";
+					return null;
+				},
+			});
+			if (!localPath) return;
+
+			const cleanUrl = siteUrl.trim().replace(/\/$/, "");
+			const cleanPath = localPath.trim();
+
+			// Save settings
+			const vscodeConfig = vscode.workspace.getConfiguration("skylit");
+			await vscodeConfig.update(
+				"siteUrl",
+				cleanUrl,
+				vscode.ConfigurationTarget.Workspace
+			);
+			await vscodeConfig.update(
+				"localDevPath",
+				cleanPath,
+				vscode.ConfigurationTarget.Workspace
+			);
+
+			// Save token
+			await authManager.saveToken(cleanUrl, token);
+
+			isRemoteMode = true;
+
+			const remoteSite = {
+				name: new URL(cleanUrl).hostname,
+				path: cleanPath,
+				siteUrl: cleanUrl,
+				devFolder: cleanPath,
+			};
+
+			await connectToWordPress(remoteSite, context, false);
+		})
+	);
+
+	// Sync all posts from remote (full sync)
+	context.subscriptions.push(
+		vscode.commands.registerCommand("skylit.syncFromRemote", async () => {
+			if (!restClient) {
+				vscode.window.showErrorMessage("Not connected to WordPress");
+				return;
+			}
+			if (!exportPoller) {
+				vscode.window.showErrorMessage(
+					"Export poller not active (remote mode required)"
+				);
+				return;
+			}
+
+			const result = await vscode.window.withProgress(
+				{
+					location: vscode.ProgressLocation.Notification,
+					title: "Syncing all posts from remote WordPress...",
+					cancellable: false,
+				},
+				async () => {
+					return exportPoller!.performFullSync();
+				}
+			);
+
+			vscode.window.showInformationMessage(
+				`Full sync complete: ${result.synced} posts synced${
+					result.errors > 0 ? `, ${result.errors} errors` : ""
+				}`
+			);
+		})
+	);
+
+	// Relocate dev folder (pull from server to local, or move between locations)
+	context.subscriptions.push(
+		vscode.commands.registerCommand("skylit.relocateDevFolder", async () => {
+			debugLogger.show();
+
+			if (!restClient) {
+				vscode.window.showErrorMessage(
+					"Not connected to WordPress. Connect first, then relocate."
+				);
+				return;
+			}
+
+			// Ask what they want to do
+			const action = await vscode.window.showQuickPick(
+				[
+					{
+						label: "$(cloud-download) Pull to local folder",
+						description:
+							"Download all posts from WordPress to a local dev folder and switch to remote mode",
+						value: "pull-local",
+					},
+					{
+						label: "$(file-symlink-directory) Move to different folder",
+						description: "Move dev folder to a new location (local to local)",
+						value: "move-local",
+					},
+				],
+				{
+					placeHolder: "How would you like to relocate the dev folder?",
+				}
+			);
+
+			if (!action) return;
+
+			if (action.value === "pull-local" || action.value === "move-local") {
+				// Prompt for local path (showOpenDialog shows remote filesystem in SSH sessions)
+				const newPath = await promptForLocalDevFolder(
+					action.value === "pull-local"
+						? "Enter the local path where posts should be downloaded"
+						: "Enter the new local path for your dev folder"
+				);
+
+				if (!newPath) return;
+
+				// If moving locally, copy existing files first
+				if (action.value === "move-local" && currentDevPath) {
+					const confirm = await vscode.window.showWarningMessage(
+						`This will copy all files from:\n${currentDevPath}\n\nTo:\n${newPath}\n\nAnd switch the extension to use the new location.`,
+						{ modal: true },
+						"Copy & Switch",
+						"Cancel"
+					);
+
+					if (confirm !== "Copy & Switch") return;
+
+					await vscode.window.withProgress(
+						{
+							location: vscode.ProgressLocation.Notification,
+							title: "Copying dev folder...",
+							cancellable: false,
+						},
+						async (progress) => {
+							const fs = require("fs");
+							const pathModule = require("path");
+
+							const copyRecursive = (src: string, dest: string) => {
+								if (!fs.existsSync(dest)) {
+									fs.mkdirSync(dest, {
+										recursive: true,
+									});
+								}
+
+								const entries = fs.readdirSync(src, {
+									withFileTypes: true,
+								});
+
+								for (const entry of entries) {
+									const srcPath = pathModule.join(src, entry.name);
+									const destPath = pathModule.join(dest, entry.name);
+
+									if (entry.isDirectory()) {
+										copyRecursive(srcPath, destPath);
+									} else {
+										fs.copyFileSync(srcPath, destPath);
+									}
+								}
+							};
+
+							progress.report({
+								message: "Copying files...",
+							});
+							copyRecursive(currentDevPath!, newPath);
+							progress.report({
+								message: "Files copied!",
+							});
+						}
+					);
+
+					debugLogger.info(
+						`📁 Copied dev folder from ${currentDevPath} to ${newPath}`
+					);
+				}
+
+				// If pulling from remote, download via REST API
+				if (action.value === "pull-local") {
+					const manifest = await restClient!.getExportAll();
+
+					const confirm = await vscode.window.showWarningMessage(
+						`This will download ${manifest.count} posts from WordPress to:\n${newPath}\n\nAnd switch to remote dev folder mode.`,
+						{ modal: true },
+						"Download & Switch",
+						"Cancel"
+					);
+
+					if (confirm !== "Download & Switch") return;
+
+					// Create a temporary ExportPoller for the download
+					const tempPoller = new ExportPoller(
+						restClient!,
+						newPath,
+						statusBar,
+						debugLogger
+					);
+
+					const result = await vscode.window.withProgress(
+						{
+							location: vscode.ProgressLocation.Notification,
+							title: "Downloading posts from WordPress...",
+							cancellable: false,
+						},
+						async (progress) => {
+							progress.report({
+								message: `Downloading ${manifest.count} posts...`,
+							});
+							return tempPoller.performFullSync();
+						}
+					);
+
+					debugLogger.info(
+						`📦 Downloaded ${result.synced} posts to ${newPath}`
+					);
+
+					if (result.errors > 0) {
+						vscode.window.showWarningMessage(
+							`Downloaded ${result.synced} posts with ${result.errors} errors. Check Output panel.`
+						);
+					}
+				}
+
+				// Get the site URL (from current connection)
+				const currentSiteUrl = restClient!.getSiteUrl();
+
+				// Save settings for remote mode
+				const vscodeConfig = vscode.workspace.getConfiguration("skylit");
+				await vscodeConfig.update(
+					"localDevPath",
+					newPath,
+					vscode.ConfigurationTarget.Workspace
+				);
+
+				// Ensure siteUrl is saved (for reconnection)
+				if (!vscodeConfig.get<string>("siteUrl", "")) {
+					await vscodeConfig.update(
+						"siteUrl",
+						currentSiteUrl,
+						vscode.ConfigurationTarget.Workspace
+					);
+				}
+
+				// Switch to remote mode
+				isRemoteMode = true;
+				currentDevPath = newPath;
+
+				// Restart file watcher on new path
+				if (fileWatcher) {
+					fileWatcher.dispose();
+				}
+				fileWatcher = new FileWatcher(
+					newPath,
+					restClient!,
+					statusBar,
+					debugLogger,
+					newPath,
+					isRemoteMode
+				);
+				await fileWatcher.start();
+
+				// Start export poller
+				if (exportPoller) {
+					exportPoller.dispose();
+				}
+				exportPoller = new ExportPoller(
+					restClient!,
+					newPath,
+					statusBar,
+					debugLogger
+				);
+				exportPoller.start();
+
+				// Restart post type converter
+				if (postTypeConverter) {
+					postTypeConverter.dispose();
+				}
+				postTypeConverter = new PostTypeConverter(
+					restClient!,
+					newPath,
+					debugLogger
+				);
+				postTypeConverter.startWatching();
+
+				statusBar.updateStatus("connected", "Remote");
+
+				vscode.window.showInformationMessage(
+					`Dev folder relocated to ${newPath}. Now running in remote mode.`
+				);
+			}
+		})
 	);
 
 	// Show menu command
@@ -1409,22 +1471,25 @@ function registerCommands(context: vscode.ExtensionContext) {
 		vscode.commands.registerCommand("skylit.showMenu", async () => {
 			// If disconnected or error, show quick connect options
 			if (
-				statusBar["connectionState"] ===
-					"disconnected" ||
+				statusBar["connectionState"] === "disconnected" ||
 				statusBar["connectionState"] === "error"
 			) {
 				const items = [
 					{
 						label: "🔌 Connect to WordPress",
 						command: "skylit.connect",
+						description: "Connect to detected WordPress site",
+					},
+					{
+						label: "🌐 Connect to Remote WordPress",
+						command: "skylit.connectRemote",
 						description:
-							"Connect to detected WordPress site",
+							"Connect to WordPress on a remote server with local dev folder",
 					},
 					{
 						label: "🔑 Setup Auth Token",
 						command: "skylit.setupToken",
-						description:
-							"Enter WordPress auth token",
+						description: "Enter WordPress auth token",
 					},
 					{
 						label: "🔍 Scan for WordPress",
@@ -1434,34 +1499,44 @@ function registerCommands(context: vscode.ExtensionContext) {
 					},
 				];
 
-				const choice =
-					await vscode.window.showQuickPick(
-						items,
-						{
-							placeHolder:
-								"Skylit.DEV I/O - Not Connected",
-						}
-					);
+				const choice = await vscode.window.showQuickPick(items, {
+					placeHolder: "Skylit.DEV I/O - Not Connected",
+				});
 
 				if (choice) {
-					vscode.commands.executeCommand(
-						choice.command
-					);
+					vscode.commands.executeCommand(choice.command);
 				}
 			} else {
 				// Connected - show all actions
-				const items = [
+				const items: Array<{
+					label: string;
+					command: string;
+					description: string;
+				}> = [
 					{
 						label: "🔄 Sync Current File",
 						command: "skylit.syncNow",
-						description:
-							"Force sync the active file",
+						description: "Force sync the active file",
 					},
+					{
+						label: "📁 Relocate Dev Folder",
+						command: "skylit.relocateDevFolder",
+						description:
+							"Move dev folder to a different location or pull from server",
+					},
+					...(isRemoteMode
+						? [
+								{
+									label: "📦 Sync All from Remote",
+									command: "skylit.syncFromRemote",
+									description: "Download all posts from WordPress",
+								},
+						  ]
+						: []),
 					{
 						label: "❌ Disconnect",
 						command: "skylit.disconnect",
-						description:
-							"Disconnect from WordPress",
+						description: "Disconnect from WordPress",
 					},
 					{
 						label: "🔍 Scan for WordPress",
@@ -1472,24 +1547,16 @@ function registerCommands(context: vscode.ExtensionContext) {
 					{
 						label: "🔑 Setup Auth Token",
 						command: "skylit.setupToken",
-						description:
-							"Enter WordPress auth token",
+						description: "Enter WordPress auth token",
 					},
 				];
 
-				const choice =
-					await vscode.window.showQuickPick(
-						items,
-						{
-							placeHolder:
-								"Skylit.DEV I/O Actions",
-						}
-					);
+				const choice = await vscode.window.showQuickPick(items, {
+					placeHolder: "Skylit.DEV I/O Actions",
+				});
 
 				if (choice) {
-					vscode.commands.executeCommand(
-						choice.command
-					);
+					vscode.commands.executeCommand(choice.command);
 				}
 			}
 		})
@@ -1508,40 +1575,51 @@ async function connectToWordPress(
 	statusBar.updateStatus("connecting", "Connecting...");
 
 	try {
-		// Check if site URL is localhost and prompt for actual URL
+		// Start with URL from wp-config.php detection
 		let siteUrl = site.siteUrl;
-		if (
-			siteUrl === "http://localhost" ||
-			siteUrl === "https://localhost"
-		) {
+
+		// Try discovery endpoint to get canonical siteUrl and devPath from WordPress
+		// This is the source of truth - WordPress knows its own URL
+		const discovered = await RestClient.discover(siteUrl, debugLogger);
+		if (discovered) {
+			siteUrl = discovered.siteUrl;
+			site.siteUrl = siteUrl;
+			site.devFolder = discovered.devPath;
+			debugLogger.info(`✅ Discovered from WordPress: ${siteUrl}`);
+		}
+
+		// VS Code settings can still override (for edge cases like proxies)
+		const vscodeConfig = vscode.workspace.getConfiguration("skylit");
+		const manualSiteUrl = vscodeConfig.get<string>("siteUrl");
+		if (manualSiteUrl?.trim()) {
+			debugLogger.warn(
+				`⚠️ skylit.siteUrl setting is overriding discovered URL: ${manualSiteUrl}`
+			);
+			siteUrl = manualSiteUrl.trim().replace(/\/$/, "");
+			site.siteUrl = siteUrl;
+		}
+
+		// Check if site URL is still localhost
+		if (siteUrl === "http://localhost" || siteUrl === "https://localhost") {
 			debugLogger.warn(`⚠️ Default localhost URL detected`);
 
 			// Don't prompt during auto-connect, just fail gracefully
 			if (isAutoConnect) {
-				debugLogger.info(
-					'💡 Please set "skylit.siteUrl" in VS Code settings'
-				);
-				statusBar.updateStatus(
-					"disconnected",
-					"Configure site URL"
-				);
+				debugLogger.info('💡 Please set "skylit.siteUrl" in VS Code settings');
+				statusBar.updateStatus("disconnected", "Configure site URL");
 				return;
 			}
 
 			// Prompt user for actual URL
 			const userUrl = await vscode.window.showInputBox({
 				prompt: "Enter your WordPress site URL",
-				placeHolder:
-					"https://palegreen-capybara-849923.hostingersite.com",
+				placeHolder: "https://palegreen-capybara-849923.hostingersite.com",
 				value: siteUrl,
 				ignoreFocusOut: true,
 			});
 
 			if (!userUrl || userUrl.trim() === "") {
-				statusBar.updateStatus(
-					"disconnected",
-					"Connection cancelled"
-				);
+				statusBar.updateStatus("disconnected", "Connection cancelled");
 				return;
 			}
 
@@ -1550,8 +1628,6 @@ async function connectToWordPress(
 			debugLogger.info(`✅ Using URL: ${siteUrl}`);
 
 			// Save to settings for future use
-			const vscodeConfig =
-				vscode.workspace.getConfiguration("skylit");
 			await vscodeConfig.update(
 				"siteUrl",
 				siteUrl,
@@ -1560,16 +1636,13 @@ async function connectToWordPress(
 		}
 
 		// Security: Warn if connecting over HTTP (not HTTPS)
-		const isLocalhost =
-			/^https?:\/\/(localhost|127\.0\.0\.1|::1)/i.test(
-				siteUrl
-			);
+		const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|::1)/i.test(
+			siteUrl
+		);
 		const isHttps = siteUrl.startsWith("https://");
 
 		if (!isHttps && !isLocalhost) {
-			debugLogger.warn(
-				"⚠️ Security Warning: Connecting over HTTP"
-			);
+			debugLogger.warn("⚠️ Security Warning: Connecting over HTTP");
 
 			const choice = await vscode.window.showWarningMessage(
 				"⚠️ Security Warning\n\nYou are connecting over HTTP instead of HTTPS. Your auth token will be transmitted in cleartext and could be intercepted.\n\nUse HTTPS in production for secure communication.",
@@ -1579,9 +1652,7 @@ async function connectToWordPress(
 			);
 
 			if (choice !== "Continue Anyway") {
-				debugLogger.info(
-					"❌ User cancelled HTTP connection"
-				);
+				debugLogger.info("❌ User cancelled HTTP connection");
 				statusBar.updateStatus(
 					"disconnected",
 					"Connection cancelled (use HTTPS)"
@@ -1589,9 +1660,7 @@ async function connectToWordPress(
 				return;
 			}
 
-			debugLogger.warn(
-				"⚠️ User acknowledged HTTP security risk and continued"
-			);
+			debugLogger.warn("⚠️ User acknowledged HTTP security risk and continued");
 		}
 
 		// Check for saved token
@@ -1618,13 +1687,8 @@ async function connectToWordPress(
 						"Dismiss"
 					)
 					.then((selection) => {
-						if (
-							selection ===
-							"Setup Token"
-						) {
-							vscode.commands.executeCommand(
-								"skylit.setupToken"
-							);
+						if (selection === "Setup Token") {
+							vscode.commands.executeCommand("skylit.setupToken");
 						}
 					});
 				return;
@@ -1638,10 +1702,7 @@ async function connectToWordPress(
 			});
 
 			if (!input) {
-				statusBar.updateStatus(
-					"disconnected",
-					"Connection cancelled"
-				);
+				statusBar.updateStatus("disconnected", "Connection cancelled");
 				return;
 			}
 
@@ -1664,10 +1725,7 @@ async function connectToWordPress(
 				debugLogger.info(
 					"💡 Token is invalid or expired. Please setup a new token."
 				);
-				statusBar.updateStatus(
-					"error",
-					"Invalid token - Click to setup"
-				);
+				statusBar.updateStatus("error", "Invalid token - Click to setup");
 
 				vscode.window
 					.showWarningMessage(
@@ -1676,13 +1734,8 @@ async function connectToWordPress(
 						"Dismiss"
 					)
 					.then((selection) => {
-						if (
-							selection ===
-							"Setup New Token"
-						) {
-							vscode.commands.executeCommand(
-								"skylit.setupToken"
-							);
+						if (selection === "Setup New Token") {
+							vscode.commands.executeCommand("skylit.setupToken");
 						}
 					});
 				return;
@@ -1695,9 +1748,7 @@ async function connectToWordPress(
 				)
 				.then((selection) => {
 					if (selection === "Setup Token") {
-						vscode.commands.executeCommand(
-							"skylit.setupToken"
-						);
+						vscode.commands.executeCommand("skylit.setupToken");
 					}
 				});
 			statusBar.updateStatus("error", "Invalid token");
@@ -1708,49 +1759,92 @@ async function connectToWordPress(
 
 		// Get plugin status and dev folder from WordPress
 		const status = await restClient.getStatus();
-		debugLogger.info(
-			`✅ Connected to Skylit plugin v${status.version}`
-		);
-		debugLogger.log(
-			`   Dev folder from WordPress: ${status.dev_path}`
-		);
+		debugLogger.info(`✅ Connected to Skylit plugin v${status.version}`);
+		debugLogger.log(`   Dev folder from WordPress: ${status.dev_path}`);
 
-		// Validate that WordPress provided a dev folder path
-		if (!status.dev_path || status.dev_path.trim() === "") {
-			debugLogger.error(
-				"❌ WordPress did not provide a dev folder path"
-			);
-			vscode.window.showErrorMessage(
-				"Dev folder not configured in WordPress. Please set it in Admin → Skylit.DEV → Dev Sync"
-			);
-			statusBar.updateStatus(
-				"error",
-				"Dev folder not configured"
-			);
+		// Determine the effective dev path:
+		// Remote mode → use local dev path from settings
+		// Local mode → use server dev path from WordPress
+		const localDevPath = vscodeConfig.get<string>("localDevPath", "").trim();
+		const effectiveDevPath =
+			isRemoteMode && localDevPath ? localDevPath : status.dev_path;
+
+		if (!effectiveDevPath || effectiveDevPath.trim() === "") {
+			debugLogger.error("❌ No dev folder path available");
+			const msg = isRemoteMode
+				? "Local dev path not configured. Set skylit.localDevPath in settings."
+				: "Dev folder not configured in WordPress. Please set it in Admin → Skylit.DEV → Dev Sync";
+			vscode.window.showErrorMessage(msg);
+			statusBar.updateStatus("error", "Dev folder not configured");
 			return;
 		}
 
-		// Initialize file watcher with the dev folder from WordPress API
-		// This is the source of truth - it reflects the actual WordPress settings
+		if (isRemoteMode) {
+			debugLogger.info(
+				`🌐 Remote mode: using local dev path: ${effectiveDevPath}`
+			);
+		}
+
+		// Initialize file watcher with the effective dev path
 		if (fileWatcher) {
 			fileWatcher.dispose();
 		}
 
-		debugLogger.log(
-			`👀 Starting file watcher for: ${status.dev_path}`
-		);
+		debugLogger.info(`👀 Starting file watcher for: ${effectiveDevPath}`);
 
 		fileWatcher = new FileWatcher(
-			status.dev_path,
+			effectiveDevPath,
 			restClient,
 			statusBar,
-			debugLogger
+			debugLogger,
+			effectiveDevPath,
+			isRemoteMode
 		);
 
 		await fileWatcher.start();
 
+		fileWatcher.setIdAssignConfig(
+			status.id_assign_mode || "auto",
+			status.id_assign_delay ?? 10
+		);
+
 		// Store the current dev path
-		currentDevPath = status.dev_path;
+		currentDevPath = effectiveDevPath;
+
+		// Start export poller for remote mode (pulls exports from WordPress)
+		if (isRemoteMode) {
+			if (exportPoller) {
+				exportPoller.dispose();
+			}
+			exportPoller = new ExportPoller(
+				restClient,
+				effectiveDevPath,
+				statusBar,
+				debugLogger
+			);
+			exportPoller.start();
+			debugLogger.info("📡 Export poller started (remote dev folder mode)");
+
+			// Check if this is a first-time sync (empty dev folder)
+			const fs = require("fs");
+			const postTypesDir = require("path").join(effectiveDevPath, "post-types");
+			if (!fs.existsSync(postTypesDir)) {
+				const syncNow = await vscode.window.showInformationMessage(
+					"Remote dev folder appears empty. Sync all posts from WordPress?",
+					"Sync Now",
+					"Later"
+				);
+				if (syncNow === "Sync Now") {
+					vscode.commands.executeCommand("skylit.syncFromRemote");
+				}
+			}
+		} else {
+			// Ensure export poller is stopped in local mode
+			if (exportPoller) {
+				exportPoller.dispose();
+				exportPoller = null;
+			}
+		}
 
 		// Initialize post type converter
 		if (postTypeConverter) {
@@ -1758,7 +1852,7 @@ async function connectToWordPress(
 		}
 		postTypeConverter = new PostTypeConverter(
 			restClient,
-			status.dev_path,
+			effectiveDevPath,
 			debugLogger
 		);
 		postTypeConverter.startWatching();
@@ -1773,19 +1867,24 @@ async function connectToWordPress(
 			if (!restClient) return;
 
 			try {
-				const updatedStatus =
-					await restClient.getStatus();
+				const updatedStatus = await restClient.getStatus();
 
-				// Check if dev folder location changed in WordPress
-				if (updatedStatus.dev_path !== currentDevPath) {
+				// Always refresh ID assign config in case it changed in plugin settings
+				if (fileWatcher) {
+					fileWatcher.setIdAssignConfig(
+						updatedStatus.id_assign_mode || "auto",
+						updatedStatus.id_assign_delay ?? 10
+					);
+				}
+
+				// In local mode, check if dev folder location changed in WordPress
+				// In remote mode, the dev path is local and doesn't change from the server
+				if (!isRemoteMode && updatedStatus.dev_path !== currentDevPath) {
 					debugLogger.log(
 						`🔄 Dev folder changed: ${currentDevPath} → ${updatedStatus.dev_path}`
 					);
-					debugLogger.log(
-						`   Restarting file watcher...`
-					);
+					debugLogger.log(`   Restarting file watcher...`);
 
-					// Restart file watcher with new path
 					if (fileWatcher) {
 						fileWatcher.dispose();
 					}
@@ -1794,22 +1893,26 @@ async function connectToWordPress(
 						updatedStatus.dev_path,
 						restClient,
 						statusBar,
-						debugLogger
+						debugLogger,
+						updatedStatus.dev_path,
+						isRemoteMode
 					);
 
 					await fileWatcher.start();
+					fileWatcher.setIdAssignConfig(
+						updatedStatus.id_assign_mode || "auto",
+						updatedStatus.id_assign_delay ?? 10
+					);
 					currentDevPath = updatedStatus.dev_path;
 
-					// Restart post type converter with new path
 					if (postTypeConverter) {
 						postTypeConverter.dispose();
 					}
-					postTypeConverter =
-						new PostTypeConverter(
-							restClient,
-							updatedStatus.dev_path,
-							debugLogger
-						);
+					postTypeConverter = new PostTypeConverter(
+						restClient,
+						updatedStatus.dev_path,
+						debugLogger
+					);
 					postTypeConverter.startWatching();
 
 					debugLogger.info(
@@ -1818,14 +1921,15 @@ async function connectToWordPress(
 				}
 			} catch (error: any) {
 				// Silently fail - don't spam errors if WordPress is temporarily unavailable
-				debugLogger.log(
-					`⚠️ Status check failed: ${error.message}`
-				);
+				debugLogger.log(`⚠️ Status check failed: ${error.message}`);
 			}
 		}, 60000); // Check every 60 seconds
 
 		// Start jump-to-code polling (every 500ms for responsiveness)
 		startJumpPolling();
+
+		// Start relocation request polling (every 5s, handles plugin-initiated moves)
+		startRelocatePolling();
 
 		// Run initial metadata cleanup on startup
 		performMetadataCleanup();
@@ -1833,23 +1937,23 @@ async function connectToWordPress(
 		// Start periodic metadata cleanup (every 5 minutes)
 		startMetadataCleanup();
 
-		statusBar.updateStatus("connected", "Connected");
+		const modeLabel = isRemoteMode ? "Remote" : "Connected";
+		statusBar.updateStatus("connected", modeLabel);
 
-		// Extract a readable folder path for the notification
-		const devPath = status.dev_path.replace(/\\/g, "/");
+		const displayDevPath = effectiveDevPath.replace(/\\/g, "/");
 		let displayMessage = "";
 
-		if (devPath.includes("wp-content")) {
-			// Inside WordPress wp-content directory
-			const wpContentIndex = devPath.indexOf("wp-content");
-			const relativePath = devPath.substring(wpContentIndex);
+		if (isRemoteMode) {
+			const parts = displayDevPath.split("/").filter((p: string) => p);
+			const folderName = parts[parts.length - 1] || parts[parts.length - 2];
+			displayMessage = `✅ Connected to remote WordPress → local /${folderName}`;
+		} else if (displayDevPath.includes("wp-content")) {
+			const wpContentIndex = displayDevPath.indexOf("wp-content");
+			const relativePath = displayDevPath.substring(wpContentIndex);
 			displayMessage = `✅ Connected to .../${relativePath}`;
 		} else {
-			// Outside WordPress (server root level)
-			const parts = devPath.split("/").filter((p) => p);
-			const folderName =
-				parts[parts.length - 1] ||
-				parts[parts.length - 2];
+			const parts = displayDevPath.split("/").filter((p: string) => p);
+			const folderName = parts[parts.length - 1] || parts[parts.length - 2];
 			displayMessage = `✅ Connected to /${folderName} (Server Root)`;
 		}
 
@@ -1902,30 +2006,46 @@ async function pollForJump() {
 			debugLogger.log(
 				`📍 Jump request received: ${jumpData.file}:${jumpData.line}`
 			);
-			debugLogger.log(
-				`   Current dev path from WordPress: ${currentDevPath}`
-			);
 
-			// Get workspace folders to determine if we're in a remote workspace
-			const workspaceFolders =
-				vscode.workspace.workspaceFolders;
-			if (
-				!workspaceFolders ||
-				workspaceFolders.length === 0
-			) {
+			// CRITICAL: Only process jump if the target file is ALREADY OPEN in an editor
+			// This prevents Gutenberg from hijacking focus when user is working elsewhere
+			const normalizedJumpFile = jumpData.file
+				.replace(/\\/g, "/")
+				.toLowerCase();
+			const openEditors = vscode.window.visibleTextEditors;
+			const targetFileIsOpen = openEditors.some((editor) => {
+				const editorPath = editor.document.uri.fsPath
+					.replace(/\\/g, "/")
+					.toLowerCase();
+				return (
+					editorPath === normalizedJumpFile ||
+					editorPath.endsWith(normalizedJumpFile)
+				);
+			});
+
+			if (!targetFileIsOpen) {
 				debugLogger.log(
-					`   ❌ No workspace folder found`
+					`   ⏭️ Ignoring jump - target file not currently open in editor`
+				);
+				debugLogger.log(
+					`   (Jump-to-line only works when the file is already open)`
 				);
 				return;
 			}
 
+			debugLogger.log(`   ✓ Target file is open, proceeding with jump`);
+			debugLogger.log(`   Current dev path from WordPress: ${currentDevPath}`);
+
+			// Get workspace folders to determine if we're in a remote workspace
+			const workspaceFolders = vscode.workspace.workspaceFolders;
+			if (!workspaceFolders || workspaceFolders.length === 0) {
+				debugLogger.log(`   ❌ No workspace folder found`);
+				return;
+			}
+
 			const workspaceUri = workspaceFolders[0].uri;
-			debugLogger.log(
-				`   Workspace URI scheme: ${workspaceUri.scheme}`
-			);
-			debugLogger.log(
-				`   Workspace path: ${workspaceUri.path}`
-			);
+			debugLogger.log(`   Workspace URI scheme: ${workspaceUri.scheme}`);
+			debugLogger.log(`   Workspace path: ${workspaceUri.path}`);
 
 			// For remote workspaces (SSH, WSL, etc.), construct URI with the same scheme
 			// For local workspaces, use file:// scheme
@@ -1938,9 +2058,7 @@ async function pollForJump() {
 					authority: workspaceUri.authority,
 					path: jumpData.file,
 				});
-				debugLogger.log(
-					`   Using remote URI scheme: ${workspaceUri.scheme}`
-				);
+				debugLogger.log(`   Using remote URI scheme: ${workspaceUri.scheme}`);
 			} else {
 				// Local workspace - use file:// scheme
 				fileUri = vscode.Uri.file(jumpData.file);
@@ -1950,39 +2068,25 @@ async function pollForJump() {
 			debugLogger.log(`   File URI: ${fileUri.toString()}`);
 			debugLogger.log(`   Attempting to open file...`);
 
-			const document =
-				await vscode.workspace.openTextDocument(
-					fileUri
-				);
-			debugLogger.log(
-				`   ✅ Document opened: ${document.fileName}`
-			);
+			const document = await vscode.workspace.openTextDocument(fileUri);
+			debugLogger.log(`   ✅ Document opened: ${document.fileName}`);
 
 			// Show document with cursor at specified line
-			const editor = await vscode.window.showTextDocument(
-				document,
-				{
-					selection: new vscode.Range(
-						jumpData.line - 1, // VS Code uses 0-based line numbers
-						jumpData.column || 0,
-						jumpData.line - 1,
-						jumpData.column || 0
-					),
-					viewColumn: vscode.ViewColumn.One,
-				}
-			);
-			debugLogger.log(
-				`   ✅ Editor opened, showing line ${jumpData.line}`
-			);
+			// Use preserveFocus: false to actually move cursor, but don't change viewColumn
+			const editor = await vscode.window.showTextDocument(document, {
+				selection: new vscode.Range(
+					jumpData.line - 1, // VS Code uses 0-based line numbers
+					jumpData.column || 0,
+					jumpData.line - 1,
+					jumpData.column || 0
+				),
+				preserveFocus: false,
+			});
+			debugLogger.log(`   ✅ Editor opened, showing line ${jumpData.line}`);
 
 			// Reveal line at center of viewport
 			editor.revealRange(
-				new vscode.Range(
-					jumpData.line - 1,
-					0,
-					jumpData.line - 1,
-					0
-				),
+				new vscode.Range(jumpData.line - 1, 0, jumpData.line - 1, 0),
 				vscode.TextEditorRevealType.InCenter
 			);
 
@@ -2007,30 +2111,20 @@ async function pollForJump() {
 				);
 
 				// Add jitter (±25%)
-				const jitter =
-					jumpPollIntervalMs *
-					0.25 *
-					(Math.random() - 0.5);
-				jumpPollIntervalMs = Math.round(
-					jumpPollIntervalMs + jitter
-				);
+				const jitter = jumpPollIntervalMs * 0.25 * (Math.random() - 0.5);
+				jumpPollIntervalMs = Math.round(jumpPollIntervalMs + jitter);
 
 				debugLogger.warn(
 					`⚠️ Jump polling error (${consecutiveErrors} consecutive): ${error.message}. ` +
 						`Backing off to ${jumpPollIntervalMs}ms`
 				);
 			} else {
-				debugLogger.warn(
-					`⚠️ Jump error: ${error.message}`
-				);
+				debugLogger.warn(`⚠️ Jump error: ${error.message}`);
 			}
 		}
 	} finally {
 		// Schedule next poll
-		jumpPollingInterval = setTimeout(
-			pollForJump,
-			jumpPollIntervalMs
-		);
+		jumpPollingInterval = setTimeout(pollForJump, jumpPollIntervalMs);
 	}
 }
 
@@ -2075,9 +2169,7 @@ function startMetadataCleanup() {
 		clearInterval(metadataCleanupInterval);
 	}
 
-	debugLogger.log(
-		"🧹 Starting periodic metadata cleanup (every 5 minutes)..."
-	);
+	debugLogger.log("🧹 Starting periodic metadata cleanup (every 5 minutes)...");
 
 	metadataCleanupInterval = setInterval(async () => {
 		await performMetadataCleanup();
@@ -2092,5 +2184,216 @@ function stopMetadataCleanup() {
 		clearInterval(metadataCleanupInterval);
 		metadataCleanupInterval = null;
 		debugLogger.log("🧹 Metadata cleanup stopped");
+	}
+}
+
+/**
+ * Prompt user for a local dev folder path.
+ * Uses showInputBox instead of showOpenDialog because in Remote SSH sessions
+ * the file picker shows the server filesystem, not the local machine.
+ */
+async function promptForLocalDevFolder(
+	prompt: string
+): Promise<string | undefined> {
+	// Always use native folder picker -- showOpenDialog opens on the
+	// local (UI) side even when connected via Remote SSH.
+	const folderUri = await vscode.window.showOpenDialog({
+		canSelectFolders: true,
+		canSelectFiles: false,
+		canSelectMany: false,
+		openLabel: "Select Dev Folder",
+		title: prompt,
+	});
+
+	if (!folderUri || folderUri.length === 0) return undefined;
+
+	const selectedPath = folderUri[0].fsPath;
+
+	// Ensure the directory exists (create if needed)
+	const fsModule = require("fs");
+	if (!fsModule.existsSync(selectedPath)) {
+		fsModule.mkdirSync(selectedPath, { recursive: true });
+		debugLogger.info(`📁 Created dev folder: ${selectedPath}`);
+	}
+
+	return selectedPath;
+}
+
+/**
+ * Relocation request polling
+ * Polls the plugin for pending relocation requests initiated from the WP admin panel.
+ * When a request is found, prompts the user to choose a local folder and performs the relocation.
+ */
+const RELOCATE_POLL_INTERVAL = 5000; // 5 seconds
+
+function startRelocatePolling() {
+	if (relocatePollingInterval) {
+		clearTimeout(relocatePollingInterval);
+	}
+	debugLogger.log(
+		"🔄 Starting relocation request polling (every 5 seconds)..."
+	);
+	pollForRelocate();
+}
+
+function stopRelocatePolling() {
+	if (relocatePollingInterval) {
+		clearTimeout(relocatePollingInterval);
+		relocatePollingInterval = null;
+		debugLogger.log("🔄 Relocation request polling stopped");
+	}
+}
+
+async function pollForRelocate() {
+	if (!restClient) {
+		relocatePollingInterval = setTimeout(
+			pollForRelocate,
+			RELOCATE_POLL_INTERVAL
+		);
+		return;
+	}
+
+	try {
+		const data = await restClient.getPendingRelocate();
+
+		if (data.pending) {
+			debugLogger.info(
+				`🔄 Relocation request received from plugin (action: ${data.action})`
+			);
+			await handlePluginRelocateRequest(data.action || "pull-local");
+		}
+	} catch {
+		// Silent fail - plugin may not have the endpoint yet
+	}
+
+	relocatePollingInterval = setTimeout(pollForRelocate, RELOCATE_POLL_INTERVAL);
+}
+
+async function handlePluginRelocateRequest(action: string) {
+	if (!restClient) return;
+
+	// Prompt user to type a local path (showOpenDialog shows remote filesystem in SSH sessions)
+	const newPath = await promptForLocalDevFolder(
+		"WordPress requested dev folder relocation. Enter the local path where your dev folder should live."
+	);
+
+	if (!newPath) {
+		await restClient.ackRelocate(false, "");
+		debugLogger.info("🔄 Relocation cancelled by user");
+		return;
+	}
+
+	try {
+		// Download all posts from WordPress
+		const manifest = await restClient.getExportAll();
+
+		const confirm = await vscode.window.showWarningMessage(
+			`WordPress wants to move the dev folder here.\n\n` +
+				`${manifest.count} posts will be downloaded to:\n${newPath}\n\n` +
+				`The extension will switch to remote mode.`,
+			{ modal: true },
+			"Download & Switch",
+			"Cancel"
+		);
+
+		if (confirm !== "Download & Switch") {
+			await restClient.ackRelocate(false, "");
+			return;
+		}
+
+		const tempPoller = new ExportPoller(
+			restClient,
+			newPath,
+			statusBar,
+			debugLogger
+		);
+
+		const result = await vscode.window.withProgress(
+			{
+				location: vscode.ProgressLocation.Notification,
+				title: "Downloading posts from WordPress...",
+				cancellable: false,
+			},
+			async (progress) => {
+				progress.report({
+					message: `Downloading ${manifest.count} posts...`,
+				});
+				return tempPoller.performFullSync();
+			}
+		);
+
+		debugLogger.info(`📦 Downloaded ${result.synced} posts to ${newPath}`);
+
+		// Save settings for remote mode
+		const currentSiteUrl = restClient.getSiteUrl();
+		const vscodeConfig = vscode.workspace.getConfiguration("skylit");
+		await vscodeConfig.update(
+			"localDevPath",
+			newPath,
+			vscode.ConfigurationTarget.Workspace
+		);
+		if (!vscodeConfig.get<string>("siteUrl", "")) {
+			await vscodeConfig.update(
+				"siteUrl",
+				currentSiteUrl,
+				vscode.ConfigurationTarget.Workspace
+			);
+		}
+
+		// Switch to remote mode
+		isRemoteMode = true;
+		currentDevPath = newPath;
+
+		// Restart file watcher on new path
+		if (fileWatcher) {
+			fileWatcher.dispose();
+		}
+		fileWatcher = new FileWatcher(
+			newPath,
+			restClient,
+			statusBar,
+			debugLogger,
+			newPath,
+			isRemoteMode
+		);
+		await fileWatcher.start();
+
+		// Start export poller
+		if (exportPoller) {
+			exportPoller.dispose();
+		}
+		exportPoller = new ExportPoller(
+			restClient,
+			newPath,
+			statusBar,
+			debugLogger
+		);
+		exportPoller.start();
+
+		// Restart post type converter
+		if (postTypeConverter) {
+			postTypeConverter.dispose();
+		}
+		postTypeConverter = new PostTypeConverter(restClient, newPath, debugLogger);
+		postTypeConverter.startWatching();
+
+		statusBar.updateStatus("connected", "Remote");
+
+		// Acknowledge success back to the plugin
+		await restClient.ackRelocate(true, newPath);
+
+		if (result.errors > 0) {
+			vscode.window.showWarningMessage(
+				`Relocated with ${result.synced} posts downloaded (${result.errors} errors). Check Output panel.`
+			);
+		} else {
+			vscode.window.showInformationMessage(
+				`Dev folder relocated to ${newPath}. ${result.synced} posts downloaded. Now running in remote mode.`
+			);
+		}
+	} catch (error: any) {
+		debugLogger.log(`❌ Plugin-initiated relocation failed: ${error.message}`);
+		await restClient.ackRelocate(false, "");
+		vscode.window.showErrorMessage(`Relocation failed: ${error.message}`);
 	}
 }
