@@ -41,9 +41,7 @@ function pathToUri(filePath: string): vscode.Uri {
 			// Check if the path starts with the workspace path
 			if (normalizedPath.startsWith(wsPath)) {
 				// Path is within workspace, use joinPath for proper URI
-				const relativePath = normalizedPath.substring(
-					wsPath.length
-				);
+				const relativePath = normalizedPath.substring(wsPath.length);
 				return vscode.Uri.joinPath(wsUri, relativePath);
 			}
 
@@ -186,10 +184,7 @@ class FoldingStateManager {
 		if (!editor) {
 			// Try to open the file
 			try {
-				const doc =
-					await vscode.workspace.openTextDocument(
-						uri
-					);
+				const doc = await vscode.workspace.openTextDocument(uri);
 				await vscode.window.showTextDocument(doc);
 			} catch {
 				return;
@@ -210,15 +205,10 @@ class FoldingStateManager {
 
 		for (const foldLine of savedFolds) {
 			// Check if this fold line is within an unchanged block
-			const isInUnchangedBlock = unchangedBlocks.some(
-				(block) => {
-					// Fold line should be within the block's range
-					return (
-						foldLine >= block.startLine &&
-						foldLine <= block.endLine
-					);
-				}
-			);
+			const isInUnchangedBlock = unchangedBlocks.some((block) => {
+				// Fold line should be within the block's range
+				return foldLine >= block.startLine && foldLine <= block.endLine;
+			});
 
 			if (isInUnchangedBlock) {
 				foldsToRestore.push(foldLine);
@@ -238,16 +228,10 @@ class FoldingStateManager {
 			try {
 				// Move cursor to the line and fold
 				const position = new vscode.Position(line, 0);
-				activeEditor.selection = new vscode.Selection(
-					position,
-					position
-				);
-				await vscode.commands.executeCommand(
-					"editor.fold",
-					{
-						selectionLines: [line],
-					}
-				);
+				activeEditor.selection = new vscode.Selection(position, position);
+				await vscode.commands.executeCommand("editor.fold", {
+					selectionLines: [line],
+				});
 			} catch (e) {
 				// Fold might fail if line doesn't have foldable content
 			}
@@ -277,14 +261,21 @@ export class FileWatcher {
 	private debounceTimers: Map<string, NodeJS.Timeout> = new Map();
 	private folderActionTimers: Map<string, NodeJS.Timeout> = new Map();
 	private newFolderTimers: Map<string, NodeJS.Timeout> = new Map(); // Debounce new folder detection
+	private acfJsonBatchTimer: NodeJS.Timeout | null = null; // Shared debounce for ACF JSON batch writes
+	private taxonomyJsonBatchTimer: NodeJS.Timeout | null = null; // Shared debounce for taxonomy JSON batch writes
+	private acfJsonBatchDebounceMs: number = 2000; // Wait 2s after last ACF file change before syncing
+	// ── import-instant serialization queue ──────────────────────────────────
+	// Shared hosting (Hostinger etc.) 500s when multiple PHP requests run in
+	// parallel. All import-instant calls are funnelled through this queue so
+	// only one is in-flight at a time, with a gap between each request so
+	// the PHP-FPM worker has time to release memory before the next one lands.
+	private importQueue: Array<() => Promise<void>> = [];
+	private importQueueRunning: boolean = false;
+	private importQueueIntervalMs: number = 1500; // Gap between sequential import-instant calls
 	private lastSyncTime: Map<string, number> = new Map();
 	private lastFolderActionTime: Map<number, number> = new Map();
 	private lastThemeSyncTime: Map<string, number> = new Map(); // Track theme file syncs
 	private processedNewFolders: Set<string> = new Set(); // Track folders we've already processed
-	private recentlyRenamedFolders: Map<
-		string,
-		{ newFolder: string; postId: number; timestamp: number }
-	> = new Map(); // Track old→new renames to prevent duplicates
 	private pendingRenames: Map<
 		number,
 		{ oldPath: string; oldSlug: string; timestamp: number }
@@ -297,34 +288,74 @@ export class FileWatcher {
 	private skipDeletePromptForPosts: Set<number> = new Set(); // Track posts being deleted via command to skip FileWatcher prompt
 	private metadataCache: Map<
 		number,
-		{ slug: string; title: string; status: string }
-	> = new Map(); // Cache metadata for change detection
+		{
+			slug: string;
+			title: string;
+			status: string;
+			syncHash?: string;
+			lastSyncTime?: string;
+			lastSyncDirection?: string;
+		}
+	> = new Map();
 	private metadataSyncCooldown: Map<number, number> = new Map(); // Cooldown for metadata syncs
 	private devFolder: string;
 	private themePath: string | null = null; // Theme folder path (fetched from WordPress)
 	private restClient: RestClient;
 	private statusBar: StatusBar;
 	private debugLogger: DebugLogger;
-	private debounceMs: number = 500;
+	private debounceMs: number = 800;
 	private folderActionDebounceMs: number = 1000; // Debounce folder actions
 	private folderActionCooldownMs: number = 5000; // Don't re-process same post within 5 seconds
-	private syncCooldownMs: number = 3000; // Don't re-sync same file within 3 seconds
+	private syncCooldownMs: number = 1500; // Don't re-sync same file within 1.5 seconds
 	private themeSyncCooldownMs: number = 3000; // Cooldown for theme → dev sync
+	private acfSyncCooldownMs: number = 10000; // Cooldown after ACF batch sync (ACF save hooks can fire for several seconds)
 	private newFolderDebounceMs: number = 2000; // Wait for HTML file to be created
+	/** Paths we wrote during startup sync — skip syncing these back to WP to avoid redundant import-instant */
+	private pathsWrittenDuringStartup: Set<string> = new Set();
+	/** True while syncOnConnection is running — ignore content file watcher events to avoid duplicate "Content file changed" cycles */
+	private startupSyncInProgress: boolean = false;
 	private renameCooldownMs: number = 2000; // Time window to match unlink+add as rename
+	private pathToPostIdIndex: Map<string, number> = new Map(); // Reverse index: relative folder path -> post ID
 	private foldingManager: FoldingStateManager; // Manages folding state for unchanged blocks
 	private cursorSelectionListener: vscode.Disposable | null = null; // Cursor tracking for GT sync
 	private cursorDebounceTimer: NodeJS.Timeout | null = null; // Debounce cursor position updates
 	private lastCursorBlockId: string | null = null; // Avoid writing same block repeatedly
 	private cursorTrackingEnabled: boolean = true; // Can be disabled via settings
+	private jumpCooldownUntil: number = 0; // Suppress cursor tracking after a GT→IDE jump
+	/** Paths the extension itself wrote (canonical HTML writeback, startup sync, etc.)
+	 *  Value = timestamp. syncFile checks this to skip only our own writes. */
+	private selfWrittenPaths: Map<string, number> = new Map();
+	private liveBlockLines: Map<number, Array<{ layoutBlockId: string; line: number; blockName: string }>> = new Map();
+	private lineTrackingListener: vscode.Disposable | null = null; // Real-time line shift listener
+	private localDevFolder: string; // Local (IDE-resolved) dev folder path for VS Code watchers
+	private vscodeThemeWatcher: vscode.FileSystemWatcher | null = null; // VS Code native watcher for theme file sync
+	private remoteMode: boolean = false; // When true, push files to server instead of telling plugin to copy
+	private assetSourceModes: { js: "theme" | "database"; css: "theme" | "database"; php: "theme" | "database" } = { js: "theme", css: "theme", php: "theme" };
+	public pendingMetadataRepairs: Array<{ entry: any; activeHtml: string; activePath: string }> = [];
+
+	// ---- Media Library Sync ----
+	/** In-memory index of .skylit/media/*.json — keyed by local_path */
+	private mediaMetaIndex: Map<string, import("./types").MediaMetadata> = new Map();
+	/** Pending deletes waiting for a matching add (rename detection). hash → { attachmentId, timer } */
+	private pendingMediaDeletes: Map<string, { attachmentId: number; timer: NodeJS.Timeout }> = new Map();
+	/** Cached media sync direction from WP settings */
+	private mediaSyncDirection: import("./types").MediaSyncDirection = "bidirectional";
+	/** Whether media sync is enabled (fetched from WP on connect) */
+	private mediaSyncEnabled: boolean = false;
+	/** VS Code native watcher for media-library/ — SSH-compatible */
+	private vscodeMediaWatcher: vscode.FileSystemWatcher | null = null;
 
 	constructor(
 		devFolder: string,
 		restClient: RestClient,
 		statusBar: StatusBar,
-		debugLogger: DebugLogger
+		debugLogger: DebugLogger,
+		localDevFolder?: string,
+		remoteMode?: boolean
 	) {
 		this.devFolder = devFolder;
+		this.localDevFolder = localDevFolder || devFolder;
+		this.remoteMode = remoteMode || false;
 		this.restClient = restClient;
 		this.statusBar = statusBar;
 		this.debugLogger = debugLogger;
@@ -333,19 +364,31 @@ export class FileWatcher {
 		// Get debounce setting
 		const config = vscode.workspace.getConfiguration("skylit");
 		this.debounceMs = config.get<number>("debounceMs", 500);
-		this.cursorTrackingEnabled = config.get<boolean>(
-			"cursorTracking",
-			true
-		);
+		this.cursorTrackingEnabled = config.get<boolean>("cursorTracking", true);
+	}
+
+	private aiSkillsetGenerator: import("./aiSkillsetGenerator").AiSkillsetGenerator | null = null;
+
+	/**
+	 * Set the AI Skillset Generator so we can trigger regeneration after ACF JSON changes
+	 */
+	setAiSkillsetGenerator(generator: import("./aiSkillsetGenerator").AiSkillsetGenerator) {
+		this.aiSkillsetGenerator = generator;
+	}
+
+	/**
+	 * Update the cached asset source modes (js/css/php: 'theme' | 'database').
+	 * Called after connection so notifications can say the right thing.
+	 */
+	setAssetSourceModes(modes: Partial<{ js: "theme" | "database"; css: "theme" | "database"; php: "theme" | "database" }>) {
+		this.assetSourceModes = { ...this.assetSourceModes, ...modes };
 	}
 
 	/**
 	 * Start watching files
 	 */
 	async start() {
-		this.debugLogger.log(
-			`👀 Starting file watcher for: ${this.devFolder}`
-		);
+		this.debugLogger.info(`👀 Starting file watcher for: ${this.devFolder}`);
 
 		// Main watcher for ALL file content changes (dynamic - watches everything except excluded)
 		this.watcher = chokidar.watch(`${this.devFolder}`, {
@@ -355,7 +398,10 @@ export class FileWatcher {
 				"**/.git/**",
 				"**/.vscode/**",
 				"**/.cursor/**",
-				"**/post-types/**", // Handled separately by Gutenberg sync
+				"**/post-types/**", // All content folders handled by VS Code native watcher
+				"**/templates/**",
+				"**/parts/**",
+				"**/patterns/**",
 			],
 			ignoreInitial: true,
 			persistent: true,
@@ -366,96 +412,133 @@ export class FileWatcher {
 			},
 		});
 
-		// Listen for file changes
-		this.watcher.on("change", (filePath) => {
-			this.debugLogger.log(`📝 File changed: ${filePath}`);
+		// Handler for both file changes and new file additions
+		const handleFileEvent = (filePath: string, eventType: string) => {
+			this.debugLogger.info(`📝 File ${eventType}: ${filePath}`);
 
 			// Normalize path for cross-platform
 			const normalizedPath = filePath.replace(/\\/g, "/");
-			const devFolderNormalized = this.devFolder.replace(
-				/\\/g,
-				"/"
-			);
+			const devFolderNormalized = this.devFolder.replace(/\\/g, "/");
 
-			// Skip if this is in post-types folder (handled by Gutenberg sync)
-			if (normalizedPath.includes("/post-types/")) {
-				this.handleFileChange(filePath);
+			// Media library files — route to media sync handler
+			if (normalizedPath.includes("/media-library/")) {
+				const chokidarEvent =
+					eventType === "changed" ? "change" :
+					eventType === "added" ? "add" : "unlink";
+				this.handleMediaFileChange(filePath, chokidarEvent);
 				return;
 			}
 
-			// Everything else is a theme file - sync to theme folder
-			// This includes: style.css, functions.php, theme.json, templates/, parts/,
-			// patterns/, assets/, includes/, and any custom folders
+			// Content folders are handled by VS Code native watcher (SSH-compatible)
+			// If chokidar somehow fires for them, route correctly
+			const isContentFolder =
+				normalizedPath.includes("/post-types/") ||
+				normalizedPath.includes("/templates/") ||
+				normalizedPath.includes("/parts/") ||
+				normalizedPath.includes("/patterns/");
+			if (isContentFolder) {
+				if (eventType === "changed") {
+					this.handleFileChange(filePath);
+				}
+				return;
+			}
+
+			// Everything else is a theme/global file - sync to theme folder
+			// This includes: style.css, functions.php, theme.json,
+			// patterns/, assets/, includes/, acf-json/, and any custom folders
 			this.handleThemeFileChange(filePath);
+		};
+
+		// Listen for file changes (edits to existing files)
+		this.watcher.on("change", (filePath) => {
+			handleFileEvent(filePath, "changed");
+		});
+
+		// Listen for new files (created/pasted/moved into watched folders)
+		this.watcher.on("add", (filePath) => {
+			handleFileEvent(filePath, "added");
 		});
 
 		this.watcher.on("error", (error) => {
-			this.debugLogger.log(
-				`❌ File watcher error: ${error.message}`
-			);
+			this.debugLogger.log(`❌ File watcher error: ${error.message}`);
 		});
 
-		// Use VS Code's native FileSystemWatcher for trash operations
-		// This properly handles SSH remotes through VS Code's virtual filesystem
+		// ── VS Code native FileSystemWatcher for theme files ──
+		// Skip all VS Code native watchers when the dev path is a local Windows
+		// path but the workspace is a remote SSH session — the server can't
+		// access the local filesystem.
+		const devNormalized = this.devFolder.replace(/\\/g, "/");
+		const isLocalPathOnRemote =
+			/^[A-Za-z]:\//.test(devNormalized) &&
+			vscode.workspace.workspaceFolders?.[0]?.uri.scheme !== "file";
+
+		if (isLocalPathOnRemote) {
+			this.debugLogger.info(
+				`⏭️ Skipping VS Code native watchers — dev path is on local machine, extension runs on remote server.`
+			);
+			this.debugLogger.info(
+				`ℹ️ To enable live file watching, open a local Cursor window with this dev folder and connect to the remote WordPress site.`
+			);
+			return;
+		}
+
+		this.setupVscodeThemeWatcher();
+
 		const postTypesPath = posixJoin(this.devFolder, "post-types");
 
 		this.debugLogger.log(
 			`🔍 [Trash Watcher] Setting up VS Code native watcher for: ${postTypesPath}`
 		);
 
-		// Create a glob pattern that matches files in post-types folders
-		// VS Code watcher works with Uri patterns
 		const trashPattern = new vscode.RelativePattern(
-			vscode.Uri.file(postTypesPath),
-			"**/*" // Watch all files and folders
+			pathToUri(postTypesPath),
+			"**/*"
 		);
 
-		this.vscodeTrashWatcher =
-			vscode.workspace.createFileSystemWatcher(
-				trashPattern,
-				false,
-				true,
-				false
-			);
+		this.vscodeTrashWatcher = vscode.workspace.createFileSystemWatcher(
+			trashPattern,
+			false,
+			true,
+			false
+		);
 
 		// Listen for files/folders being created (could be trash or restore)
 		this.vscodeTrashWatcher.onDidCreate((uri) => {
 			const filePath = uri.fsPath;
-			this.debugLogger.log(
-				`🔍 [VS Code Watcher] Created: ${filePath}`
-			);
+			this.debugLogger.log(`🔍 [VS Code Watcher] Created: ${filePath}`);
 
-			// Check if this is a directory by looking at the path pattern
-			// Folders with _ID suffix in post-types are what we care about
+			const norm = filePath.replace(/\\/g, "/");
+			const isContentArea =
+				norm.includes("/post-types/") ||
+				norm.includes("/templates/") ||
+				norm.includes("/parts/") ||
+				norm.includes("/patterns/");
+
 			if (
-				filePath.includes("_trash") ||
-				/_\d+$/.test(path.basename(filePath)) ||
-				/_\d+[\/\\]/.test(filePath)
+				isContentArea &&
+				(norm.includes("/_trash/") || /_\d+$/.test(path.basename(filePath)))
 			) {
-				this.handlePotentialTrashAction(
-					filePath,
-					"add"
-				);
+				this.handlePotentialTrashAction(filePath, "add");
 			}
 		});
 
 		// Listen for files/folders being deleted (could be trash or restore)
 		this.vscodeTrashWatcher.onDidDelete((uri) => {
 			const filePath = uri.fsPath;
-			this.debugLogger.log(
-				`🔍 [VS Code Watcher] Deleted: ${filePath}`
-			);
+			this.debugLogger.log(`🔍 [VS Code Watcher] Deleted: ${filePath}`);
 
-			// Check if this is a post folder being removed from _trash (restore)
+			const norm = filePath.replace(/\\/g, "/");
+			const isContentArea =
+				norm.includes("/post-types/") ||
+				norm.includes("/templates/") ||
+				norm.includes("/parts/") ||
+				norm.includes("/patterns/");
+
 			if (
-				filePath.includes("_trash") ||
-				/_\d+$/.test(path.basename(filePath)) ||
-				/_\d+[\/\\]/.test(filePath)
+				isContentArea &&
+				(norm.includes("/_trash/") || /_\d+$/.test(path.basename(filePath)))
 			) {
-				this.handlePotentialTrashAction(
-					filePath,
-					"unlink"
-				);
+				this.handlePotentialTrashAction(filePath, "unlink");
 			}
 		});
 
@@ -472,17 +555,552 @@ export class FileWatcher {
 		// Start metadata watcher for JSON → WordPress sync
 		await this.startMetadataWatcher();
 
+		// Media library watcher is started by refreshMediaSyncSettings() after
+		// fetching the sync-enabled flag from WP — not here.
+
 		// Start cursor tracking for Gutenberg block selection sync
 		this.startCursorTracking();
+
+		// Bidirectional startup sync runs in the background — doesn't block the editor
+		this.runBackgroundSync();
 	}
 
 	/**
-	 * Start watching for new folders in post-types directory
-	 * When a new folder is created without _ID suffix, create a WordPress post
+	 * Run the startup sync in the background without blocking the editor.
+	 * Shows a subtle status indicator while syncing.
+	 */
+	private runBackgroundSync() {
+		this.statusBar.showBackgroundSync("Syncing files and folders...");
+		this.syncOnConnection()
+			.then(() => {
+				this.statusBar.clearBackgroundSync();
+			})
+			.catch((err) => {
+				this.debugLogger.log(`⚠️ Background sync error: ${err.message}`);
+				this.statusBar.clearBackgroundSync();
+			});
+	}
+
+	/**
+	 * Full bidirectional reconciliation on connection.
+	 * Guarantees WP and dev folder are perfectly in sync:
+	 *   - Active WP posts have folders in the correct content directory
+	 *   - Trashed WP posts have folders in _trash/
+	 *   - Dev folders without WP posts get posts created (handled by scanForNewFolders)
+	 *   - Stray dev folders (no matching WP post at all) are flagged
+	 */
+	private async syncOnConnection() {
+		const profileEnd = this.debugLogger.profileStart("syncOnConnection");
+		this.startupSyncInProgress = true;
+		try {
+			this.pathsWrittenDuringStartup.clear();
+			this.debugLogger.info("🔄 Startup sync: full WP ↔ Dev reconciliation...");
+
+			const manifest = await this.restClient.getExportAll();
+			if (!manifest || !manifest.posts) {
+				this.debugLogger.log("   ℹ️ No posts returned from WordPress");
+				return;
+			}
+
+			this.debugLogger.log(`   📋 WP manifest: ${manifest.count} posts`);
+
+			const stats = {
+				exported: 0,
+				movedToTrash: 0,
+				restoredFromTrash: 0,
+				alreadySynced: 0,
+				cleanedTrash: 0,
+				metadataRepaired: 0,
+			};
+
+			// Build a set of WP-managed slugs for stray detection later
+			const wpSlugs = new Set<string>();
+			const pendingRepairs: Array<{
+				entry: any;
+				activeHtml: string;
+				activePath: string;
+			}> = [];
+
+			for (const entry of manifest.posts) {
+				wpSlugs.add(`${entry.type_folder}/${entry.folder_name}`);
+
+				const activePath = posixJoin(
+					this.devFolder,
+					entry.type_folder,
+					entry.folder_name
+				);
+				const activeHtml = posixJoin(activePath, `${entry.folder_name}.html`);
+				const trashPath = posixJoin(
+					this.devFolder,
+					entry.type_folder,
+					"_trash",
+					entry.folder_name
+				);
+				const trashHtml = posixJoin(trashPath, `${entry.folder_name}.html`);
+
+				const existsActive = await vsExists(activeHtml);
+				const existsTrash = await vsExists(trashHtml);
+				const isTrashed = entry.post_status === "trash";
+
+				if (isTrashed) {
+					// WP post is trashed — folder should be in _trash/
+					if (existsTrash) {
+						stats.alreadySynced++;
+						continue;
+					}
+					if (existsActive) {
+						// Move from active to _trash
+						try {
+							const trashDir = posixJoin(
+								this.devFolder,
+								entry.type_folder,
+								"_trash"
+							);
+							try {
+								await vscode.workspace.fs.createDirectory(pathToUri(trashDir));
+							} catch {}
+							await vscode.workspace.fs.rename(
+								pathToUri(activePath),
+								pathToUri(trashPath),
+								{ overwrite: false }
+							);
+							stats.movedToTrash++;
+							this.debugLogger.log(
+								`   🗑️ Moved to _trash: ${entry.type_folder}/${entry.folder_name}`
+							);
+						} catch (err: any) {
+							this.debugLogger.log(
+								`   ⚠️ Failed to move to trash: ${err.message}`
+							);
+						}
+						continue;
+					}
+					// Trashed and no folder anywhere — nothing to do
+					stats.alreadySynced++;
+					continue;
+				}
+
+				// WP post is active — folder should be in the content directory (NOT _trash)
+				if (existsActive) {
+					let needsReExport = false;
+
+					try {
+						const localHtml = await vsReadFile(activeHtml);
+
+						// If missing metadata header, sync local→WP to get the header added
+						// (import-instant returns canonical HTML with the header)
+						if (!localHtml.startsWith("<!--\nWordPress Sync Metadata")) {
+							const localStripped = localHtml
+								.replace(/<!--[\s\S]*?-->/g, "")
+								.trim();
+							if (localStripped.length > 50) {
+								this.debugLogger.log(
+									`   📝 Adding metadata header via sync: ${entry.type_folder}/${entry.folder_name}`
+								);
+								const cssPath = posixJoin(
+									activePath,
+									`${entry.folder_name}.css`
+								);
+								let localCss = "";
+								try {
+									localCss = await vsReadFile(cssPath);
+								} catch {}
+							try {
+								await new Promise<void>((resolve) => {
+									this.enqueueImport(async () => {
+										try {
+											const resp = await this.restClient.syncFile(
+												entry.post_id,
+												localHtml,
+												localCss
+											);
+											const canonical = (resp as any).canonical_html;
+											if (canonical && typeof canonical === "string") {
+												this.lastSyncTime.set(activeHtml, Date.now());
+												this.pathsWrittenDuringStartup.add(activeHtml.replace(/\\/g, "/"));
+												await vsWriteFile(activeHtml, canonical);
+											}
+										} catch (syncErr: any) {
+											this.debugLogger.log(
+												`   ⚠️ Failed to sync for header: ${syncErr.message}`
+											);
+										}
+										resolve();
+									});
+								});
+							} catch (syncErr: any) {
+								this.debugLogger.log(
+									`   ⚠️ Failed to sync for header: ${syncErr.message}`
+								);
+							}
+								stats.exported++;
+								continue;
+							}
+							needsReExport = true;
+						}
+
+						// Check for content drift using syncHash (only when WP has a stored hash)
+						if (
+							!needsReExport &&
+							entry.sync_hash &&
+							entry.sync_hash.length > 0
+						) {
+							const crypto = await import("crypto");
+							const localHash = crypto
+								.createHash("md5")
+								.update(localHtml)
+								.digest("hex");
+							if (localHash !== entry.sync_hash) {
+								needsReExport = true;
+							}
+						}
+					} catch {}
+
+					if (needsReExport) {
+						try {
+							const payload = await this.restClient.getExportContent(
+								entry.post_id
+							);
+							// Guard: don't overwrite a non-empty local file with empty WP content.
+							// WP may have default empty paragraph for patterns that were never opened in GT.
+							const wpHtml = payload.html || "";
+							const stripped = wpHtml
+								.replace(/<!--[\s\S]*?-->/g, "")
+								.replace(/<p[^>]*>\s*<\/p>/gi, "")
+								.trim();
+							if (stripped.length < 20) {
+								// WP content is essentially empty — import local file to WP instead
+								const localContent = await vsReadFile(activeHtml);
+								const localStripped = localContent
+									.replace(/<!--[\s\S]*?-->/g, "")
+									.trim();
+								if (localStripped.length > 50) {
+									this.debugLogger.log(
+										`   ⬆️ WP empty, importing local to WP: ${entry.type_folder}/${entry.folder_name}`
+									);
+									const cssPath = posixJoin(
+										activePath,
+										`${entry.folder_name}.css`
+									);
+									let localCss = "";
+									try {
+										localCss = await vsReadFile(cssPath);
+									} catch {}
+								try {
+									await new Promise<void>((resolve) => {
+										this.enqueueImport(async () => {
+											try {
+												await this.restClient.syncFile(
+													entry.post_id,
+													localContent,
+													localCss
+												);
+											} catch (syncErr: any) {
+												this.debugLogger.log(
+													`   ⚠️ Failed to push local to WP: ${syncErr.message}`
+												);
+											}
+											resolve();
+										});
+									});
+								} catch (syncErr: any) {
+									this.debugLogger.log(
+										`   ⚠️ Failed to push local to WP: ${syncErr.message}`
+									);
+								}
+									stats.exported++;
+									continue;
+								}
+							}
+							if (payload.html) {
+								this.lastSyncTime.set(activeHtml, Date.now());
+								this.pathsWrittenDuringStartup.add(activeHtml.replace(/\\/g, "/"));
+								await vsWriteFile(activeHtml, payload.html);
+							}
+							if (payload.css) {
+								const cssPath = posixJoin(
+									activePath,
+									`${entry.folder_name}.css`
+								);
+								this.lastSyncTime.set(cssPath, Date.now());
+								this.pathsWrittenDuringStartup.add(cssPath.replace(/\\/g, "/"));
+								await vsWriteFile(cssPath, payload.css);
+							}
+							stats.exported++;
+							this.debugLogger.log(
+								`   🔄 Re-synced: ${entry.type_folder}/${entry.folder_name}`
+							);
+							continue;
+						} catch {}
+					}
+
+					// Collect posts needing metadata repair (blocks[] empty) — batched later
+					if ((entry as any).blocks_count === 0 && !needsReExport) {
+						pendingRepairs.push({ entry, activeHtml, activePath });
+					}
+
+					stats.alreadySynced++;
+					continue;
+				}
+
+				if (existsTrash) {
+					// Restore from _trash to active location
+					try {
+						await vscode.workspace.fs.rename(
+							pathToUri(trashPath),
+							pathToUri(activePath),
+							{ overwrite: false }
+						);
+						stats.restoredFromTrash++;
+						this.debugLogger.log(
+							`   ♻️ Restored from _trash: ${entry.type_folder}/${entry.folder_name}`
+						);
+					} catch (err: any) {
+						this.debugLogger.log(
+							`   ⚠️ Failed to restore from trash: ${err.message}`
+						);
+					}
+					continue;
+				}
+
+				// Missing entirely — export from WP
+				try {
+					const payload = await this.restClient.getExportContent(entry.post_id);
+					try {
+						await vscode.workspace.fs.createDirectory(pathToUri(activePath));
+					} catch {}
+					if (payload.html) {
+						this.pathsWrittenDuringStartup.add(activeHtml.replace(/\\/g, "/"));
+						await vsWriteFile(activeHtml, payload.html);
+					}
+					if (payload.css) {
+						const cssPath = posixJoin(activePath, `${entry.folder_name}.css`);
+						this.pathsWrittenDuringStartup.add(cssPath.replace(/\\/g, "/"));
+						await vsWriteFile(cssPath, payload.css);
+					}
+					stats.exported++;
+					this.debugLogger.log(
+						`   📥 Exported: ${entry.type_folder}/${entry.folder_name} (ID: ${entry.post_id})`
+					);
+				} catch (err: any) {
+					this.debugLogger.log(
+						`   ⚠️ Failed to export ${entry.folder_name}: ${err.message}`
+					);
+				}
+			}
+
+			stats.cleanedTrash = await this.cleanupTrashFolders(wpSlugs);
+
+			// Metadata repair: only log a notice during startup sync (opt-in via command)
+			if (pendingRepairs.length > 0) {
+				this.debugLogger.info(
+					`   ℹ️ ${pendingRepairs.length} posts have empty blocks metadata. Run "Skylit: Repair Metadata" to fix them.`
+				);
+				this.pendingMetadataRepairs = pendingRepairs;
+			} else {
+				this.pendingMetadataRepairs = [];
+			}
+
+			const summary = [
+				stats.alreadySynced > 0 ? `${stats.alreadySynced} in sync` : "",
+				stats.exported > 0 ? `${stats.exported} exported to dev` : "",
+				stats.metadataRepaired > 0
+					? `${stats.metadataRepaired} metadata repaired`
+					: "",
+				stats.movedToTrash > 0 ? `${stats.movedToTrash} moved to _trash` : "",
+				stats.restoredFromTrash > 0
+					? `${stats.restoredFromTrash} restored from _trash`
+					: "",
+				stats.cleanedTrash > 0
+					? `${stats.cleanedTrash} removed from _trash (permanently deleted)`
+					: "",
+			]
+				.filter(Boolean)
+				.join(", ");
+
+			this.debugLogger.info(`✅ Startup sync complete: ${summary}`);
+			// Stop ignoring file changes we caused after 20s (avoid syncing them back to WP)
+			setTimeout(() => this.pathsWrittenDuringStartup.clear(), 20000);
+		} catch (error: any) {
+			this.debugLogger.log(`⚠️ Startup sync failed: ${error.message}`);
+			this.pathsWrittenDuringStartup.clear();
+		} finally {
+			this.startupSyncInProgress = false;
+			profileEnd();
+		}
+	}
+
+	/**
+	 * Remove folders from _trash/ that belong to permanently deleted WP posts.
+	 * wpSlugs contains all type_folder/slug combos that still exist in WP (including trashed).
+	 * Any _trash folder whose slug is NOT in the WP manifest was permanently deleted.
+	 */
+	private async cleanupTrashFolders(wpSlugs: Set<string>): Promise<number> {
+		let cleaned = 0;
+		const trashRoots = [
+			{
+				root: posixJoin(this.devFolder, "post-types"),
+				label: "post-types",
+				nested: true,
+			},
+			{
+				root: posixJoin(this.devFolder, "templates"),
+				label: "templates",
+				nested: false,
+			},
+			{
+				root: posixJoin(this.devFolder, "parts"),
+				label: "parts",
+				nested: false,
+			},
+			{
+				root: posixJoin(this.devFolder, "patterns", "synced"),
+				label: "patterns/synced",
+				nested: false,
+			},
+			{
+				root: posixJoin(this.devFolder, "patterns", "unsynced"),
+				label: "patterns/unsynced",
+				nested: false,
+			},
+		];
+
+		for (const { root, label, nested } of trashRoots) {
+			try {
+				if (nested) {
+					if (!(await vsExists(root))) continue;
+					const typeDirs = await vsReadDir(root);
+					for (const [typeName, tType] of typeDirs) {
+						if (tType !== vscode.FileType.Directory) continue;
+						const trashDir = posixJoin(root, typeName, "_trash");
+						cleaned += await this.cleanSingleTrashDir(
+							trashDir,
+							`post-types/${typeName}`,
+							wpSlugs
+						);
+					}
+				} else {
+					const trashDir = posixJoin(root, "_trash");
+					cleaned += await this.cleanSingleTrashDir(trashDir, label, wpSlugs);
+				}
+			} catch {
+				/* root doesn't exist */
+			}
+		}
+		return cleaned;
+	}
+
+	private async cleanSingleTrashDir(
+		trashDir: string,
+		typeFolder: string,
+		wpSlugs: Set<string>
+	): Promise<number> {
+		let cleaned = 0;
+		try {
+			if (!(await vsExists(trashDir))) return 0;
+			const entries = await vsReadDir(trashDir);
+			for (const [slug, fType] of entries) {
+				if (fType !== vscode.FileType.Directory || slug.startsWith("."))
+					continue;
+				const key = `${typeFolder}/${slug}`;
+				if (!wpSlugs.has(key)) {
+					try {
+						await vscode.workspace.fs.delete(
+							pathToUri(posixJoin(trashDir, slug)),
+							{ recursive: true }
+						);
+						cleaned++;
+						this.debugLogger.log(
+							`   🧹 Cleaned from _trash: ${key} (permanently deleted in WP)`
+						);
+					} catch (err: any) {
+						this.debugLogger.log(
+							`   ⚠️ Failed to clean ${key}: ${err.message}`
+						);
+					}
+				}
+			}
+		} catch {
+			/* trash dir doesn't exist or not readable */
+		}
+		return cleaned;
+	}
+
+	/**
+	 * Manually repair metadata for posts with empty blocks.
+	 * Fetches export content from WP in batches with pauses to avoid overloading PHP.
+	 */
+	async repairMetadata(): Promise<{ repaired: number; failed: number }> {
+		const repairs = this.pendingMetadataRepairs;
+		if (repairs.length === 0) {
+			this.debugLogger.info("ℹ️ No pending metadata repairs.");
+			return { repaired: 0, failed: 0 };
+		}
+
+		this.debugLogger.info(
+			`🔧 Repairing metadata for ${repairs.length} posts (batches of 3)...`
+		);
+
+		let repaired = 0;
+		let failed = 0;
+		const BATCH_SIZE = 3;
+
+		for (let i = 0; i < repairs.length; i += BATCH_SIZE) {
+			const batch = repairs.slice(i, i + BATCH_SIZE);
+			for (const { entry, activeHtml, activePath } of batch) {
+				try {
+					const payload = await this.restClient.getExportContent(
+						entry.post_id
+					);
+					if (payload.html) {
+						this.lastSyncTime.set(activeHtml, Date.now());
+						this.pathsWrittenDuringStartup.add(activeHtml.replace(/\\/g, "/"));
+						await vsWriteFile(activeHtml, payload.html);
+					}
+					if (payload.css) {
+						const cssPath = posixJoin(
+							activePath,
+							`${entry.folder_name}.css`
+						);
+						this.lastSyncTime.set(cssPath, Date.now());
+						this.pathsWrittenDuringStartup.add(cssPath.replace(/\\/g, "/"));
+						await vsWriteFile(cssPath, payload.css);
+					}
+					repaired++;
+					this.debugLogger.log(
+						`   🔧 Repaired: ${entry.type_folder}/${entry.folder_name}`
+					);
+				} catch (err: any) {
+					failed++;
+					this.debugLogger.log(
+						`   ⚠️ Repair failed: ${entry.folder_name}: ${err.message}`
+					);
+				}
+			}
+			if (i + BATCH_SIZE < repairs.length) {
+				this.debugLogger.log(
+					`   ⏳ Batch ${Math.floor(i / BATCH_SIZE) + 1} done, pausing 5s...`
+				);
+				await new Promise((r) => setTimeout(r, 5000));
+			}
+		}
+
+		this.pendingMetadataRepairs = [];
+		setTimeout(() => this.pathsWrittenDuringStartup.clear(), 20000);
+
+		this.debugLogger.info(
+			`✅ Metadata repair complete: ${repaired} repaired, ${failed} failed`
+		);
+		return { repaired, failed };
+	}
+
+	/**
+	 * Start watching for new folders in content directories
+	 * When a new folder is created without a linked WP post, create one
 	 * Uses VS Code's native FileSystemWatcher for SSH compatibility
 	 */
 	private async startNewFolderWatcher() {
-		// Watch post-types, templates, and parts folders
+		// Watch all content folders: post-types, templates, parts, and patterns
 		const foldersToWatch = [
 			{
 				path: posixJoin(this.devFolder, "post-types"),
@@ -495,6 +1113,10 @@ export class FileWatcher {
 			{
 				path: posixJoin(this.devFolder, "parts"),
 				label: "parts",
+			},
+			{
+				path: posixJoin(this.devFolder, "patterns"),
+				label: "patterns",
 			},
 		];
 
@@ -516,90 +1138,57 @@ export class FileWatcher {
 				);
 			}
 
-			// Create VS Code native FileSystemWatcher (works on SSH)
+			// Create VS Code native FileSystemWatcher — use pathToUri for SSH compatibility
 			const newFolderPattern = new vscode.RelativePattern(
-				vscode.Uri.file(folder.path),
-				"**/*" // Watch all files and folders
+				pathToUri(folder.path),
+				"**/*"
 			);
 
-			const watcher =
-				vscode.workspace.createFileSystemWatcher(
-					newFolderPattern,
-					false,
-					true,
-					false
-				);
+			const watcher = vscode.workspace.createFileSystemWatcher(
+				newFolderPattern,
+				false,
+				true,
+				false
+			);
 
 			// Listen for files/folders being created (new folder or HTML file added)
 			watcher.onDidCreate((uri) => {
 				const filePath = uri.fsPath.replace(/\\/g, "/");
 
 				// Skip trash folders
-				if (
-					filePath.includes("/_trash/") ||
-					filePath.includes("\\_trash\\")
-				) {
+				if (filePath.includes("/_trash/") || filePath.includes("\\_trash\\")) {
 					return;
 				}
 
 				// Check if this is an HTML file
 				if (filePath.endsWith(".html")) {
 					this.debugLogger.log(
-						`🔔 [VS Code Watcher] HTML file created: ${path.basename(
-							filePath
-						)}`
+						`🔔 [VS Code Watcher] HTML file created: ${path.basename(filePath)}`
 					);
-					const folderPath = path
-						.dirname(filePath)
-						.replace(/\\/g, "/");
-					const postId =
-						this.extractPostIdFromPath(
-							folderPath
-						);
+					const folderPath = path.dirname(filePath).replace(/\\/g, "/");
+					const postId = this.extractPostIdFromPath(folderPath);
 					// Rename: first event is often the file inside the renamed folder
-					if (
-						postId &&
-						this.pendingRenames.has(postId)
-					) {
-						this.handleRenameComplete(
-							folderPath,
-							postId
-						);
+					if (postId && this.pendingRenames.has(postId)) {
+						this.handleRenameComplete(folderPath, postId);
 					} else {
-						this.handlePotentialNewFolder(
-							folderPath
-						);
+						this.handlePotentialNewFolder(folderPath);
 					}
 					return;
 				}
 
 				// Check if this is a folder (has no extension or is a known folder pattern)
 				const baseName = path.basename(filePath);
-				if (
-					!baseName.includes(".") ||
-					/_\d+$/.test(baseName)
-				) {
+				if (!baseName.includes(".") || /_\d+$/.test(baseName)) {
 					this.debugLogger.log(
 						`🔔 [VS Code Watcher] Folder created: ${baseName}`
 					);
 
 					// Check if this is a rename completion (folder with _ID reappearing)
-					const postId =
-						this.extractPostIdFromPath(
-							filePath
-						);
-					if (
-						postId &&
-						this.pendingRenames.has(postId)
-					) {
-						this.handleRenameComplete(
-							filePath,
-							postId
-						);
+					const postId = this.extractPostIdFromPath(filePath);
+					if (postId && this.pendingRenames.has(postId)) {
+						this.handleRenameComplete(filePath, postId);
 					} else {
-						this.handlePotentialNewFolder(
-							filePath
-						);
+						this.handlePotentialNewFolder(filePath);
 					}
 				}
 			});
@@ -609,10 +1198,7 @@ export class FileWatcher {
 				const filePath = uri.fsPath.replace(/\\/g, "/");
 
 				// Skip trash folders
-				if (
-					filePath.includes("/_trash/") ||
-					filePath.includes("\\_trash\\")
-				) {
+				if (filePath.includes("/_trash/") || filePath.includes("\\_trash\\")) {
 					return;
 				}
 
@@ -622,9 +1208,7 @@ export class FileWatcher {
 					this.debugLogger.log(
 						`🔔 [VS Code Watcher] Folder deleted: ${baseName}`
 					);
-					this.handlePotentialRenameStart(
-						filePath
-					);
+					this.handlePotentialRenameStart(filePath);
 				}
 			});
 
@@ -640,15 +1224,138 @@ export class FileWatcher {
 	}
 
 	/**
+	 * Set up VS Code native FileSystemWatcher for theme files.
+	 *
+	 * This watcher uses the LOCAL dev folder (resolved by the IDE workspace manager)
+	 * so it works regardless of the server-side dev_path WordPress returns.
+	 * It watches for all file changes/creates outside post-types/ and triggers
+	 * the same handleThemeFileChange() flow (which routes acf-json/ to the
+	 * dedicated sync endpoint and everything else to the generic asset sync).
+	 */
+	private setupVscodeThemeWatcher() {
+		// Clean up previous watcher
+		if (this.vscodeThemeWatcher) {
+			this.vscodeThemeWatcher.dispose();
+			this.vscodeThemeWatcher = null;
+		}
+
+		const localFolder = this.localDevFolder.replace(/\\/g, "/");
+		this.debugLogger.info(
+			`👀 [Theme Watcher] Setting up VS Code native watcher for: ${localFolder}`
+		);
+
+		// In remote mode with a local dev path (e.g. C:/Users/...),
+		// we can't watch from the server. Skip the watcher gracefully.
+		const isLocalWindowsPath = /^[A-Za-z]:\//.test(localFolder);
+		const wf = vscode.workspace.workspaceFolders?.[0];
+		const isRemoteWorkspace = wf && wf.uri.scheme !== "file";
+
+		if (isLocalWindowsPath && isRemoteWorkspace) {
+			this.debugLogger.info(
+				`⏭️ [Theme Watcher] Skipping — local dev path (${localFolder}) is not accessible from the remote server. File pushing happens via REST API.`
+			);
+			return;
+		}
+
+		const baseUri =
+			wf && (wf.uri.scheme === "vscode-remote" || wf.uri.scheme === "file")
+				? wf.uri.with({ path: localFolder })
+				: vscode.Uri.file(localFolder);
+
+		// Watch all files inside the dev folder (e.g. .../sirc-dev-root/acf-json/**)
+		const pattern = new vscode.RelativePattern(baseUri, "**/*");
+
+		this.vscodeThemeWatcher = vscode.workspace.createFileSystemWatcher(
+			pattern,
+			false, // onDidCreate
+			false, // onDidChange
+			true // onDidDelete (ignore)
+		);
+
+		const handleVscodeEvent = (uri: vscode.Uri, eventType: string) => {
+			const filePath = uri.fsPath;
+			const normalizedPath = filePath.replace(/\\/g, "/");
+
+			// Skip dotfiles and build artifacts
+			const fileName = path.basename(normalizedPath);
+			if (fileName.startsWith(".")) {
+				return;
+			}
+			if (
+				normalizedPath.includes("/node_modules/") ||
+				normalizedPath.includes("/.git/") ||
+				normalizedPath.includes("/.vscode/") ||
+				normalizedPath.includes("/.cursor/") ||
+				normalizedPath.includes("/.skylit/")
+			) {
+				return;
+			}
+
+			// Skip directories (VS Code watcher fires for dirs too)
+			// We only want files - check by extension presence
+			const ext = path.extname(fileName);
+			if (!ext) {
+				return;
+			}
+
+			// Content files (HTML/CSS) in any content folder need to sync to WordPress
+			// Media library files — route to media sync handler
+			if (normalizedPath.includes("/media-library/")) {
+				const chokidarEvent =
+					eventType === "changed" ? "change" :
+					eventType === "created" ? "add" : "unlink";
+				this.handleMediaFileChange(filePath, chokidarEvent);
+				return;
+			}
+
+			const isContentFolder =
+				normalizedPath.includes("/post-types/") ||
+				normalizedPath.includes("/templates/") ||
+				normalizedPath.includes("/parts/") ||
+				normalizedPath.includes("/patterns/");
+
+			if (isContentFolder) {
+				if (this.startupSyncInProgress) {
+					this.debugLogger.log(
+						`📝 [VS Code Watcher] Content file ${eventType} (during startup, ignoring): ${normalizedPath}`
+					);
+					return;
+				}
+				this.debugLogger.info(
+					`📝 [VS Code Watcher] Content file ${eventType}: ${normalizedPath}`
+				);
+				if (eventType === "changed") {
+					this.handleFileChange(filePath);
+				}
+				return;
+			}
+
+			this.debugLogger.info(
+				`📝 [VS Code Watcher] File ${eventType}: ${normalizedPath}`
+			);
+
+			this.handleThemeFileChange(filePath);
+		};
+
+		this.vscodeThemeWatcher.onDidChange((uri) => {
+			handleVscodeEvent(uri, "changed");
+		});
+
+		this.vscodeThemeWatcher.onDidCreate((uri) => {
+			handleVscodeEvent(uri, "created");
+		});
+
+		this.debugLogger.info(
+			`✅ [Theme Watcher] VS Code native watcher active for: ${localFolder}`
+		);
+	}
+
+	/**
 	 * Start watching for changes in JSON metadata files
 	 * When slug/title/status changes in JSON, sync to WordPress and rename files if needed
 	 */
 	private async startMetadataWatcher() {
-		const metadataPath = posixJoin(
-			this.devFolder,
-			".skylit",
-			"metadata"
-		);
+		const metadataPath = posixJoin(this.devFolder, ".skylit", "metadata");
 
 		this.debugLogger.log(
 			`🔍 [Metadata Watcher] Checking for .skylit/metadata at: ${metadataPath}`
@@ -676,8 +1383,7 @@ export class FileWatcher {
 			const skylitPath = posixJoin(this.devFolder, ".skylit");
 			try {
 				if (fs.existsSync(skylitPath)) {
-					const contents =
-						fs.readdirSync(skylitPath);
+					const contents = fs.readdirSync(skylitPath);
 					this.debugLogger.log(
 						`🔍 [Metadata Watcher] .skylit folder contents: ${contents.join(
 							", "
@@ -701,14 +1407,13 @@ export class FileWatcher {
 			);
 		}
 
-		this.debugLogger.log(
-			`👀 Starting metadata watcher for: ${metadataPath}`
-		);
+		this.debugLogger.log(`👀 Starting metadata watcher for: ${metadataPath}`);
 
 		// Load initial metadata cache
 		// This uses fs operations which may fail on SSH - that's OK
 		try {
 			await this.loadMetadataCache(metadataPath);
+			await this.buildReverseIndex(metadataPath);
 		} catch (err: any) {
 			this.debugLogger.log(
 				`⚠️ Could not load metadata cache (SSH expected): ${err.message}`
@@ -718,26 +1423,21 @@ export class FileWatcher {
 			);
 		}
 
-		this.metadataWatcher = chokidar.watch(
-			`${metadataPath}/*.json`,
-			{
-				ignoreInitial: true,
-				persistent: true,
-				awaitWriteFinish: {
-					stabilityThreshold: 500,
-					pollInterval: 100,
-				},
-			}
-		);
+		this.metadataWatcher = chokidar.watch(`${metadataPath}/*.json`, {
+			ignoreInitial: true,
+			persistent: true,
+			awaitWriteFinish: {
+				stabilityThreshold: 500,
+				pollInterval: 100,
+			},
+		});
 
 		this.metadataWatcher.on("change", (filePath) => {
 			this.handleMetadataChange(filePath);
 		});
 
 		this.metadataWatcher.on("error", (error) => {
-			this.debugLogger.log(
-				`❌ Metadata watcher error: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Metadata watcher error: ${error.message}`);
 		});
 
 		this.debugLogger.log(
@@ -756,30 +1456,27 @@ export class FileWatcher {
 			const jsonFiles = dirEntries
 				.filter(
 					([name, type]) =>
-						type === vscode.FileType.File &&
-						name.endsWith(".json")
+						type === vscode.FileType.File && name.endsWith(".json")
 				)
 				.map(([name]) => name);
 
 			for (const file of jsonFiles) {
 				const filePath = posixJoin(metadataPath, file);
-				const postId = parseInt(
-					path.basename(file, ".json"),
-					10
-				);
+				const postId = parseInt(path.basename(file, ".json"), 10);
 
 				if (isNaN(postId)) continue;
 
 				try {
-					const content = await vsReadFile(
-						filePath
-					);
+					const content = await vsReadFile(filePath);
 					const data = JSON.parse(content);
 
 					this.metadataCache.set(postId, {
 						slug: data.slug || "",
 						title: data.title || "",
 						status: data.status || "",
+						syncHash: data.syncHash || undefined,
+						lastSyncTime: data.lastSyncTime || undefined,
+						lastSyncDirection: data.lastSyncDirection || undefined,
 					});
 				} catch (e) {
 					// Skip invalid JSON files
@@ -793,6 +1490,44 @@ export class FileWatcher {
 			this.debugLogger.log(
 				`⚠️ Could not load metadata cache: ${error.message}`
 			);
+		}
+	}
+
+	/**
+	 * Build reverse index mapping relative folder paths to post IDs
+	 * from all .skylit/metadata/*.json files.
+	 */
+	private async buildReverseIndex(metadataPath: string) {
+		this.pathToPostIdIndex.clear();
+		try {
+			if (!(await vsExists(metadataPath))) return;
+
+			const dirEntries = await vsReadDir(metadataPath);
+			const jsonFiles = dirEntries
+				.filter(
+					([name, type]) =>
+						type === vscode.FileType.File && name.endsWith(".json")
+				)
+				.map(([name]) => name);
+
+			for (const file of jsonFiles) {
+				try {
+					const filePath = posixJoin(metadataPath, file);
+					const content = await vsReadFile(filePath);
+					const data = JSON.parse(content);
+					if (data.postId && data.file) {
+						const folderRelative = path.dirname(data.file).replace(/\\/g, "/");
+						this.pathToPostIdIndex.set(folderRelative, data.postId);
+					}
+				} catch {
+					// Skip invalid files
+				}
+			}
+			this.debugLogger.log(
+				`📇 Built reverse index: ${this.pathToPostIdIndex.size} entries`
+			);
+		} catch (err: any) {
+			this.debugLogger.log(`⚠️ Could not build reverse index: ${err.message}`);
 		}
 	}
 
@@ -815,13 +1550,20 @@ export class FileWatcher {
 			return; // Skip if recently synced (prevent loops)
 		}
 
-		this.debugLogger.log(
-			`🔔 [Metadata] Change detected: ${fileName}`
-		);
+		this.debugLogger.log(`🔔 [Metadata] Change detected: ${fileName}`);
+
+		// Invalidate live block line cache so next cursor move re-reads fresh lines
+		this.liveBlockLines.delete(postId);
 
 		try {
 			const content = await vsReadFile(normalizedPath);
 			const newData = JSON.parse(content);
+
+			// Update reverse index
+			if (newData.postId && newData.file) {
+				const folderRelative = path.dirname(newData.file).replace(/\\/g, "/");
+				this.pathToPostIdIndex.set(folderRelative, newData.postId);
+			}
 
 			const oldData = this.metadataCache.get(postId);
 
@@ -834,30 +1576,21 @@ export class FileWatcher {
 			let hasChanges = false;
 
 			if (oldData) {
-				if (
-					newData.slug &&
-					newData.slug !== oldData.slug
-				) {
+				if (newData.slug && newData.slug !== oldData.slug) {
 					changes.slug = newData.slug;
 					hasChanges = true;
 					this.debugLogger.log(
 						`   📝 Slug changed: ${oldData.slug} → ${newData.slug}`
 					);
 				}
-				if (
-					newData.title &&
-					newData.title !== oldData.title
-				) {
+				if (newData.title && newData.title !== oldData.title) {
 					changes.title = newData.title;
 					hasChanges = true;
 					this.debugLogger.log(
 						`   📝 Title changed: ${oldData.title} → ${newData.title}`
 					);
 				}
-				if (
-					newData.status &&
-					newData.status !== oldData.status
-				) {
+				if (newData.status && newData.status !== oldData.status) {
 					changes.status = newData.status;
 					hasChanges = true;
 					this.debugLogger.log(
@@ -882,9 +1615,7 @@ export class FileWatcher {
 				this.metadataCache.set(postId, {
 					slug: newData.slug || oldData.slug,
 					title: newData.title || oldData.title,
-					status:
-						newData.status ||
-						oldData.status,
+					status: newData.status || oldData.status,
 				});
 				return;
 			}
@@ -906,47 +1637,32 @@ export class FileWatcher {
 			this.statusBar.showSyncing("Syncing metadata...");
 
 			try {
-				const response =
-					await this.restClient.updateFromMetadata(
-						postId,
-						changes
-					);
+				const response = await this.restClient.updateFromMetadata(
+					postId,
+					changes
+				);
 
 				if (response.success) {
-					this.statusBar.showSuccess(
-						"Metadata synced"
-					);
+					this.statusBar.showSuccess("Metadata synced");
 
 					// Update cache with new values
 					this.metadataCache.set(postId, {
-						slug:
-							changes.slug ||
-							oldData.slug,
-						title:
-							changes.title ||
-							oldData.title,
-						status:
-							changes.status ||
-							oldData.status,
+						slug: changes.slug || oldData.slug,
+						title: changes.title || oldData.title,
+						status: changes.status || oldData.status,
 					});
 
 					// No popup notification - status bar is enough
 				} else {
-					this.debugLogger.log(
-						`⚠️ Metadata sync failed: ${response.error}`
-					);
+					this.debugLogger.log(`⚠️ Metadata sync failed: ${response.error}`);
 					// Only log to output, no popup
 				}
 			} catch (error: any) {
-				this.debugLogger.log(
-					`❌ Metadata sync error: ${error.message}`
-				);
+				this.debugLogger.log(`❌ Metadata sync error: ${error.message}`);
 				// Only show error popups for critical errors
 			}
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Failed to parse metadata: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Failed to parse metadata: ${error.message}`);
 		}
 	}
 
@@ -995,10 +1711,7 @@ export class FileWatcher {
 			const colonIndex = line.indexOf(":");
 			if (colonIndex === -1) continue;
 
-			const key = line
-				.substring(0, colonIndex)
-				.trim()
-				.toLowerCase();
+			const key = line.substring(0, colonIndex).trim().toLowerCase();
 			const value = line.substring(colonIndex + 1).trim();
 
 			switch (key) {
@@ -1084,10 +1797,7 @@ export class FileWatcher {
 			);
 		}
 
-		if (
-			htmlMetadata.status &&
-			htmlMetadata.status !== cached.status
-		) {
+		if (htmlMetadata.status && htmlMetadata.status !== cached.status) {
 			// Validate status
 			const validStatuses = [
 				"publish",
@@ -1128,11 +1838,10 @@ export class FileWatcher {
 		this.statusBar.showSyncing("Syncing metadata...");
 
 		try {
-			const response =
-				await this.restClient.updateFromMetadata(
-					postId,
-					changes
-				);
+			const response = await this.restClient.updateFromMetadata(
+				postId,
+				changes
+			);
 
 			if (response.success) {
 				this.statusBar.showSuccess("Metadata synced");
@@ -1147,9 +1856,7 @@ export class FileWatcher {
 				// Also update JSON metadata to keep in sync
 				await this.updateJsonMetadata(postId, changes);
 
-				this.debugLogger.log(
-					`✅ [HTML Metadata] Synced to WordPress`
-				);
+				this.debugLogger.log(`✅ [HTML Metadata] Synced to WordPress`);
 				return true;
 			} else {
 				this.debugLogger.log(
@@ -1158,9 +1865,7 @@ export class FileWatcher {
 				return false;
 			}
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ [HTML Metadata] Sync error: ${error.message}`
-			);
+			this.debugLogger.log(`❌ [HTML Metadata] Sync error: ${error.message}`);
 			return false;
 		}
 	}
@@ -1187,109 +1892,59 @@ export class FileWatcher {
 
 			switch (postType) {
 				case "page":
-					parentPath = posixJoin(
-						this.devFolder,
-						"post-types",
-						"pages"
-					);
+					parentPath = posixJoin(this.devFolder, "post-types", "pages");
 					usesIdSuffix = true;
 					break;
 				case "post":
-					parentPath = posixJoin(
-						this.devFolder,
-						"post-types",
-						"posts"
-					);
+					parentPath = posixJoin(this.devFolder, "post-types", "posts");
 					usesIdSuffix = true;
 					break;
 				case "wp_template":
-					parentPath = posixJoin(
-						this.devFolder,
-						"templates"
-					);
+					parentPath = posixJoin(this.devFolder, "templates");
 					usesIdSuffix = true; // Templates also use _ID suffix
 					break;
 				case "wp_template_part":
-					parentPath = posixJoin(
-						this.devFolder,
-						"parts"
-					);
+					parentPath = posixJoin(this.devFolder, "parts");
 					usesIdSuffix = true;
 					break;
 				case "wp_block":
-					parentPath = posixJoin(
-						this.devFolder,
-						"patterns"
-					);
+					parentPath = posixJoin(this.devFolder, "patterns");
 					usesIdSuffix = true;
 					break;
 				default:
 					// Custom post type
-					parentPath = posixJoin(
-						this.devFolder,
-						"post-types",
-						postType + "s"
-					);
+					parentPath = posixJoin(this.devFolder, "post-types", postType + "s");
 					usesIdSuffix = true;
 					break;
 			}
 
-			const oldFolderName = usesIdSuffix
-				? `${oldSlug}_${postId}`
-				: oldSlug;
-			const newFolderName = usesIdSuffix
-				? `${newSlug}_${postId}`
-				: newSlug;
+			const oldFolderName = usesIdSuffix ? `${oldSlug}_${postId}` : oldSlug;
+			const newFolderName = usesIdSuffix ? `${newSlug}_${postId}` : newSlug;
 
-			const oldFolderPath = posixJoin(
-				parentPath,
-				oldFolderName
-			);
-			const newFolderPath = posixJoin(
-				parentPath,
-				newFolderName
-			);
+			const oldFolderPath = posixJoin(parentPath, oldFolderName);
+			const newFolderPath = posixJoin(parentPath, newFolderName);
 
 			// Check if old folder exists
 			if (!(await vsExists(oldFolderPath))) {
-				this.debugLogger.log(
-					`⚠️ Old folder not found: ${oldFolderName}`
-				);
+				this.debugLogger.log(`⚠️ Old folder not found: ${oldFolderName}`);
 				return;
 			}
 
 			// Check if new folder already exists
 			if (await vsExists(newFolderPath)) {
-				this.debugLogger.log(
-					`⚠️ New folder already exists: ${newFolderName}`
-				);
+				this.debugLogger.log(`⚠️ New folder already exists: ${newFolderName}`);
 				return;
 			}
 
 			// Rename files inside the folder first
-			const oldHtmlPath = posixJoin(
-				oldFolderPath,
-				`${oldFolderName}.html`
-			);
-			const newHtmlPath = posixJoin(
-				oldFolderPath,
-				`${newFolderName}.html`
-			);
-			const oldCssPath = posixJoin(
-				oldFolderPath,
-				`${oldFolderName}.css`
-			);
-			const newCssPath = posixJoin(
-				oldFolderPath,
-				`${newFolderName}.css`
-			);
+			const oldHtmlPath = posixJoin(oldFolderPath, `${oldFolderName}.html`);
+			const newHtmlPath = posixJoin(oldFolderPath, `${newFolderName}.html`);
+			const oldCssPath = posixJoin(oldFolderPath, `${oldFolderName}.css`);
+			const newCssPath = posixJoin(oldFolderPath, `${newFolderName}.css`);
 
 			if (await vsExists(oldHtmlPath)) {
 				// Update the HTML metadata comment with new slug before renaming
-				await this.updateHtmlMetadataSlug(
-					oldHtmlPath,
-					newSlug
-				);
+				await this.updateHtmlMetadataSlug(oldHtmlPath, newSlug);
 				await vsRename(oldHtmlPath, newHtmlPath);
 				this.debugLogger.log(
 					`   ✓ HTML: ${oldFolderName}.html → ${newFolderName}.html`
@@ -1305,34 +1960,20 @@ export class FileWatcher {
 
 			// Rename the folder
 			await vsRename(oldFolderPath, newFolderPath);
-			this.debugLogger.log(
-				`   ✓ Folder: ${oldFolderName} → ${newFolderName}`
-			);
+			this.debugLogger.log(`   ✓ Folder: ${oldFolderName} → ${newFolderName}`);
 
 			// Handle open editors
-			const relativePath = newFolderPath.replace(
-				this.devFolder + "/",
-				""
-			);
-			await this.handleFileRename(
-				oldFolderPath,
-				relativePath,
-				postId
-			);
+			const relativePath = newFolderPath.replace(this.devFolder + "/", "");
+			await this.handleFileRename(oldFolderPath, relativePath, postId);
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Failed to rename files: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Failed to rename files: ${error.message}`);
 		}
 	}
 
 	/**
 	 * Update the slug in HTML metadata comment
 	 */
-	private async updateHtmlMetadataSlug(
-		htmlPath: string,
-		newSlug: string
-	) {
+	private async updateHtmlMetadataSlug(htmlPath: string, newSlug: string) {
 		try {
 			let content = await vsReadFile(htmlPath);
 
@@ -1343,10 +1984,7 @@ export class FileWatcher {
 			);
 
 			// Also update Modified timestamp
-			const now = new Date()
-				.toISOString()
-				.replace("T", " ")
-				.substring(0, 19);
+			const now = new Date().toISOString().replace("T", " ").substring(0, 19);
 			content = content.replace(
 				/(<!--\s*\n?\s*WordPress Sync Metadata[\s\S]*?Modified:\s*)([^\n]+)/,
 				`$1${now}`
@@ -1386,48 +2024,26 @@ export class FileWatcher {
 			const oldFolderName = `${oldSlug}_${postId}`;
 			const newFolderName = `${newSlug}_${postId}`;
 
-			const oldFolderPath = posixJoin(
-				postTypePath,
-				oldFolderName
-			);
-			const newFolderPath = posixJoin(
-				postTypePath,
-				newFolderName
-			);
+			const oldFolderPath = posixJoin(postTypePath, oldFolderName);
+			const newFolderPath = posixJoin(postTypePath, newFolderName);
 
 			// Check if old folder exists (using VS Code FS API)
 			if (!(await vsExists(oldFolderPath))) {
-				this.debugLogger.log(
-					`⚠️ Old folder not found: ${oldFolderName}`
-				);
+				this.debugLogger.log(`⚠️ Old folder not found: ${oldFolderName}`);
 				return;
 			}
 
 			// Check if new folder already exists
 			if (await vsExists(newFolderPath)) {
-				this.debugLogger.log(
-					`⚠️ New folder already exists: ${newFolderName}`
-				);
+				this.debugLogger.log(`⚠️ New folder already exists: ${newFolderName}`);
 				return;
 			}
 
 			// Rename files inside the folder first (using VS Code FS API)
-			const oldHtmlPath = posixJoin(
-				oldFolderPath,
-				`${oldFolderName}.html`
-			);
-			const newHtmlPath = posixJoin(
-				oldFolderPath,
-				`${newFolderName}.html`
-			);
-			const oldCssPath = posixJoin(
-				oldFolderPath,
-				`${oldFolderName}.css`
-			);
-			const newCssPath = posixJoin(
-				oldFolderPath,
-				`${newFolderName}.css`
-			);
+			const oldHtmlPath = posixJoin(oldFolderPath, `${oldFolderName}.html`);
+			const newHtmlPath = posixJoin(oldFolderPath, `${newFolderName}.html`);
+			const oldCssPath = posixJoin(oldFolderPath, `${oldFolderName}.css`);
+			const newCssPath = posixJoin(oldFolderPath, `${newFolderName}.css`);
 
 			if (await vsExists(oldHtmlPath)) {
 				await vsRename(oldHtmlPath, newHtmlPath);
@@ -1445,16 +2061,11 @@ export class FileWatcher {
 
 			// Rename the folder (using VS Code FS API)
 			await vsRename(oldFolderPath, newFolderPath);
-			this.debugLogger.log(
-				`   ✓ Folder: ${oldFolderName} → ${newFolderName}`
-			);
+			this.debugLogger.log(`   ✓ Folder: ${oldFolderName} → ${newFolderName}`);
 
 			// Update JSON's file path to stay in sync
 			const newFilePath = `post-types/${postTypeFolderName}/${newFolderName}/${newFolderName}.html`;
-			await this.updateJsonMetadataFilePath(
-				postId,
-				newFilePath
-			);
+			await this.updateJsonMetadataFilePath(postId, newFilePath);
 
 			// Handle open editors - close old file and open new file
 			await this.handleFileRename(
@@ -1463,9 +2074,7 @@ export class FileWatcher {
 				postId
 			);
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Failed to rename files: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Failed to rename files: ${error.message}`);
 		}
 	}
 
@@ -1495,16 +2104,12 @@ export class FileWatcher {
 			const content = await vsReadFile(metadataPath);
 			const metadata = JSON.parse(content);
 
+			const now = new Date().toISOString();
 			metadata.file = newFilePath;
-			metadata.lastExported = new Date()
-				.toISOString()
-				.replace("T", " ")
-				.substring(0, 19);
+			metadata.lastExported = now.replace("T", " ").substring(0, 19);
+			metadata.lastSyncTime = now;
 
-			await vsWriteFile(
-				metadataPath,
-				JSON.stringify(metadata, null, 4)
-			);
+			await vsWriteFile(metadataPath, JSON.stringify(metadata, null, 4));
 			this.debugLogger.log(`   ✓ JSON file path updated`);
 		} catch (error: any) {
 			this.debugLogger.log(
@@ -1514,19 +2119,41 @@ export class FileWatcher {
 	}
 
 	/**
-	 * Extract post ID from folder path (e.g., "about-us_123" → 123)
+	 * Extract post ID from folder path using the reverse index (metadata-first),
+	 * falling back to .post-id marker and legacy _ID suffix.
 	 */
 	private extractPostIdFromPath(dirPath: string): number | null {
+		const normalizedDir = dirPath.replace(/\\/g, "/");
+		const devFolderNormalized = this.devFolder.replace(/\\/g, "/");
+		const relativePath = normalizedDir
+			.replace(devFolderNormalized, "")
+			.replace(/^\//, "");
+
+		// 1. Metadata-driven reverse index (folder relative path → postId)
+		const postId = this.pathToPostIdIndex.get(relativePath);
+		if (postId) return postId;
+
+		// 2. Legacy fallback: _ID suffix in folder name
 		const folderName = path.basename(dirPath);
 		const match = folderName.match(/_(\d+)$/);
-		return match ? parseInt(match[1], 10) : null;
+		if (match) return parseInt(match[1], 10);
+
+		// 3. Slug-based: reverse lookup in metadata cache
+		for (const [pid, meta] of this.metadataCache.entries()) {
+			if (meta.slug === folderName) {
+				return pid;
+			}
+		}
+
+		return null;
 	}
 
 	/**
-	 * Extract slug from folder name (e.g., "about-us_123" → "about-us")
+	 * Public helper: resolve post ID from an absolute file path.
 	 */
-	private extractSlugFromFolderName(folderName: string): string {
-		return folderName.replace(/_\d+$/, "");
+	public getPostIdForFile(filePath: string): number | null {
+		const dir = path.dirname(filePath);
+		return this.extractPostIdFromPath(dir);
 	}
 
 	/**
@@ -1547,11 +2174,9 @@ export class FileWatcher {
 			return;
 		}
 
-		const oldSlug = this.extractSlugFromFolderName(folderName);
+		const oldSlug = folderName;
 
-		this.debugLogger.log(
-			`🔄 Folder removed (potential rename): ${folderName}`
-		);
+		this.debugLogger.log(`🔄 Folder removed (potential rename): ${folderName}`);
 
 		// Store for matching with subsequent addDir
 		this.pendingRenames.set(postId, {
@@ -1563,22 +2188,15 @@ export class FileWatcher {
 		// Clean up after timeout (if no addDir follows, it was a delete, not rename)
 		setTimeout(() => {
 			if (this.pendingRenames.has(postId)) {
-				const pending =
-					this.pendingRenames.get(postId)!;
-				if (
-					Date.now() - pending.timestamp >=
-					this.renameCooldownMs
-				) {
+				const pending = this.pendingRenames.get(postId)!;
+				if (Date.now() - pending.timestamp >= this.renameCooldownMs) {
 					this.pendingRenames.delete(postId);
 					this.debugLogger.log(
 						`🗑️ Folder delete confirmed (no rename): ${folderName}`
 					);
 
 					// Ask user what to do with the WordPress post
-					this.promptDeleteAction(
-						postId,
-						folderName
-					);
+					this.promptDeleteAction(postId, folderName);
 				}
 			}
 		}, this.renameCooldownMs + 100);
@@ -1613,45 +2231,28 @@ export class FileWatcher {
 		);
 
 		if (!choice || choice === keepOption) {
-			this.debugLogger.log(
-				`📁 User chose to keep post ${postId} in WordPress`
-			);
+			this.debugLogger.log(`📁 User chose to keep post ${postId} in WordPress`);
 			return;
 		}
 
 		const action = choice === trashOption ? "trash" : "delete";
 
 		try {
-			this.debugLogger.log(
-				`📤 Sending ${action} action for post ${postId}...`
-			);
+			this.debugLogger.log(`📤 Sending ${action} action for post ${postId}...`);
 			this.statusBar.showSyncing(
-				`${
-					action === "trash"
-						? "Trashing"
-						: "Deleting"
-				} post...`
+				`${action === "trash" ? "Trashing" : "Deleting"} post...`
 			);
 
-			const response = await this.restClient.sendFolderAction(
-				postId,
-				action
-			);
+			const response = await this.restClient.sendFolderAction(postId, action);
 
-			if (response.success) {
-				const actionVerb =
-					action === "trash"
-						? "moved to trash"
-						: "permanently deleted";
-				this.debugLogger.log(
-					`✅ Post ${postId} ${actionVerb}`
-				);
-				this.statusBar.showSuccess(
-					`Post ${actionVerb}`
-				);
-				vscode.window.showInformationMessage(
-					`✅ Post ${postId} ${actionVerb} from WordPress`
-				);
+		if (response.success) {
+			const actionVerb =
+				action === "trash" ? "moved to trash" : "permanently deleted";
+			this.debugLogger.log(`✅ Post ${postId} ${actionVerb}`);
+			this.statusBar.showSuccess(`Post ${actionVerb}`, 3000);
+			vscode.window.showInformationMessage(
+				`✅ Post ${postId} ${actionVerb} in WordPress`
+			);
 
 				// Clean up local metadata file for permanent deletes
 				if (action === "delete") {
@@ -1661,9 +2262,7 @@ export class FileWatcher {
 				this.statusBar.showError("Action failed");
 			}
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ ${action} failed: ${error.message}`
-			);
+			this.debugLogger.log(`❌ ${action} failed: ${error.message}`);
 			this.statusBar.showError(`Failed: ${error.message}`);
 			vscode.window.showErrorMessage(
 				`Failed to ${action} post ${postId}: ${error.message}`
@@ -1684,9 +2283,7 @@ export class FileWatcher {
 			);
 			if (fs.existsSync(metadataPath)) {
 				fs.unlinkSync(metadataPath);
-				this.debugLogger.log(
-					`🗑️ Deleted metadata file: ${postId}.json`
-				);
+				this.debugLogger.log(`🗑️ Deleted metadata file: ${postId}.json`);
 			}
 		} catch (error: any) {
 			this.debugLogger.log(
@@ -1701,7 +2298,7 @@ export class FileWatcher {
 	private async handleRenameComplete(dirPath: string, postId: number) {
 		const normalizedPath = dirPath.replace(/\\/g, "/");
 		const folderName = path.basename(normalizedPath);
-		const newSlug = this.extractSlugFromFolderName(folderName);
+		const newSlug = folderName;
 
 		const pending = this.pendingRenames.get(postId);
 		if (!pending) {
@@ -1713,22 +2310,17 @@ export class FileWatcher {
 
 		// Check if slug actually changed
 		if (pending.oldSlug === newSlug) {
-			this.debugLogger.log(
-				`🔄 Folder moved but slug unchanged: ${folderName}`
-			);
+			this.debugLogger.log(`🔄 Folder moved but slug unchanged: ${folderName}`);
 			return;
 		}
 
 		this.debugLogger.log(
-			`📝 Folder renamed: ${pending.oldSlug}_${postId} → ${newSlug}_${postId}`
+			`📝 Folder renamed: ${pending.oldSlug} → ${newSlug} (post ${postId})`
 		);
 		this.statusBar.showSyncing("Updating slug...");
 
 		try {
-			const response = await this.restClient.updatePostSlug(
-				postId,
-				newSlug
-			);
+			const response = await this.restClient.updatePostSlug(postId, newSlug);
 
 			if (response.success) {
 				this.statusBar.showSuccess("Slug updated");
@@ -1749,32 +2341,18 @@ export class FileWatcher {
 				}
 
 				// Show notification
-				const config =
-					vscode.workspace.getConfiguration(
-						"skylit"
-					);
-				if (
-					config.get<boolean>(
-						"showNotifications",
-						true
-					)
-				) {
+				const config = vscode.workspace.getConfiguration("skylit");
+				if (config.get<boolean>("showNotifications", true)) {
 					vscode.window.showInformationMessage(
 						`✅ Slug updated: ${pending.oldSlug} → ${newSlug}`
 					);
 				}
 			} else {
-				this.debugLogger.log(
-					`⚠️ Could not update slug: ${response.error}`
-				);
+				this.debugLogger.log(`⚠️ Could not update slug: ${response.error}`);
 			}
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Failed to update slug: ${error.message}`
-			);
-			vscode.window.showErrorMessage(
-				`Failed to update slug: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Failed to update slug: ${error.message}`);
+			vscode.window.showErrorMessage(`Failed to update slug: ${error.message}`);
 		}
 	}
 
@@ -1799,34 +2377,31 @@ export class FileWatcher {
 		);
 
 		if (!(await vsExists(metadataPath))) {
-			this.debugLogger.log(
-				`⚠️ Metadata file not found: ${postId}.json`
-			);
+			this.debugLogger.log(`⚠️ Metadata file not found: ${postId}.json`);
 			return;
 		}
 
 		try {
-			// Set cooldown to prevent the change from triggering another sync
 			this.metadataSyncCooldown.set(postId, Date.now());
 
 			const content = await vsReadFile(metadataPath);
 			const metadata = JSON.parse(content);
 
-			// Apply updates
 			if (updates.slug !== undefined) {
 				const oldSlug = metadata.slug;
 				metadata.slug = updates.slug;
 
-				// Also update the file path to match
-				const newFolderName = `${updates.slug}_${postId}`;
-				if (metadata.file) {
-					metadata.file = metadata.file.replace(
-						new RegExp(
-							`${oldSlug}_${postId}`,
-							"g"
-						),
-						newFolderName
-					);
+				// Update the file path: replace old slug with new slug
+				if (metadata.file && oldSlug) {
+					metadata.file = metadata.file
+						.replace(
+							new RegExp(`/${oldSlug}/${oldSlug}\\.`, "g"),
+							`/${updates.slug}/${updates.slug}.`
+						)
+						.replace(
+							new RegExp(`/${oldSlug}_\\d+/${oldSlug}_\\d+\\.`, "g"),
+							`/${updates.slug}/${updates.slug}.`
+						);
 				}
 			}
 			if (updates.title !== undefined) {
@@ -1839,19 +2414,14 @@ export class FileWatcher {
 				metadata.file = updates.file;
 			}
 
-			metadata.lastExported = new Date()
-				.toISOString()
-				.replace("T", " ")
-				.substring(0, 19);
+			const now = new Date().toISOString();
+			metadata.lastExported = now.replace("T", " ").substring(0, 19);
+			metadata.lastEditTime = now;
+			metadata.lastSyncTime = now;
+			metadata.lastSyncDirection = "dev-to-wp";
 
-			// Write back (using VS Code FS API)
-			await vsWriteFile(
-				metadataPath,
-				JSON.stringify(metadata, null, 4)
-			);
-			this.debugLogger.log(
-				`📦 JSON metadata updated: ${postId}.json`
-			);
+			await vsWriteFile(metadataPath, JSON.stringify(metadata, null, 4));
+			this.debugLogger.log(`📦 JSON metadata updated: ${postId}.json`);
 		} catch (error: any) {
 			this.debugLogger.log(
 				`❌ Failed to update JSON metadata: ${error.message}`
@@ -1869,31 +2439,21 @@ export class FileWatcher {
 			.replace(/\\/g, "/")
 			.replace(/\/$/, "");
 
-		this.debugLogger.log(
-			`🔍 [New Folder] Checking: ${normalizedPath}`
-		);
-		this.debugLogger.log(
-			`🔍 [New Folder] Dev folder: ${devFolderNormalized}`
-		);
+		this.debugLogger.log(`🔍 [New Folder] Checking: ${normalizedPath}`);
+		this.debugLogger.log(`🔍 [New Folder] Dev folder: ${devFolderNormalized}`);
 
 		// Get relative path from dev folder
 		let relativePath = normalizedPath;
 		if (normalizedPath.startsWith(devFolderNormalized + "/")) {
-			relativePath = normalizedPath.substring(
-				devFolderNormalized.length + 1
-			);
+			relativePath = normalizedPath.substring(devFolderNormalized.length + 1);
 		} else if (normalizedPath.startsWith(devFolderNormalized)) {
-			relativePath = normalizedPath.substring(
-				devFolderNormalized.length
-			);
+			relativePath = normalizedPath.substring(devFolderNormalized.length);
 			if (relativePath.startsWith("/")) {
 				relativePath = relativePath.substring(1);
 			}
 		}
 
-		this.debugLogger.log(
-			`🔍 [New Folder] Relative path: ${relativePath}`
-		);
+		this.debugLogger.log(`🔍 [New Folder] Relative path: ${relativePath}`);
 
 		// Handle different folder structures:
 		// - post-types/[type]/[folder] (pages, posts)
@@ -1901,9 +2461,9 @@ export class FileWatcher {
 		// - parts/[folder] (FSE template parts)
 		const parts = relativePath.split("/");
 		this.debugLogger.log(
-			`🔍 [New Folder] Parts: ${JSON.stringify(
-				parts
-			)} (length: ${parts.length})`
+			`🔍 [New Folder] Parts: ${JSON.stringify(parts)} (length: ${
+				parts.length
+			})`
 		);
 
 		let postTypeFolder: string;
@@ -1921,14 +2481,16 @@ export class FileWatcher {
 			// FSE template parts: parts/header
 			postTypeFolder = "wp_template_part";
 			folderName = parts[1];
-		} else if (parts.length === 3 && parts[0] === "patterns" && (parts[1] === "synced" || parts[1] === "unsynced")) {
+		} else if (
+			parts.length === 3 &&
+			parts[0] === "patterns" &&
+			(parts[1] === "synced" || parts[1] === "unsynced")
+		) {
 			// Patterns: patterns/synced/my-pattern or patterns/unsynced/my-pattern
 			postTypeFolder = "wp_block";
 			folderName = parts[2];
 		} else {
-			this.debugLogger.log(
-				`🔍 [New Folder] Skipping - not a content folder`
-			);
+			this.debugLogger.log(`🔍 [New Folder] Skipping - not a content folder`);
 			return; // Not a content folder
 		}
 
@@ -1941,54 +2503,14 @@ export class FileWatcher {
 		}
 
 		// Skip if in _trash
-		if (
-			folderName === "_trash" ||
-			relativePath.includes("/_trash/")
-		) {
+		if (folderName === "_trash" || relativePath.includes("/_trash/")) {
 			this.debugLogger.log(
 				`🔍 [New Folder] Skipping - in trash: ${folderName}`
 			);
 			return;
 		}
 
-		// IMPORTANT: Check for duplicates FIRST, before "already processed" check
-		// This handles the case where WordPress recreates the old folder after we renamed it
-		const recentRename =
-			this.recentlyRenamedFolders.get(folderName);
-		if (recentRename) {
-			const ageMs = Date.now() - recentRename.timestamp;
-			// If renamed within last 30 seconds, this is likely WordPress re-exporting
-			// After 30 seconds, treat as intentional new page creation
-			if (ageMs < 30 * 1000) {
-				this.debugLogger.log(
-					`🔄 [Duplicate Prevention] "${folderName}" was recently renamed to "${
-						recentRename.newFolder
-					}" (${Math.round(ageMs / 1000)}s ago)`
-				);
-				this.debugLogger.log(
-					`   Redirecting to existing post (ID: ${recentRename.postId})`
-				);
-
-				// Auto-redirect: delete this duplicate folder and merge contents
-				// Don't await - let it run in background (function is already async)
-				this.redirectDuplicateFolder(
-					normalizedPath,
-					recentRename,
-					postTypeFolder
-				);
-				return;
-			} else {
-				// Old entry, remove it - allow new page creation with same name
-				this.debugLogger.log(
-					`🔍 [New Folder] Clearing old rename tracking for "${folderName}" (${Math.round(
-						ageMs / 1000
-					)}s ago)`
-				);
-				this.recentlyRenamedFolders.delete(folderName);
-			}
-		}
-
-		// Skip if already processed (but not if it's a duplicate - handled above)
+		// Skip if already processed
 		if (this.processedNewFolders.has(normalizedPath)) {
 			this.debugLogger.log(
 				`🔍 [New Folder] Skipping - already processed: ${folderName}`
@@ -2018,70 +2540,6 @@ export class FileWatcher {
 	}
 
 	/**
-	 * Find existing folder with ID for a given slug
-	 * Used to detect folders migrated by the plugin
-	 */
-	private async findExistingFolderWithId(
-		folderName: string,
-		postTypeFolder: string
-	): Promise<{ folderName: string; postId: number } | null> {
-		try {
-			// Determine correct parent path based on post type
-			let parentPath: string;
-			if (postTypeFolder === "wp_template") {
-				parentPath = posixJoin(
-					this.devFolder,
-					"templates"
-				);
-			} else if (postTypeFolder === "wp_template_part") {
-				parentPath = posixJoin(this.devFolder, "parts");
-			} else {
-				parentPath = posixJoin(
-					this.devFolder,
-					`post-types/${postTypeFolder}`
-				);
-			}
-
-			// Check if parent exists
-			const parentExists = await vsExists(parentPath);
-			if (!parentExists) {
-				return null;
-			}
-
-			// Read parent directory
-			const contents = await vsReadDir(parentPath);
-
-			// Look for folders matching pattern: {folderName}_{ID}
-			const pattern = new RegExp(`^${folderName}_(\\d+)$`);
-
-			for (const [name, type] of contents) {
-				if (type === vscode.FileType.Directory) {
-					const match = name.match(pattern);
-					if (match) {
-						const postId = parseInt(
-							match[1]
-						);
-						this.debugLogger.log(
-							`✓ Found existing folder: ${name} (ID: ${postId})`
-						);
-						return {
-							folderName: name,
-							postId,
-						};
-					}
-				}
-			}
-
-			return null;
-		} catch (err: any) {
-			this.debugLogger.log(
-				`⚠️ Error finding existing folder: ${err.message}`
-			);
-			return null;
-		}
-	}
-
-	/**
 	 * Create a WordPress post from a new folder
 	 */
 	private async createPostFromNewFolder(
@@ -2090,20 +2548,14 @@ export class FileWatcher {
 		folderName: string,
 		relativePath: string
 	) {
-		this.debugLogger.log(
-			`🔍 [Create Post] Starting for: ${folderPath}`
-		);
+		this.debugLogger.log(`🔍 [Create Post] Starting for: ${folderPath}`);
 
 		// Check if folder still exists and has HTML file (using VS Code FS API)
 		const folderExists = await vsExists(folderPath);
-		this.debugLogger.log(
-			`🔍 [Create Post] Folder exists: ${folderExists}`
-		);
+		this.debugLogger.log(`🔍 [Create Post] Folder exists: ${folderExists}`);
 
 		if (!folderExists) {
-			this.debugLogger.log(
-				`⚠️ Folder no longer exists: ${relativePath}`
-			);
+			this.debugLogger.log(`⚠️ Folder no longer exists: ${relativePath}`);
 			return;
 		}
 
@@ -2118,15 +2570,12 @@ export class FileWatcher {
 		const htmlFiles = dirContents
 			.filter(
 				([name, type]) =>
-					type === vscode.FileType.File &&
-					name.endsWith(".html")
+					type === vscode.FileType.File && name.endsWith(".html")
 			)
 			.map(([name]) => name);
 
 		this.debugLogger.log(
-			`🔍 [Create Post] HTML files found: ${JSON.stringify(
-				htmlFiles
-			)}`
+			`🔍 [Create Post] HTML files found: ${JSON.stringify(htmlFiles)}`
 		);
 
 		if (htmlFiles.length === 0) {
@@ -2141,442 +2590,100 @@ export class FileWatcher {
 		this.processedNewFolders.add(folderPath);
 		this.debugLogger.log(`✓ HTML file found: ${htmlFiles[0]}`);
 
-		// IMPORTANT: Check if a folder with ID already exists for this slug
-		// This catches folders migrated by the plugin (not tracked in recentlyRenamedFolders)
-		const existingIdFolder = await this.findExistingFolderWithId(
-			folderName,
-			postTypeFolder
-		);
-		if (existingIdFolder) {
-			this.debugLogger.log(
-				`🔄 [Duplicate Detection] Found existing folder with ID: ${existingIdFolder.folderName}`
-			);
-			this.debugLogger.log(
-				`   Merging duplicate "${folderName}" → "${existingIdFolder.folderName}"`
-			);
-
-			// Redirect to existing folder
-			await this.redirectDuplicateFolder(
-				folderPath,
-				{
-					newFolder: existingIdFolder.folderName,
-					postId: existingIdFolder.postId,
-					timestamp: Date.now(),
-				},
-				postTypeFolder
-			);
-			return;
-		}
-
 		// Map folder name to post type
 		const postType = this.mapFolderToPostType(postTypeFolder);
 
-		this.debugLogger.log(
-			`📄 Creating ${postType} from: ${relativePath}`
-		);
+		this.debugLogger.log(`📄 Creating ${postType} from: ${relativePath}`);
 		this.statusBar.showSyncing(`Creating ${postType}...`);
 
 		try {
-			// Pass skip_rename=true so IDE does the rename via VS Code API
-			// This ensures open editors (including AI's) are automatically updated
-			const response =
-				await this.restClient.createPostFromFolder(
-					relativePath,
-					postType,
-					true
-				);
+			const response = await this.restClient.createPostFromFolder(
+				relativePath,
+				postType
+			);
 
 			if (response.success && response.post_id) {
-				this.statusBar.showSuccess(
-					`Created: ${response.title}`
-				);
+				this.statusBar.showSuccess(`Created: ${response.title}`);
 				this.debugLogger.log(
 					`✅ Created ${postType} "${response.title}" (ID: ${response.post_id})`
 				);
-
-				// Do the rename via VS Code API - this updates all open editors automatically!
-				const newFolderName = `${response.slug}_${response.post_id}`;
 
 				// Determine correct path based on post type
 				let basePath: string;
 				if (postTypeFolder === "wp_template") {
 					basePath = "templates";
-				} else if (
-					postTypeFolder === "wp_template_part"
-				) {
+				} else if (postTypeFolder === "wp_template_part") {
 					basePath = "parts";
 				} else if (postTypeFolder === "wp_block") {
-					// Patterns - use the original path (patterns/synced or patterns/unsynced)
-					// relativePath is like "patterns/synced/my-pattern"
 					const patternParts = relativePath.split("/");
-					basePath = `${patternParts[0]}/${patternParts[1]}`; // "patterns/synced" or "patterns/unsynced"
+					basePath = `${patternParts[0]}/${patternParts[1]}`;
 				} else {
 					basePath = `post-types/${postTypeFolder}`;
 				}
 
-				const newFolderPath = posixJoin(
-					this.devFolder,
-					`${basePath}/${newFolderName}`
-				);
+				// Update reverse index for path-to-postID lookups
+				const slug = response.slug || folderName;
+				this.pathToPostIdIndex.set(`${basePath}/${slug}`, response.post_id);
 
-				// IMPORTANT: Track the rename BEFORE we start, so trash handler knows to skip it
-				this.recentlyRenamedFolders.set(folderName, {
-					newFolder: newFolderName,
-					postId: response.post_id,
-					timestamp: Date.now(),
-				});
-				this.debugLogger.log(
-					`   📝 Pre-tracking rename: "${folderName}" → "${newFolderName}"`
-				);
-
-				// Mark the new folder as processed too (so we don't try to create again)
-				this.processedNewFolders.add(newFolderPath);
-
-				await this.renameViaVSCode(
-					folderPath,
-					newFolderPath,
-					folderName,
-					newFolderName
-				);
-
-				this.debugLogger.log(
-					`   Folder renamed: ${folderName} → ${newFolderName}`
-				);
-
-				// Update response with actual new folder path for notification
-				response.new_folder = `${basePath}/${newFolderName}`;
-
-				// Write notification for AI - same format as AI request flow
-				// This allows AI to know the new folder path after auto-rename
-				await this.writePostCreationNotification(
-					response,
-					postType
-				);
-
-				// Show notification
-				const config =
-					vscode.workspace.getConfiguration(
-						"skylit"
+				// Write canonical HTML (with metadata header) back to disk
+				const canonicalHtml = (response as any).canonical_html;
+				if (canonicalHtml && typeof canonicalHtml === "string") {
+					const htmlPath = posixJoin(
+						this.devFolder,
+						basePath,
+						slug,
+						`${slug}.html`
 					);
-				if (
-					config.get<boolean>(
-						"showNotifications",
-						true
-					)
-				) {
+					try {
+						this.lastSyncTime.set(htmlPath, Date.now());
+						this.selfWrittenPaths.set(htmlPath, Date.now());
+						await vsWriteFile(htmlPath, canonicalHtml);
+						this.debugLogger.log(
+							`📝 Wrote canonical HTML with metadata header: ${slug}.html`
+						);
+					} catch (e: any) {
+						this.debugLogger.log(
+							`⚠️ Could not write canonical HTML: ${e.message}`
+						);
+					}
+				}
+				const canonicalCss = (response as any).canonical_css;
+				if (canonicalCss && typeof canonicalCss === "string") {
+					const cssPath = posixJoin(
+						this.devFolder,
+						basePath,
+						slug,
+						`${slug}.css`
+					);
+					try {
+						this.lastSyncTime.set(cssPath, Date.now());
+						this.selfWrittenPaths.set(cssPath, Date.now());
+						await vsWriteFile(cssPath, canonicalCss);
+					} catch {}
+				}
+
+				// Write notification JSON for AI
+				response.new_folder = `${basePath}/${slug}`;
+				await this.writePostCreationNotification(response, postType);
+
+				const config = vscode.workspace.getConfiguration("skylit");
+				if (config.get<boolean>("showNotifications", true)) {
 					vscode.window.showInformationMessage(
 						`✅ Created ${postType}: ${response.title} (ID: ${response.post_id})`
 					);
 				}
 			} else {
-				this.debugLogger.log(
-					`⚠️ Could not create post: ${response.error}`
-				);
-				this.statusBar.showError(
-					response.error ||
-						"Failed to create post"
-				);
+				this.debugLogger.log(`⚠️ Could not create post: ${response.error}`);
+				this.statusBar.showError(response.error || "Failed to create post");
 				// Remove from processed so it can be retried
 				this.processedNewFolders.delete(folderPath);
 			}
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Failed to create post: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Failed to create post: ${error.message}`);
 			this.processedNewFolders.delete(folderPath);
 			this.statusBar.showError(`Failed: ${error.message}`);
 			vscode.window.showErrorMessage(
 				`Failed to create ${postType}: ${error.message}`
-			);
-		}
-	}
-
-	/**
-	 * Rename folder and files using VS Code's WorkspaceEdit API
-	 * This ensures all open editors (including AI's) are automatically updated
-	 */
-	private async renameViaVSCode(
-		oldFolderPath: string,
-		newFolderPath: string,
-		oldFolderName: string,
-		newFolderName: string
-	) {
-		this.debugLogger.log(
-			`🔄 [VS Code Rename] ${oldFolderName} → ${newFolderName}`
-		);
-
-		try {
-			// Check if target folder already exists (server already renamed)
-			const targetExists = await vsExists(newFolderPath);
-			const sourceExists = await vsExists(oldFolderPath);
-
-			if (targetExists && !sourceExists) {
-				// Server already renamed the folder - just rename files inside
-				this.debugLogger.log(
-					`   ℹ️ Target folder already exists (server renamed). Renaming files inside...`
-				);
-				await this.renameFilesInFolder(
-					newFolderPath,
-					oldFolderName,
-					newFolderName
-				);
-				return;
-			}
-
-			if (targetExists && sourceExists) {
-				// Both exist - merge source into target, then delete source
-				this.debugLogger.log(
-					`   ℹ️ Both folders exist. Merging...`
-				);
-				await this.mergeAndRenameFolders(
-					oldFolderPath,
-					newFolderPath,
-					oldFolderName,
-					newFolderName
-				);
-				return;
-			}
-
-			if (!sourceExists) {
-				// Source doesn't exist - nothing to rename
-				this.debugLogger.log(
-					`   ⚠️ Source folder doesn't exist. Skipping rename.`
-				);
-				return;
-			}
-
-			// Normal case: rename folder using VS Code API
-			// First, rename the folder itself
-			const edit = new vscode.WorkspaceEdit();
-			edit.renameFile(
-				pathToUri(oldFolderPath),
-				pathToUri(newFolderPath),
-				{ overwrite: false }
-			);
-
-			const folderSuccess = await vscode.workspace.applyEdit(
-				edit
-			);
-
-			if (folderSuccess) {
-				this.debugLogger.log(
-					`   ✅ Folder renamed via VS Code API`
-				);
-				// Now rename files inside the new folder
-				await this.renameFilesInFolder(
-					newFolderPath,
-					oldFolderName,
-					newFolderName
-				);
-			} else {
-				this.debugLogger.log(
-					`   ⚠️ VS Code folder rename failed, trying fs.rename...`
-				);
-
-				// Fallback to filesystem rename
-				await vscode.workspace.fs.rename(
-					pathToUri(oldFolderPath),
-					pathToUri(newFolderPath),
-					{ overwrite: false }
-				);
-
-				await this.renameFilesInFolder(
-					newFolderPath,
-					oldFolderName,
-					newFolderName
-				);
-			}
-
-			this.debugLogger.log(`✅ [VS Code Rename] Complete`);
-		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ [VS Code Rename] Error: ${error.message}`
-			);
-			// Don't throw - the post was created successfully, rename is secondary
-			// The folder might already be renamed by the server (old plugin version)
-		}
-	}
-
-	/**
-	 * Rename files inside a folder to match the new folder name
-	 */
-	private async renameFilesInFolder(
-		folderPath: string,
-		oldPrefix: string,
-		newPrefix: string
-	) {
-		try {
-			const files = await vsReadDir(folderPath);
-			const edit = new vscode.WorkspaceEdit();
-			let hasRenames = false;
-
-			for (const [fileName, fileType] of files) {
-				if (
-					fileType === vscode.FileType.File &&
-					fileName.startsWith(oldPrefix)
-				) {
-					const newFileName = fileName.replace(
-						oldPrefix,
-						newPrefix
-					);
-					if (newFileName !== fileName) {
-						const oldFilePath = posixJoin(
-							folderPath,
-							fileName
-						);
-						const newFilePath = posixJoin(
-							folderPath,
-							newFileName
-						);
-
-						edit.renameFile(
-							pathToUri(oldFilePath),
-							pathToUri(newFilePath),
-							{ overwrite: true }
-						);
-
-						this.debugLogger.log(
-							`   📄 ${fileName} → ${newFileName}`
-						);
-						hasRenames = true;
-					}
-				}
-			}
-
-			if (hasRenames) {
-				const success =
-					await vscode.workspace.applyEdit(edit);
-				if (!success) {
-					// Fallback to individual renames
-					for (const [
-						fileName,
-						fileType,
-					] of files) {
-						if (
-							fileType ===
-								vscode.FileType
-									.File &&
-							fileName.startsWith(
-								oldPrefix
-							)
-						) {
-							const newFileName =
-								fileName.replace(
-									oldPrefix,
-									newPrefix
-								);
-							if (
-								newFileName !==
-								fileName
-							) {
-								const oldFilePath =
-									posixJoin(
-										folderPath,
-										fileName
-									);
-								const newFilePath =
-									posixJoin(
-										folderPath,
-										newFileName
-									);
-								await vscode.workspace.fs.rename(
-									pathToUri(
-										oldFilePath
-									),
-									pathToUri(
-										newFilePath
-									),
-									{
-										overwrite: true,
-									}
-								);
-							}
-						}
-					}
-				}
-			}
-		} catch (error: any) {
-			this.debugLogger.log(
-				`   ⚠️ File rename error: ${error.message}`
-			);
-		}
-	}
-
-	/**
-	 * Merge source folder into target folder, renaming files as needed
-	 */
-	private async mergeAndRenameFolders(
-		sourcePath: string,
-		targetPath: string,
-		oldPrefix: string,
-		newPrefix: string
-	) {
-		try {
-			const sourceFiles = await vsReadDir(sourcePath);
-
-			for (const [fileName, fileType] of sourceFiles) {
-				if (fileType === vscode.FileType.File) {
-					const sourceFilePath = posixJoin(
-						sourcePath,
-						fileName
-					);
-					const newFileName = fileName.startsWith(
-						oldPrefix
-					)
-						? fileName.replace(
-								oldPrefix,
-								newPrefix
-						  )
-						: fileName;
-					const targetFilePath = posixJoin(
-						targetPath,
-						newFileName
-					);
-
-					// Move file from source to target
-					try {
-						await vscode.workspace.fs.rename(
-							pathToUri(
-								sourceFilePath
-							),
-							pathToUri(
-								targetFilePath
-							),
-							{ overwrite: true }
-						);
-						this.debugLogger.log(
-							`   📄 Merged: ${fileName} → ${newFileName}`
-						);
-					} catch (e) {
-						// File might already exist in target
-					}
-				}
-			}
-
-			// Delete empty source folder
-			try {
-				await vscode.workspace.fs.delete(
-					pathToUri(sourcePath),
-					{ recursive: true }
-				);
-				this.debugLogger.log(
-					`   🗑️ Deleted source folder: ${path.basename(
-						sourcePath
-					)}`
-				);
-			} catch (e) {
-				// Non-critical
-			}
-
-			// Rename any remaining files in target with old prefix
-			await this.renameFilesInFolder(
-				targetPath,
-				oldPrefix,
-				newPrefix
-			);
-		} catch (error: any) {
-			this.debugLogger.log(
-				`   ⚠️ Merge error: ${error.message}`
 			);
 		}
 	}
@@ -2599,10 +2706,7 @@ export class FileWatcher {
 			return; // No post ID, nothing to write
 		}
 		const skylitPath = posixJoin(this.devFolder, ".skylit");
-		const resultFile = posixJoin(
-			skylitPath,
-			"last-created-post.json"
-		);
+		const resultFile = posixJoin(skylitPath, "last-created-post.json");
 
 		try {
 			// Ensure .skylit folder exists
@@ -2610,25 +2714,16 @@ export class FileWatcher {
 			try {
 				await vscode.workspace.fs.stat(skylitUri);
 			} catch {
-				await vscode.workspace.fs.createDirectory(
-					skylitUri
-				);
+				await vscode.workspace.fs.createDirectory(skylitUri);
 			}
 
-			// Extract slug from new folder name (e.g., "my-page_550" -> "my-page")
 			const slug =
 				response.slug ||
-				(response.new_folder
-					? response.new_folder.replace(
-							/_\d+$/,
-							""
-					  )
-					: "");
+				(response.new_folder ? path.basename(response.new_folder) : "");
 			const folderName = response.new_folder || "";
-			const fullPath = `${this.devFolder.replace(
-				/\\/g,
-				"/"
-			)}/${response.new_folder || ""}`;
+			const fullPath = `${this.devFolder.replace(/\\/g, "/")}/${
+				response.new_folder || ""
+			}`;
 
 			const resultData = {
 				success: true,
@@ -2646,10 +2741,7 @@ export class FileWatcher {
 			};
 
 			// Write result
-			await vsWriteFile(
-				resultFile,
-				JSON.stringify(resultData, null, 2)
-			);
+			await vsWriteFile(resultFile, JSON.stringify(resultData, null, 2));
 
 			this.debugLogger.log(
 				`📝 [Folder Auto-Create] Notification written to: ${resultFile}`
@@ -2666,141 +2758,6 @@ export class FileWatcher {
 	}
 
 	/**
-	 * Redirect a duplicate folder (AI recreated old folder after rename)
-	 * Moves content to existing folder and deletes duplicate
-	 */
-	private async redirectDuplicateFolder(
-		duplicateFolderPath: string,
-		renameInfo: {
-			newFolder: string;
-			postId: number;
-			timestamp: number;
-		},
-		postTypeFolder: string
-	) {
-		try {
-			const oldFolderName =
-				path.basename(duplicateFolderPath);
-			const targetFolderPath = duplicateFolderPath.replace(
-				`/${oldFolderName}`,
-				`/${renameInfo.newFolder}`
-			);
-
-			this.debugLogger.log(
-				`🔄 [Redirect] Moving duplicate "${oldFolderName}" content to "${renameInfo.newFolder}"`
-			);
-
-			// Check if target folder exists
-			const targetExists = await vsExists(targetFolderPath);
-			if (!targetExists) {
-				this.debugLogger.log(
-					`⚠️ [Redirect] Target folder doesn't exist: ${renameInfo.newFolder}`
-				);
-				return;
-			}
-
-			// Read contents of duplicate folder
-			const duplicateContents = await vsReadDir(
-				duplicateFolderPath
-			);
-
-			// Copy each file from duplicate to target (overwriting)
-			for (const [fileName, fileType] of duplicateContents) {
-				if (fileType === vscode.FileType.File) {
-					const srcPath = posixJoin(
-						duplicateFolderPath,
-						fileName
-					);
-					// Rename files to match target folder name
-					const newFileName = fileName.replace(
-						new RegExp(`^${oldFolderName}`),
-						renameInfo.newFolder
-					);
-					const destPath = posixJoin(
-						targetFolderPath,
-						newFileName
-					);
-
-					try {
-						const content =
-							await vsReadFile(
-								srcPath
-							);
-						await vsWriteFile(
-							destPath,
-							content
-						);
-						this.debugLogger.log(
-							`   ✅ Merged: ${fileName} → ${newFileName}`
-						);
-					} catch (err: any) {
-						this.debugLogger.log(
-							`   ⚠️ Could not merge ${fileName}: ${err.message}`
-						);
-					}
-				}
-			}
-
-			// Delete the duplicate folder
-			try {
-				await vscode.workspace.fs.delete(
-					pathToUri(duplicateFolderPath),
-					{ recursive: true }
-				);
-				this.debugLogger.log(
-					`🗑️ [Redirect] Deleted duplicate folder: ${oldFolderName}`
-				);
-			} catch (deleteErr: any) {
-				this.debugLogger.log(
-					`⚠️ [Redirect] Could not delete duplicate folder: ${deleteErr.message}`
-				);
-			}
-
-			// Write notification so AI knows where the files went
-			// Determine correct path based on post type
-			let basePath: string;
-			if (postTypeFolder === "wp_template") {
-				basePath = "templates";
-			} else if (postTypeFolder === "wp_template_part") {
-				basePath = "parts";
-			} else {
-				basePath = `post-types/${postTypeFolder}`;
-			}
-
-			await this.writePostCreationNotification(
-				{
-					post_id: renameInfo.postId,
-					new_folder: `${basePath}/${renameInfo.newFolder}`,
-					slug: renameInfo.newFolder.replace(
-						/_\d+$/,
-						""
-					),
-				},
-				postTypeFolder === "pages"
-					? "page"
-					: postTypeFolder === "posts"
-					? "post"
-					: postTypeFolder
-			);
-
-			// IMPORTANT: Clear the tracking after successful merge
-			// This allows future folders with the same name to create NEW posts
-			this.recentlyRenamedFolders.delete(oldFolderName);
-			this.debugLogger.log(
-				`🧹 [Redirect] Cleared rename tracking for "${oldFolderName}"`
-			);
-
-			vscode.window.showInformationMessage(
-				`🔄 Merged duplicate folder "${oldFolderName}" into existing "${renameInfo.newFolder}"`
-			);
-		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ [Redirect] Failed to redirect duplicate folder: ${error.message}`
-			);
-		}
-	}
-
-	/**
 	 * Handle file rename in open editors
 	 * Closes old file if open and opens new file
 	 */
@@ -2813,51 +2770,27 @@ export class FileWatcher {
 
 		try {
 			// Build paths
-			const newFolderPath = posixJoin(
-				this.devFolder,
-				newRelativePath
-			);
+			const newFolderPath = posixJoin(this.devFolder, newRelativePath);
 			const newFolderName = path.basename(newFolderPath);
-			const newHtmlPath = posixJoin(
-				newFolderPath,
-				`${newFolderName}.html`
-			);
+			const newHtmlPath = posixJoin(newFolderPath, `${newFolderName}.html`);
 
 			// Find any open editors with files from the old folder
-			const oldFolderPathNormalized = oldFolderPath.replace(
-				/\\/g,
-				"/"
-			);
+			const oldFolderPathNormalized = oldFolderPath.replace(/\\/g, "/");
 
 			for (const tabGroup of vscode.window.tabGroups.all) {
 				for (const tab of tabGroup.tabs) {
-					if (
-						tab.input instanceof
-						vscode.TabInputText
-					) {
+					if (tab.input instanceof vscode.TabInputText) {
 						const uri = tab.input.uri;
-						const uriPath =
-							uri.fsPath.replace(
-								/\\/g,
-								"/"
-							);
+						const uriPath = uri.fsPath.replace(/\\/g, "/");
 
 						// Check if this file was from the old folder
-						if (
-							uriPath.startsWith(
-								oldFolderPathNormalized
-							)
-						) {
+						if (uriPath.startsWith(oldFolderPathNormalized)) {
 							this.debugLogger.log(
-								`📂 Closing old file: ${path.basename(
-									uriPath
-								)}`
+								`📂 Closing old file: ${path.basename(uriPath)}`
 							);
 
 							// Close the old tab
-							await vscode.window.tabGroups.close(
-								tab
-							);
+							await vscode.window.tabGroups.close(tab);
 						}
 					}
 				}
@@ -2865,10 +2798,8 @@ export class FileWatcher {
 
 			// Open the new file (using VS Code FS API for SSH compatibility)
 			if (await vsExists(newHtmlPath)) {
-				this.debugLogger.log(
-					`📂 Opening new file: ${newFolderName}.html`
-				);
-				const newUri = vscode.Uri.file(newHtmlPath);
+				this.debugLogger.log(`📂 Opening new file: ${newFolderName}.html`);
+				const newUri = pathToUri(newHtmlPath);
 				await vscode.window.showTextDocument(newUri);
 			}
 		} catch (error: any) {
@@ -2895,152 +2826,163 @@ export class FileWatcher {
 	}
 
 	/**
-	 * Scan post-types directory for existing folders without IDs
-	 * Creates WordPress posts for any that don't exist yet
-	 * Uses VS Code's workspace.fs API for SSH compatibility
+	 * Scan a content directory for existing folders without linked WordPress posts.
+	 * Handles all structures:
+	 *   post-types/[type]/[slug]   → page, post, etc.
+	 *   templates/[slug]           → wp_template
+	 *   parts/[slug]               → wp_template_part
+	 *   patterns/[synced|unsynced]/[slug] → wp_block
 	 */
-	private async scanForNewFolders(postTypesPath: string) {
-		this.debugLogger.log(
-			"🔍 Scanning for folders without post IDs..."
-		);
+	private async scanForNewFolders(rootPath: string) {
+		const devNorm = this.devFolder.replace(/\\/g, "/").replace(/\/$/, "");
+		const rootNorm = rootPath.replace(/\\/g, "/").replace(/\/$/, "");
+		const rootLabel = rootNorm.replace(devNorm + "/", "");
+
+		this.debugLogger.log(`🔍 Scanning ${rootLabel} for unlinked folders...`);
 
 		try {
-			// Get all post type subdirectories (pages, posts, etc.) using VS Code FS API
-			const postTypeDirEntries = await vsReadDir(
-				postTypesPath
-			);
-			const postTypeDirs = postTypeDirEntries.filter(
-				([name, type]) =>
-					type === vscode.FileType.Directory &&
-					!name.startsWith(".") &&
-					name !== "_trash"
-			);
-
-			if (postTypeDirs.length === 0) {
+			if (!(await vsExists(rootPath))) {
 				this.debugLogger.log(
-					"   ℹ️ No post-type folders found (pages, posts, etc.)"
+					`   ℹ️ ${rootLabel} folder does not exist, skipping`
 				);
 				return;
+			}
+
+			// Collect content-folder candidates: { absolutePath, relativePath, postType }
+			const candidates: Array<{
+				absPath: string;
+				relPath: string;
+				postType: string;
+			}> = [];
+
+			const topEntries = await vsReadDir(rootPath);
+			const topDirs = topEntries.filter(
+				([n, t]) =>
+					t === vscode.FileType.Directory &&
+					!n.startsWith(".") &&
+					n !== "_trash" &&
+					n !== "block-styles"
+			);
+
+			if (rootLabel === "post-types") {
+				// Two levels: post-types/pages/slug
+				for (const [typeDirName] of topDirs) {
+					const typePath = posixJoin(rootPath, typeDirName);
+					const postType = this.mapFolderToPostType(typeDirName);
+					const slugEntries = await vsReadDir(typePath);
+					for (const [slug, sType] of slugEntries) {
+						if (
+							sType !== vscode.FileType.Directory ||
+							slug.startsWith(".") ||
+							slug === "_trash" ||
+							slug === "block-styles"
+						)
+							continue;
+						candidates.push({
+							absPath: posixJoin(typePath, slug),
+							relPath: `post-types/${typeDirName}/${slug}`,
+							postType,
+						});
+					}
+				}
+			} else if (rootLabel === "templates") {
+				for (const [slug] of topDirs) {
+					candidates.push({
+						absPath: posixJoin(rootPath, slug),
+						relPath: `templates/${slug}`,
+						postType: "wp_template",
+					});
+				}
+			} else if (rootLabel === "parts") {
+				for (const [slug] of topDirs) {
+					candidates.push({
+						absPath: posixJoin(rootPath, slug),
+						relPath: `parts/${slug}`,
+						postType: "wp_template_part",
+					});
+				}
+			} else if (rootLabel === "patterns") {
+				// Two levels: patterns/synced/slug or patterns/unsynced/slug
+				for (const [syncDir] of topDirs) {
+					if (syncDir !== "synced" && syncDir !== "unsynced") continue;
+					const syncPath = posixJoin(rootPath, syncDir);
+					const slugEntries = await vsReadDir(syncPath);
+					for (const [slug, sType] of slugEntries) {
+						if (
+							sType !== vscode.FileType.Directory ||
+							slug.startsWith(".") ||
+							slug === "_trash"
+						)
+							continue;
+						candidates.push({
+							absPath: posixJoin(syncPath, slug),
+							relPath: `patterns/${syncDir}/${slug}`,
+							postType: "wp_block",
+						});
+					}
+				}
 			}
 
 			let foundCount = 0;
 			let createdCount = 0;
 
-			for (const [postTypeDirName] of postTypeDirs) {
-				const postTypePath = posixJoin(
-					postTypesPath,
-					postTypeDirName
+			for (const { absPath, relPath, postType } of candidates) {
+				const folderName = path.basename(absPath);
+
+				// Skip if already has _ID suffix
+				if (/_\d+$/.test(folderName)) continue;
+
+				// Skip if already processed
+				if (this.processedNewFolders.has(absPath)) continue;
+
+				// Skip if already in metadata (has a linked post)
+				let alreadyLinked = false;
+				for (const [, meta] of this.metadataCache.entries()) {
+					if (meta.slug === folderName) {
+						alreadyLinked = true;
+						break;
+					}
+				}
+				if (alreadyLinked) continue;
+
+				// Must have an HTML file
+				const files = await vsReadDir(absPath);
+				const hasHtml = files.some(
+					([n, t]) => t === vscode.FileType.File && n.endsWith(".html")
 				);
-				const postType =
-					this.mapFolderToPostType(
-						postTypeDirName
-					);
+				if (!hasHtml) continue;
 
-				// Get content folders within this post type (using VS Code FS API)
-				const contentFolderEntries = await vsReadDir(
-					postTypePath
-				);
-				const contentFolders =
-					contentFolderEntries.filter(
-						([name, type]) =>
-							type ===
-								vscode.FileType
-									.Directory &&
-							!name.startsWith(".") &&
-							name !== "_trash" &&
-							name !== "block-styles"
-					);
+				foundCount++;
+				this.debugLogger.log(`   📁 Unlinked folder: ${relPath}`);
 
-				for (const [folderName] of contentFolders) {
-					const folderPath = posixJoin(
-						postTypePath,
-						folderName
+				try {
+					const response = await this.restClient.createPostFromFolder(
+						relPath,
+						postType
 					);
-
-					// Skip if already has _ID suffix
-					if (/_\d+$/.test(folderName)) {
-						continue;
-					}
-
-					// Check if has HTML file (using VS Code FS API)
-					const files = await vsReadDir(
-						folderPath
-					);
-					const hasHtml = files.some(
-						([name, type]) =>
-							type ===
-								vscode.FileType
-									.File &&
-							name.endsWith(".html")
-					);
-
-					if (!hasHtml) {
+					if (response.success && response.post_id) {
+						createdCount++;
+						this.processedNewFolders.add(absPath);
 						this.debugLogger.log(
-							`   ⏭️ Skipping ${folderName} (no HTML file)`
+							`   ✅ Created ${postType} "${response.title}" (ID: ${response.post_id})`
 						);
-						continue;
+					} else {
+						this.debugLogger.log(`   ⚠️ Could not create: ${response.error}`);
 					}
-
-					foundCount++;
-					this.debugLogger.log(
-						`   📁 Found new folder: ${postTypeDirName}/${folderName}`
-					);
-
-					// Build relative path for API call
-					const relativePath = `post-types/${postTypeDirName}/${folderName}`;
-
-					// Create the post
-					try {
-						const response =
-							await this.restClient.createPostFromFolder(
-								relativePath,
-								postType
-							);
-
-						if (
-							response.success &&
-							response.post_id
-						) {
-							createdCount++;
-							this.debugLogger.log(
-								`   ✅ Created ${postType} "${response.title}" (ID: ${response.post_id})`
-							);
-
-							// Mark as processed
-							this.processedNewFolders.add(
-								folderPath
-							);
-						} else {
-							this.debugLogger.log(
-								`   ⚠️ Could not create: ${response.error}`
-							);
-						}
-					} catch (error: any) {
-						this.debugLogger.log(
-							`   ❌ Error creating post: ${error.message}`
-						);
-					}
+				} catch (error: any) {
+					this.debugLogger.log(`   ❌ Error creating post: ${error.message}`);
 				}
 			}
 
 			if (foundCount === 0) {
-				this.debugLogger.log(
-					"   ✅ No new folders found (all have post IDs)"
-				);
+				this.debugLogger.log(`   ✅ No unlinked folders in ${rootLabel}`);
 			} else {
 				this.debugLogger.log(
-					`🔍 Scan complete: ${createdCount}/${foundCount} posts created`
+					`🔍 Scan ${rootLabel}: ${createdCount}/${foundCount} posts created`
 				);
-
-				// Log to output only, no popup
-				if (createdCount > 0) {
-					this.debugLogger.log(
-						`✅ Created ${createdCount} new WordPress post(s) from dev folder`
-					);
-				}
 			}
 		} catch (error: any) {
-			this.debugLogger.log(`❌ Scan error: ${error.message}`);
+			this.debugLogger.log(`❌ Scan error in ${rootLabel}: ${error.message}`);
 		}
 	}
 
@@ -3051,8 +2993,7 @@ export class FileWatcher {
 	private async startThemeWatcher() {
 		try {
 			// Get theme path from WordPress
-			const assetStatus =
-				await this.restClient.getAssetStatus();
+			const assetStatus = await this.restClient.getAssetStatus();
 			this.themePath = assetStatus.theme_path;
 
 			if (!this.themePath) {
@@ -3095,9 +3036,7 @@ export class FileWatcher {
 			});
 
 			this.themeWatcher.on("error", (error) => {
-				this.debugLogger.log(
-					`❌ Theme watcher error: ${error.message}`
-				);
+				this.debugLogger.log(`❌ Theme watcher error: ${error.message}`);
 			});
 
 			this.debugLogger.log(
@@ -3107,9 +3046,7 @@ export class FileWatcher {
 			this.debugLogger.log(
 				`⚠️ Could not start theme watcher: ${error.message}`
 			);
-			this.debugLogger.log(
-				"   Bi-directional sync will be disabled"
-			);
+			this.debugLogger.log("   Bi-directional sync will be disabled");
 		}
 	}
 
@@ -3119,8 +3056,7 @@ export class FileWatcher {
 	private async handleThemeAssetChange(filePath: string) {
 		const fileName = path.basename(filePath);
 		const normalizedPath = filePath.replace(/\\/g, "/");
-		const themePathNormalized =
-			this.themePath?.replace(/\\/g, "/") || "";
+		const themePathNormalized = this.themePath?.replace(/\\/g, "/") || "";
 
 		// Get relative path from theme folder
 		const relativePath = themePathNormalized
@@ -3129,39 +3065,32 @@ export class FileWatcher {
 
 		// Check cooldown - don't sync if we just synced TO theme (prevent circular sync)
 		const now = Date.now();
-		const lastSync =
-			this.lastThemeSyncTime.get(normalizedPath) || 0;
+		const lastSync = this.lastThemeSyncTime.get(normalizedPath) || 0;
 		const timeSinceLastSync = now - lastSync;
 
 		if (timeSinceLastSync < this.themeSyncCooldownMs) {
 			this.debugLogger.log(
 				`⏸️ Skipping theme→dev sync (cooldown: ${Math.round(
-					(this.themeSyncCooldownMs -
-						timeSinceLastSync) /
-						1000
+					(this.themeSyncCooldownMs - timeSinceLastSync) / 1000
 				)}s remaining)`
 			);
 			return;
 		}
 
 		// Determine file type for logging
-		let fileType = "file";
-		if (relativePath.startsWith("assets/css/")) fileType = "CSS";
+	let fileType = "file";
+	if (relativePath.startsWith("acf-json/")) fileType = "ACF JSON";
+	else if (relativePath.startsWith("taxonomies/")) fileType = "taxonomy JSON";
+	else if (relativePath.startsWith("assets/css/")) fileType = "CSS";
 		else if (relativePath.startsWith("assets/js/")) fileType = "JS";
 		else if (relativePath.startsWith("assets/")) fileType = "asset";
-		else if (relativePath.startsWith("includes/"))
-			fileType = "PHP include";
-		else if (relativePath.startsWith("templates/"))
-			fileType = "template";
-		else if (relativePath.startsWith("parts/"))
-			fileType = "template part";
-		else if (relativePath.startsWith("patterns/"))
-			fileType = "pattern";
+		else if (relativePath.startsWith("includes/")) fileType = "PHP include";
+		else if (relativePath.startsWith("templates/")) fileType = "template";
+		else if (relativePath.startsWith("parts/")) fileType = "template part";
+		else if (relativePath.startsWith("patterns/")) fileType = "pattern";
 		else if (fileName === "theme.json") fileType = "theme config";
-		else if (fileName === "style.css")
-			fileType = "theme stylesheet";
-		else if (fileName === "functions.php")
-			fileType = "theme functions";
+		else if (fileName === "style.css") fileType = "theme stylesheet";
+		else if (fileName === "functions.php") fileType = "theme functions";
 
 		this.debugLogger.log(
 			`🔄 Theme ${fileType} changed: ${relativePath}, syncing to dev folder...`
@@ -3191,30 +3120,20 @@ export class FileWatcher {
 			this.statusBar.showSyncing(`${fileName} → dev`);
 
 			// Sync from theme to dev folder
-			const response =
-				await this.restClient.syncAssetsFromTheme();
+			const response = await this.restClient.syncAssetsFromTheme();
 
 			// Record sync time to prevent circular sync
-			this.lastThemeSyncTime.set(
-				filePath.replace(/\\/g, "/"),
-				Date.now()
-			);
+			this.lastThemeSyncTime.set(filePath.replace(/\\/g, "/"), Date.now());
 
 			if (response.success) {
-				this.statusBar.showSuccess(
-					`${fileName} synced to dev`
-				);
-				this.debugLogger.log(
-					`✅ ${fileName} synced from theme to dev folder`
-				);
+				this.statusBar.showSuccess(`${fileName} synced to dev`);
+				this.debugLogger.log(`✅ ${fileName} synced from theme to dev folder`);
 
 				// Show notification if enabled
 				// No popup notification - status bar shows connection
 			}
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Theme→dev sync error: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Theme→dev sync error: ${error.message}`);
 		}
 	}
 
@@ -3238,22 +3157,30 @@ export class FileWatcher {
 			`🔍 [Handle Trash] Processing ${eventType} for: ${normalizedPath}`
 		);
 
-		// Check if this is a post type folder (contains _ID suffix pattern)
 		const folderName = path.basename(normalizedPath);
-		const postIdMatch = folderName.match(/_(\d+)$/);
 
-		if (!postIdMatch) {
-			// Not a post folder (doesn't have _ID suffix), skip
+		// Resolve post ID: try _ID suffix first, then metadata cache
+		let postId: number | null = null;
+		const postIdMatch = folderName.match(/_(\d+)$/);
+		if (postIdMatch) {
+			postId = parseInt(postIdMatch[1], 10);
+		} else {
+			for (const [pid, meta] of this.metadataCache.entries()) {
+				if (meta.slug === folderName) {
+					postId = pid;
+					break;
+				}
+			}
+		}
+
+		if (!postId) {
 			this.debugLogger.log(
-				`🔍 [Handle Trash] Skipping - no _ID suffix in: ${folderName}`
+				`🔍 [Handle Trash] Skipping - cannot resolve post ID for: ${folderName}`
 			);
 			return;
 		}
 
-		const postId = parseInt(postIdMatch[1], 10);
-		this.debugLogger.log(
-			`🔍 [Handle Trash] Found Post ID: ${postId}`
-		);
+		this.debugLogger.log(`🔍 [Handle Trash] Found Post ID: ${postId}`);
 
 		// Check if this folder is inside a _trash directory
 		const isInTrash = normalizedPath.includes("/_trash/");
@@ -3267,8 +3194,7 @@ export class FileWatcher {
 			// This could be: (1) start of rename, (2) completion of rename (DELETE after CREATE)
 
 			// Check if there's a pending restore for this post - if so, it was a rename!
-			const pendingRestore =
-				this.pendingRestoreTimers.get(postId);
+			const pendingRestore = this.pendingRestoreTimers.get(postId);
 			if (pendingRestore) {
 				clearTimeout(pendingRestore);
 				this.pendingRestoreTimers.delete(postId);
@@ -3292,12 +3218,8 @@ export class FileWatcher {
 
 			// Clear after 3 seconds
 			setTimeout(() => {
-				const tracked =
-					this.recentFolderDeletes.get(postId);
-				if (
-					tracked &&
-					Date.now() - tracked.timestamp >= 3000
-				) {
+				const tracked = this.recentFolderDeletes.get(postId);
+				if (tracked && Date.now() - tracked.timestamp >= 3000) {
 					this.recentFolderDeletes.delete(postId);
 				}
 			}, 3100);
@@ -3322,16 +3244,15 @@ export class FileWatcher {
 		} else if (
 			eventType === "add" &&
 			!isInTrash &&
-			normalizedPath.includes("/post-types/")
+			(normalizedPath.includes("/post-types/") ||
+				normalizedPath.includes("/templates/") ||
+				normalizedPath.includes("/parts/") ||
+				normalizedPath.includes("/patterns/"))
 		) {
 			// Folder appeared OUTSIDE _trash in post-types
 			// Check if this is a rename (DELETE came first)
-			const recentDelete =
-				this.recentFolderDeletes.get(postId);
-			if (
-				recentDelete &&
-				Date.now() - recentDelete.timestamp < 3000
-			) {
+			const recentDelete = this.recentFolderDeletes.get(postId);
+			if (recentDelete && Date.now() - recentDelete.timestamp < 3000) {
 				// DELETE came first → this is a rename (DELETE→CREATE)
 				this.debugLogger.log(
 					`🔄 [Handle Trash] RENAME detected (DELETE→CREATE): ${path.basename(
@@ -3345,65 +3266,19 @@ export class FileWatcher {
 				return;
 			}
 
-			// Check if this folder was just created by OUR rename operation (not a restore)
-			// Look through recentlyRenamedFolders to see if this is the NEW folder we just created
-			for (const [
-				oldName,
-				renameInfo,
-			] of this.recentlyRenamedFolders.entries()) {
-				if (
-					renameInfo.newFolder === folderName &&
-					renameInfo.postId === postId
-				) {
-					const ageMs =
-						Date.now() -
-						renameInfo.timestamp;
-					if (ageMs < 30000) {
-						// Within last 30 seconds
-						this.debugLogger.log(
-							`🔄 [Handle Trash] Skipping - this is our own rename: ${oldName} → ${folderName}`
-						);
-						return;
-					}
-				}
-			}
-
 			// No recent delete - might be restore, but wait to see if DELETE follows
 			this.debugLogger.log(
 				`🔍 [Handle Trash] Folder appeared outside trash - waiting to detect rename pattern...`
 			);
 
 			// Schedule a delayed restore (can be cancelled if DELETE arrives)
-			const existingTimer =
-				this.pendingRestoreTimers.get(postId);
+			const existingTimer = this.pendingRestoreTimers.get(postId);
 			if (existingTimer) {
 				clearTimeout(existingTimer);
 			}
 
 			const timer = setTimeout(() => {
 				this.pendingRestoreTimers.delete(postId);
-
-				// Double-check if this was our rename before triggering restore
-				for (const [
-					oldName,
-					renameInfo,
-				] of this.recentlyRenamedFolders.entries()) {
-					if (
-						renameInfo.newFolder ===
-							folderName &&
-						renameInfo.postId === postId
-					) {
-						const ageMs =
-							Date.now() -
-							renameInfo.timestamp;
-						if (ageMs < 30000) {
-							this.debugLogger.log(
-								`🔄 [Handle Trash] Skipping restore - this was our rename: ${oldName} → ${folderName}`
-							);
-							return;
-						}
-					}
-				}
 
 				this.debugLogger.log(
 					`♻️ Detected restore (no DELETE followed): ${folderName} (Post ID: ${postId})`
@@ -3421,9 +3296,7 @@ export class FileWatcher {
 
 		if (!action) {
 			// Not a trash-related action, skip
-			this.debugLogger.log(
-				`🔍 [Handle Trash] Skipping - no action determined`
-			);
+			this.debugLogger.log(`🔍 [Handle Trash] Skipping - no action determined`);
 			return;
 		}
 
@@ -3444,16 +3317,13 @@ export class FileWatcher {
 
 		// Check cooldown - don't process if we just processed this post
 		const now = Date.now();
-		const lastActionTime =
-			this.lastFolderActionTime.get(postId) || 0;
+		const lastActionTime = this.lastFolderActionTime.get(postId) || 0;
 		const timeSinceLastAction = now - lastActionTime;
 
 		if (timeSinceLastAction < this.folderActionCooldownMs) {
 			this.debugLogger.log(
 				`⏸️ Skipping folder action (cooldown: ${Math.round(
-					(this.folderActionCooldownMs -
-						timeSinceLastAction) /
-						1000
+					(this.folderActionCooldownMs - timeSinceLastAction) / 1000
 				)}s remaining)`
 			);
 			return;
@@ -3472,26 +3342,20 @@ export class FileWatcher {
 			const pendingActions = this.folderActionTimers.size;
 			if (pendingActions > 5) {
 				// Multiple folder actions queued - confirm with user
-				const actionVerb =
-					action === "trash"
-						? "trash"
-						: "restore";
-				const choice =
-					await vscode.window.showWarningMessage(
-						`⚠️ Bulk Operation Detected\n\n${pendingActions} folders will be ${actionVerb}ed in WordPress.\n\nContinue?`,
-						{ modal: true },
-						"Yes, Continue",
-						"Cancel All"
-					);
+				const actionVerb = action === "trash" ? "trash" : "restore";
+				const choice = await vscode.window.showWarningMessage(
+					`⚠️ Bulk Operation Detected\n\n${pendingActions} folders will be ${actionVerb}ed in WordPress.\n\nContinue?`,
+					{ modal: true },
+					"Yes, Continue",
+					"Cancel All"
+				);
 
 				if (choice !== "Yes, Continue") {
 					// Cancel all pending actions
 					this.debugLogger.log(
 						`❌ User cancelled bulk ${action} operation (${pendingActions} pending)`
 					);
-					this.folderActionTimers.forEach((t) =>
-						clearTimeout(t)
-					);
+					this.folderActionTimers.forEach((t) => clearTimeout(t));
 					this.folderActionTimers.clear();
 					return;
 				}
@@ -3515,48 +3379,28 @@ export class FileWatcher {
 		action: "trash" | "restore"
 	) {
 		try {
-			this.debugLogger.log(
-				`📤 Sending ${action} action for post ${postId}...`
-			);
+			this.debugLogger.log(`📤 Sending ${action} action for post ${postId}...`);
 
 			// Send folder action to WordPress
-			const response = await this.restClient.sendFolderAction(
-				postId,
-				action
-			);
+			const response = await this.restClient.sendFolderAction(postId, action);
 
 			// Record action time AFTER successful action
 			this.lastFolderActionTime.set(postId, Date.now());
 
 			if (response.success) {
-				const actionVerb =
-					action === "trash"
-						? "trashed"
-						: "restored";
-				this.debugLogger.log(
-					`✅ Post ${postId} ${actionVerb} successfully`
-				);
+				const actionVerb = action === "trash" ? "trashed" : "restored";
+				this.debugLogger.log(`✅ Post ${postId} ${actionVerb} successfully`);
 
 				// Show notification
-				const config =
-					vscode.workspace.getConfiguration(
-						"skylit"
-					);
-				if (
-					config.get<boolean>(
-						"showNotifications",
-						true
-					)
-				) {
+				const config = vscode.workspace.getConfiguration("skylit");
+				if (config.get<boolean>("showNotifications", true)) {
 					vscode.window.showInformationMessage(
 						`✅ Post ${postId} ${actionVerb} in WordPress`
 					);
 				}
 			}
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Folder action error: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Folder action error: ${error.message}`);
 			vscode.window.showErrorMessage(
 				`Failed to ${action} post ${postId}: ${error.message}`
 			);
@@ -3569,107 +3413,245 @@ export class FileWatcher {
 	 */
 	private async handleThemeFileChange(filePath: string) {
 		const fileName = path.basename(filePath);
+		// Normalize BOTH paths to forward slashes for comparison
 		const normalizedPath = filePath.replace(/\\/g, "/");
 		const devFolderNormalized = this.devFolder.replace(/\\/g, "/");
 
-		// Get relative path from dev folder
-		const relativePath = normalizedPath.replace(
-			devFolderNormalized + "/",
-			""
-		);
+		// Get relative path from dev folder - ensure devFolder ends with /
+		const devFolderWithSlash = devFolderNormalized.endsWith("/")
+			? devFolderNormalized
+			: devFolderNormalized + "/";
 
-		// Check cooldown - prevent circular sync
+		let relativePath = normalizedPath;
+		if (normalizedPath.startsWith(devFolderWithSlash)) {
+			relativePath = normalizedPath.substring(devFolderWithSlash.length);
+		}
+
+	const isAcfJson = relativePath.startsWith("acf-json/");
+	const isTaxonomyJson = relativePath.startsWith("taxonomies/") && relativePath.endsWith(".json");
+	const isContentPostType =
+			relativePath.startsWith("templates/") ||
+			relativePath.startsWith("parts/") ||
+			relativePath.startsWith("patterns/");
+		const isAssetOrInclude =
+			relativePath.startsWith("assets/") ||
+			relativePath.startsWith("includes/") ||
+			relativePath.startsWith("theme/") ||
+			relativePath === "theme.json" ||
+			relativePath === "style.css" ||
+			relativePath === "functions.php" ||
+			isContentPostType;
+
+		// Same-machine mode: templates, parts, patterns are WordPress post types.
+		// Route their file changes through the normal syncFile() flow so they get
+		// imported into WordPress via import-instant — same as pages/posts.
+		// (In remote mode these files are pushed to the server via pushFileToServer below.)
+		if (!this.remoteMode && isContentPostType) {
+			this.handleFileChange(filePath);
+			return;
+		}
+
+	// Remote mode: push ALL theme-related files to server
+	if (this.remoteMode && (isAssetOrInclude || isAcfJson || isTaxonomyJson)) {
 		const now = Date.now();
 		const lastSync = this.lastSyncTime.get(normalizedPath) || 0;
-		const timeSinceLastSync = now - lastSync;
+		if (now - lastSync < this.syncCooldownMs) return;
 
-		if (timeSinceLastSync < this.syncCooldownMs) {
+		this.statusBar.showSyncing(fileName);
+		const pushed = await this.pushFileToServer(filePath);
+		if (pushed) {
+			this.statusBar.showSuccess(`${fileName} pushed to server`);
+			this.debugLogger.log(`✅ ${fileName} pushed to server`);
+		}
+		this.lastSyncTime.set(normalizedPath, Date.now());
+		return;
+	}
+
+	if (!isAcfJson && !isTaxonomyJson) {
+		return;
+	}
+
+	// ── Taxonomy JSON path ──────────────────────────────────────────────────
+	// Use a shared batch debounce — many taxonomy files may change at once
+	if (isTaxonomyJson) {
+		// Guard: skip re-fires caused by the plugin writing taxonomy JSON back to disk
+		// after we just synced it to WP (same-machine mode feedback loop prevention).
+		const taxFileCooldown = this.lastThemeSyncTime.get(normalizedPath) || 0;
+		if (Date.now() - taxFileCooldown < this.acfSyncCooldownMs) {
 			this.debugLogger.log(
-				`⏸️ Skipping dev→theme sync (cooldown: ${Math.round(
-					(this.syncCooldownMs -
-						timeSinceLastSync) /
-						1000
-				)}s remaining)`
+				`⏸️ [Taxonomy] Skipping re-fire (cooldown): ${relativePath}`
 			);
 			return;
 		}
 
-		// Determine file type for logging
-		let fileType = "theme file";
-		if (relativePath.startsWith("assets/css/")) fileType = "CSS";
-		else if (relativePath.startsWith("assets/js/")) fileType = "JS";
-		else if (relativePath.startsWith("assets/")) fileType = "asset";
-		else if (relativePath.startsWith("includes/"))
-			fileType = "PHP include";
-		else if (relativePath.startsWith("templates/"))
-			fileType = "template";
-		else if (relativePath.startsWith("parts/"))
-			fileType = "template part";
-		else if (relativePath.startsWith("patterns/"))
-			fileType = "pattern";
-		else if (fileName === "theme.json") fileType = "theme config";
-		else if (fileName === "style.css")
-			fileType = "theme stylesheet";
-		else if (fileName === "functions.php")
-			fileType = "theme functions";
-
-		this.debugLogger.log(
-			`📦 ${fileType} changed: ${relativePath}, syncing to theme...`
-		);
-
-		try {
-			this.statusBar.showSyncing(fileName);
-
-			// Sync all theme files to theme folder
-			const response =
-				await this.restClient.syncAssetsToTheme();
-
-			// Record sync time
-			this.lastSyncTime.set(normalizedPath, Date.now());
-
-			// Mark corresponding theme file
-			if (this.themePath) {
-				const themeFilePath =
-					this.themePath.replace(/\\/g, "/") +
-					"/" +
-					relativePath;
-				this.lastThemeSyncTime.set(
-					themeFilePath,
-					Date.now()
-				);
-			}
-
-			if (response.success) {
-				this.statusBar.showSuccess(
-					`${fileName} synced`
-				);
-				this.debugLogger.log(
-					`✅ ${relativePath} synced to theme`
-				);
-
-				const config =
-					vscode.workspace.getConfiguration(
-						"skylit"
-					);
-				if (
-					config.get<boolean>(
-						"showNotifications",
-						true
-					)
-				) {
-					vscode.window.showInformationMessage(
-						`✅ ${fileName} synced to theme`
-					);
-				}
-			}
-		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Theme sync error: ${error.message}`
-			);
-			vscode.window.showErrorMessage(
-				`Sync failed: ${error.message}`
-			);
+		if (this.taxonomyJsonBatchTimer) {
+			clearTimeout(this.taxonomyJsonBatchTimer);
 		}
+		this.taxonomyJsonBatchTimer = setTimeout(async () => {
+			this.taxonomyJsonBatchTimer = null;
+			const now = Date.now();
+			// Check cooldown against a generic taxonomy key
+			const lastSync = this.lastSyncTime.get("__taxonomy_batch__") || 0;
+			if (now - lastSync < this.syncCooldownMs) return;
+
+			try {
+				this.debugLogger.log(`🗂️ Taxonomy JSON batch sync to WP DB...`);
+				this.statusBar.showSyncing("taxonomy");
+
+				const taxResponse = await this.restClient.syncTaxonomyJsonToWp();
+
+				const taxBatchStamp = Date.now();
+				this.lastSyncTime.set("__taxonomy_batch__", taxBatchStamp);
+
+				// Stamp every taxonomy JSON file so re-fires from the plugin writing them
+				// back (same-machine mode) are suppressed for acfSyncCooldownMs.
+				try {
+					const taxDir = posixJoin(this.devFolder, "taxonomies");
+					const taxEntries = await vscode.workspace.fs.readDirectory(
+						vscode.Uri.file(taxDir)
+					);
+					for (const [name] of taxEntries) {
+						if (!name.endsWith(".json")) continue;
+						const fullPath = posixJoin(taxDir, name);
+						this.lastThemeSyncTime.set(fullPath, taxBatchStamp);
+					}
+				} catch {
+					// taxonomies/ may not exist — safe to ignore
+				}
+
+				if (taxResponse.success) {
+					this.statusBar.showSuccess(`Taxonomy synced`);
+					this.debugLogger.log(`✅ Taxonomy JSON imported to WP DB`);
+
+					const config = vscode.workspace.getConfiguration("skylit");
+					if (config.get<boolean>("showNotifications", true)) {
+						vscode.window.showInformationMessage(
+							`✅ Taxonomy terms synced to WordPress`
+						);
+					}
+				}
+			} catch (error: any) {
+				this.debugLogger.log(`❌ Taxonomy JSON sync error: ${error.message}`);
+				vscode.window.showErrorMessage(`Taxonomy sync failed: ${error.message}`);
+			}
+		}, this.acfJsonBatchDebounceMs);
+		return;
+	}
+
+	// ── ACF JSON path ───────────────────────────────────────────────────────
+	// Guard: skip if this specific file was just written by our own sync
+	// (prevents the loop where ACF's save hooks re-write files we just imported)
+	const acfFileCooldown = this.lastThemeSyncTime.get(normalizedPath) || 0;
+	if (Date.now() - acfFileCooldown < this.acfSyncCooldownMs) {
+		this.debugLogger.log(
+			`⏸️ [ACF] Skipping re-fire (cooldown): ${relativePath}`
+		);
+		return;
+	}
+
+	// Use a shared batch debounce — ACF writes many files simultaneously
+	if (this.acfJsonBatchTimer) {
+		clearTimeout(this.acfJsonBatchTimer);
+	}
+	this.acfJsonBatchTimer = setTimeout(async () => {
+		this.acfJsonBatchTimer = null;
+		const now = Date.now();
+		const lastSync = this.lastSyncTime.get("__acf_batch__") || 0;
+		if (now - lastSync < this.syncCooldownMs) return;
+
+		this.debugLogger.log(`📦 ACF JSON batch sync to theme...`);
+
+	try {
+		this.statusBar.showSyncing("acf-json");
+
+		if (this.remoteMode) {
+			const pushed = await this.pushFileToServer(filePath);
+			if (pushed) {
+				this.statusBar.showSuccess(`acf-json pushed to server`);
+				this.debugLogger.log(`✅ ACF JSON pushed to server theme & DB`);
+			}
+			this.lastSyncTime.set("__acf_batch__", Date.now());
+			return;
+		}
+
+		const acfResponse = await this.restClient.syncAcfJsonToTheme();
+
+		const acfBatchStamp = Date.now();
+		this.lastSyncTime.set("__acf_batch__", acfBatchStamp);
+
+		// Stamp every acf-json file in the dev folder so re-fires from ACF's
+		// own save hooks (acf/update_field_group etc.) are suppressed for
+		// acfSyncCooldownMs (10s) — enough for slow hosts like Hostinger.
+		try {
+			const acfDir = posixJoin(this.devFolder, "acf-json");
+			const acfEntries = await vscode.workspace.fs.readDirectory(
+				vscode.Uri.file(acfDir)
+			);
+			for (const [name] of acfEntries) {
+				if (!name.endsWith(".json")) continue;
+				const fullPath = posixJoin(acfDir, name);
+				this.lastThemeSyncTime.set(fullPath, acfBatchStamp);
+			}
+		} catch {
+			// acf-json/ may not exist yet — safe to ignore
+		}
+
+		if (acfResponse.success) {
+			this.statusBar.showSuccess(`acf-json synced + imported`);
+			this.debugLogger.log(`✅ ACF JSON synced to theme & imported to DB`);
+
+			const config = vscode.workspace.getConfiguration("skylit");
+			if (config.get<boolean>("showNotifications", true)) {
+				vscode.window.showInformationMessage(
+					`✅ ACF JSON synced to theme & imported to ACF`
+				);
+			}
+
+		if (this.aiSkillsetGenerator) {
+				this.aiSkillsetGenerator.generate().catch((err: any) => {
+					this.debugLogger.warn(`📚 Skillset regen after ACF sync failed: ${err.message}`);
+				});
+			}
+		}
+	} catch (error: any) {
+		this.debugLogger.log(`❌ Theme sync error: ${error.message}`);
+		vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
+	}
+	}, this.acfJsonBatchDebounceMs);
+}
+
+	/**
+	 * Enqueue a sync task so import-instant calls are serialized.
+	 * Prevents concurrent PHP requests from crashing on shared hosting.
+	 */
+	private enqueueImport(task: () => Promise<void>): void {
+		this.importQueue.push(task);
+		if (!this.importQueueRunning) {
+			this.drainImportQueue();
+		}
+	}
+
+	private async drainImportQueue(): Promise<void> {
+		if (this.importQueueRunning) return;
+		this.importQueueRunning = true;
+		let first = true;
+		while (this.importQueue.length > 0) {
+			// Wait between requests (except before the very first one) so the
+			// PHP-FPM worker on shared hosting has time to free memory.
+			if (!first) {
+				await new Promise<void>((r) =>
+					setTimeout(r, this.importQueueIntervalMs)
+				);
+			}
+			first = false;
+			const task = this.importQueue.shift()!;
+			try {
+				await task();
+			} catch {
+				// individual task errors are handled inside each task
+			}
+		}
+		this.importQueueRunning = false;
 	}
 
 	/**
@@ -3691,7 +3673,6 @@ export class FileWatcher {
 		const isCss = normalizedPath.includes("/assets/css/");
 		const isJs = normalizedPath.includes("/assets/js/");
 
-		// Check cooldown - don't sync if we just synced FROM theme (prevent circular sync)
 		const now = Date.now();
 		const lastSync = this.lastSyncTime.get(normalizedPath) || 0;
 		const timeSinceLastSync = now - lastSync;
@@ -3699,9 +3680,7 @@ export class FileWatcher {
 		if (timeSinceLastSync < this.syncCooldownMs) {
 			this.debugLogger.log(
 				`⏸️ Skipping dev→theme sync (cooldown: ${Math.round(
-					(this.syncCooldownMs -
-						timeSinceLastSync) /
-						1000
+					(this.syncCooldownMs - timeSinceLastSync) / 1000
 				)}s remaining)`
 			);
 			return;
@@ -3709,45 +3688,65 @@ export class FileWatcher {
 
 		const assetType = isCss ? "CSS" : isJs ? "JS" : "asset";
 		this.debugLogger.log(
-			`📦 ${assetType} asset changed: ${fileName}, syncing to theme...`
+			`📦 ${assetType} asset changed: ${fileName}, syncing to theme + DB...`
 		);
 
 		try {
 			this.statusBar.showSyncing(fileName);
 
-			// Sync assets to theme
-			const response =
-				await this.restClient.syncAssetsToTheme();
+			const types = isCss ? ["css"] : isJs ? ["js"] : ["js", "css"];
+			let dbResult: { success: boolean; updated: Record<string, number>; total: number; message: string } | null = null;
 
-			// Record sync time to prevent circular sync from theme watcher
+			if (this.remoteMode) {
+				const pushed = await this.pushFileToServer(filePath);
+				if (pushed) {
+					this.debugLogger.log(`✅ ${fileName} pushed to server theme`);
+				}
+				const fs = await import("fs");
+				const content = fs.readFileSync(filePath, "utf-8");
+				const devFolderNorm = this.devFolder.replace(/\\/g, "/").replace(/\/$/, "/");
+				const relPath = normalizedPath.replace(devFolderNorm, "");
+				dbResult = await this.restClient.importGlobalAssets(types, { [relPath]: content });
+			} else {
+				await this.restClient.syncAssetsToTheme();
+				dbResult = await this.restClient.importGlobalAssets(types);
+			}
+
+			// Build a descriptive notification message based on actual source mode
+			const dbUpdated = dbResult?.total ?? 0;
+			const sourceMode = isCss ? this.assetSourceModes.css : this.assetSourceModes.js;
+			const isDbMode = sourceMode === "database";
+
+			let destinations: string[];
+			let toastMsg: string;
+
+			if (isDbMode) {
+				destinations = dbUpdated > 0 ? ["theme", "database"] : ["theme"];
+				toastMsg = dbUpdated > 0
+					? `✅ ${fileName} saved to theme + database`
+					: `✅ ${fileName} saved to theme (database already up to date)`;
+			} else {
+				destinations = ["theme"];
+				toastMsg = `✅ ${fileName} saved to theme`;
+			}
+
+			const statusMsg = `${fileName} → ${destinations.join(" + ")}`;
+			this.statusBar.showSuccess(statusMsg, 3000);
+			vscode.window.showInformationMessage(toastMsg);
+			this.debugLogger.log(`✅ ${fileName} synced → ${destinations.join(" + ")}`);
+
 			this.lastSyncTime.set(normalizedPath, Date.now());
 
-			// Also mark the corresponding theme file as recently synced
 			if (this.themePath) {
 				const themeFilePath = normalizedPath.replace(
 					this.devFolder.replace(/\\/g, "/"),
 					this.themePath.replace(/\\/g, "/")
 				);
-				this.lastThemeSyncTime.set(
-					themeFilePath,
-					Date.now()
-				);
-			}
-
-			if (response.success) {
-				this.statusBar.showSuccess(
-					`${fileName} synced to theme`
-				);
-				this.debugLogger.log(
-					`✅ ${fileName} synced to active theme`
-				);
-
-				// No popup notification - status bar is enough
+				this.lastThemeSyncTime.set(themeFilePath, Date.now());
 			}
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Asset sync error: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Asset sync error: ${error.message}`);
+			vscode.window.showErrorMessage(`❌ Failed to sync ${fileName}: ${error.message}`);
 		}
 	}
 
@@ -3759,7 +3758,6 @@ export class FileWatcher {
 		const fileName = path.basename(filePath);
 		const normalizedPath = filePath.replace(/\\/g, "/");
 
-		// Check cooldown - don't sync if we just synced FROM theme (prevent circular sync)
 		const now = Date.now();
 		const lastSync = this.lastSyncTime.get(normalizedPath) || 0;
 		const timeSinceLastSync = now - lastSync;
@@ -3767,54 +3765,118 @@ export class FileWatcher {
 		if (timeSinceLastSync < this.syncCooldownMs) {
 			this.debugLogger.log(
 				`⏸️ Skipping dev→theme PHP sync (cooldown: ${Math.round(
-					(this.syncCooldownMs -
-						timeSinceLastSync) /
-						1000
+					(this.syncCooldownMs - timeSinceLastSync) / 1000
 				)}s remaining)`
 			);
 			return;
 		}
 
 		this.debugLogger.log(
-			`📄 PHP include changed: ${fileName}, syncing to theme...`
+			`📄 PHP include changed: ${fileName}, syncing to theme + DB...`
 		);
 
 		try {
 			this.statusBar.showSyncing(fileName);
 
-			// Sync all assets and includes to theme
-			const response =
-				await this.restClient.syncAssetsToTheme();
+			let dbResult: { success: boolean; updated: Record<string, number>; total: number; message: string } | null = null;
 
-			// Record sync time to prevent circular sync from theme watcher
+			if (this.remoteMode) {
+				const pushed = await this.pushFileToServer(filePath);
+				if (pushed) {
+					this.debugLogger.log(`✅ ${fileName} pushed to server theme`);
+				}
+				const fs = await import("fs");
+				const content = fs.readFileSync(filePath, "utf-8");
+				const devFolderNorm = this.devFolder.replace(/\\/g, "/").replace(/\/$/, "/");
+				const relPath = normalizedPath.replace(devFolderNorm, "");
+				dbResult = await this.restClient.importGlobalAssets(["php"], { [relPath]: content });
+			} else {
+				await this.restClient.syncAssetsToTheme();
+				dbResult = await this.restClient.importGlobalAssets(["php"]);
+			}
+
+			const dbUpdated = dbResult?.total ?? 0;
+			const isDbMode = this.assetSourceModes.php === "database";
+
+			let destinations: string[];
+			let toastMsg: string;
+
+			if (isDbMode) {
+				destinations = dbUpdated > 0 ? ["theme", "database"] : ["theme"];
+				toastMsg = dbUpdated > 0
+					? `✅ ${fileName} saved to theme + database`
+					: `✅ ${fileName} saved to theme (database already up to date)`;
+			} else {
+				destinations = ["theme"];
+				toastMsg = `✅ ${fileName} saved to theme`;
+			}
+
+			const statusMsg = `${fileName} → ${destinations.join(" + ")}`;
+			this.statusBar.showSuccess(statusMsg, 3000);
+			vscode.window.showInformationMessage(toastMsg);
+			this.debugLogger.log(`✅ ${fileName} synced → ${destinations.join(" + ")}`);
+
 			this.lastSyncTime.set(normalizedPath, Date.now());
 
-			// Also mark the corresponding theme file as recently synced
 			if (this.themePath) {
 				const themeFilePath = normalizedPath.replace(
 					this.devFolder.replace(/\\/g, "/"),
 					this.themePath.replace(/\\/g, "/")
 				);
-				this.lastThemeSyncTime.set(
-					themeFilePath,
-					Date.now()
-				);
-			}
-
-			if (response.success) {
-				this.statusBar.showSuccess(
-					`${fileName} synced to theme`
-				);
-				this.debugLogger.log(
-					`✅ ${fileName} synced to active theme`
-				);
-
-				// No popup notification - status bar is enough
+				this.lastThemeSyncTime.set(themeFilePath, Date.now());
 			}
 		} catch (error: any) {
+			this.debugLogger.log(`❌ PHP sync error: ${error.message}`);
+			vscode.window.showErrorMessage(`❌ Failed to sync ${fileName}: ${error.message}`);
+		}
+	}
+
+	/**
+	 * Read a local file and push it to the server theme via REST API.
+	 * Returns the relative path that was pushed, or null on failure.
+	 */
+	private async pushFileToServer(filePath: string): Promise<string | null> {
+		const normalizedPath = filePath.replace(/\\/g, "/");
+		const devFolderNormalized = this.devFolder
+			.replace(/\\/g, "/")
+			.replace(/\/$/, "");
+
+		const relativePath = normalizedPath.startsWith(devFolderNormalized + "/")
+			? normalizedPath.substring(devFolderNormalized.length + 1)
+			: path.basename(normalizedPath);
+
+		try {
+			const isBinary =
+				/\.(png|jpe?g|gif|webp|ico|svg|woff2?|ttf|eot|otf)$/i.test(filePath);
+			let content: string;
+			let encoding: string | undefined;
+
+			if (isBinary) {
+				content = fs.readFileSync(filePath).toString("base64");
+				encoding = "base64";
+			} else {
+				content = fs.readFileSync(filePath, "utf-8");
+			}
+
+			const result = await this.restClient.pushFiles([
+				{ path: relativePath, content, encoding },
+			]);
+
+			if (!result.success) {
+				const failedPaths = (result.errors || [])
+					.map((e: { path: string; error: string }) => e.error)
+					.join("; ");
+				this.debugLogger.log(
+					`⚠️ Push wrote ${result.count} file(s) but had errors: ${failedPaths}`
+				);
+			}
+
+			return relativePath;
+		} catch (error: any) {
 			this.debugLogger.log(
-				`❌ PHP sync error: ${error.message}`
+				`❌ Failed to push ${relativePath}: ${error.message}`
 			);
+			return null;
 		}
 	}
 
@@ -3833,9 +3895,10 @@ export class FileWatcher {
 				normalizedPath === expectedPath ||
 				(normalizedPath.endsWith(`/${rootFile}`) &&
 					!normalizedPath.includes("/assets/") &&
-					!normalizedPath.includes(
-						"/post-types/"
-					))
+					!normalizedPath.includes("/post-types/") &&
+					!normalizedPath.includes("/templates/") &&
+					!normalizedPath.includes("/parts/") &&
+					!normalizedPath.includes("/patterns/"))
 			) {
 				// Make sure it's at the root level (no subdirectories except the dev folder itself)
 				const relativePath = normalizedPath.replace(
@@ -3866,9 +3929,7 @@ export class FileWatcher {
 		if (timeSinceLastSync < this.syncCooldownMs) {
 			this.debugLogger.log(
 				`⏸️ Skipping theme structure sync (cooldown: ${Math.round(
-					(this.syncCooldownMs -
-						timeSinceLastSync) /
-						1000
+					(this.syncCooldownMs - timeSinceLastSync) / 1000
 				)}s remaining)`
 			);
 			return;
@@ -3896,8 +3957,7 @@ export class FileWatcher {
 			this.statusBar.showSyncing(fileName);
 
 			// Sync all theme structure to theme
-			const response =
-				await this.restClient.syncAssetsToTheme();
+			const response = await this.restClient.syncAssetsToTheme();
 
 			// Record sync time
 			this.lastSyncTime.set(normalizedPath, Date.now());
@@ -3908,39 +3968,15 @@ export class FileWatcher {
 					this.devFolder.replace(/\\/g, "/"),
 					this.themePath.replace(/\\/g, "/")
 				);
-				this.lastThemeSyncTime.set(
-					themeFilePath,
-					Date.now()
-				);
+				this.lastThemeSyncTime.set(themeFilePath, Date.now());
 			}
 
 			if (response.success) {
-				this.statusBar.showSuccess(
-					`${fileName} synced to theme`
-				);
-				this.debugLogger.log(
-					`✅ ${fileName} synced to active theme`
-				);
-
-				const config =
-					vscode.workspace.getConfiguration(
-						"skylit"
-					);
-				if (
-					config.get<boolean>(
-						"showNotifications",
-						true
-					)
-				) {
-					vscode.window.showInformationMessage(
-						`✅ ${fileName} synced to theme`
-					);
-				}
+				this.statusBar.showSuccess(`${fileName} → theme`, 3000);
+				this.debugLogger.log(`✅ ${fileName} synced to active theme`);
 			}
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Theme structure sync error: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Theme structure sync error: ${error.message}`);
 		}
 	}
 
@@ -3966,60 +4002,60 @@ export class FileWatcher {
 	 * Sync file to WordPress
 	 */
 	async syncFile(filePath: string) {
+		const profileEnd = this.debugLogger.profileStart("syncFile");
 		try {
+			const normPath = filePath.replace(/\\/g, "/");
+			this.debugLogger.info(
+				`🔄 [syncFile] Starting sync for: ${path.basename(normPath)}`
+			);
+			if (this.pathsWrittenDuringStartup.has(normPath)) {
+				this.debugLogger.info(
+					`⏭️ [syncFile] SKIP: file written during startup (pathsWrittenDuringStartup has ${this.pathsWrittenDuringStartup.size} entries)`
+				);
+				profileEnd("skip: written during startup");
+				return;
+			}
+
 			// Check cooldown - don't sync if we just synced this file
 			const now = Date.now();
 			const lastSync = this.lastSyncTime.get(filePath) || 0;
 			const timeSinceLastSync = now - lastSync;
 
 			if (timeSinceLastSync < this.syncCooldownMs) {
-				this.debugLogger.log(
-					`⏸️ Skipping sync (cooldown: ${Math.round(
-						(this.syncCooldownMs -
-							timeSinceLastSync) /
-							1000
+				this.debugLogger.info(
+					`⏸️ [syncFile] SKIP: cooldown (${Math.round(
+						(this.syncCooldownMs - timeSinceLastSync) / 1000
 					)}s remaining)`
 				);
+				profileEnd("skip: cooldown");
 				return;
 			}
 
 			// Extract post info from file path
-			const postInfo = this.extractPostInfo(filePath);
+			const postInfo = await this.extractPostInfo(filePath);
 			if (!postInfo) {
-				this.debugLogger.log(
-					`⚠️ Cannot extract post info from: ${filePath}`
-				);
+				this.debugLogger.info(`⚠️ [syncFile] SKIP: Cannot extract post info from: ${normPath}`);
+				profileEnd("skip: no post info");
 				return;
 			}
 
 			const { postId, postFolder } = postInfo;
 			const fileName = path.basename(filePath);
+			this.debugLogger.info(
+				`🔄 [syncFile] Resolved post ${postId} from folder: ${path.basename(postFolder)}`
+			);
 
-			// CRITICAL: Check if this change was caused by a recent WordPress export
-			// This prevents circular sync: IDE → WP → Export → IDE detects change → loop
-			try {
-				const checkResult =
-					await this.restClient.checkForChanges(
-						postId
-					);
-				if (checkResult.skip_import) {
-					this.debugLogger.log(
-						`⏭️ Skipping sync (recent export - circular sync prevention)`
-					);
-
-					// WordPress just exported - try to restore folding for unchanged blocks
-					await this.restoreFoldingForUnchangedBlocks(
-						filePath,
-						postId
-					);
-
-					return;
-				}
-			} catch (error) {
-				// If check fails, continue with sync (better to sync than skip)
-				this.debugLogger.log(
-					`⚠️ Could not check export status, proceeding with sync`
+			// Check if this file change was caused by the extension itself
+			// (canonical HTML writeback, startup sync, etc.) — skip only those.
+			// User-initiated IDE saves always proceed to import-instant.
+			const selfWriteTs = this.selfWrittenPaths.get(normPath);
+			if (selfWriteTs && Date.now() - selfWriteTs < 2000) {
+				this.debugLogger.info(
+					`⏭️ [syncFile] SKIP: file was written by extension ${Date.now() - selfWriteTs}ms ago`
 				);
+				await this.restoreFoldingForUnchangedBlocks(filePath, postId);
+				profileEnd("skip: self-written file");
+				return;
 			}
 
 			// Save folding state BEFORE syncing (in case WordPress exports back)
@@ -4033,10 +4069,7 @@ export class FileWatcher {
 				postFolder,
 				`${path.basename(postFolder)}.html`
 			);
-			const cssPath = posixJoin(
-				postFolder,
-				`${path.basename(postFolder)}.css`
-			);
+			const cssPath = posixJoin(postFolder, `${path.basename(postFolder)}.css`);
 
 			let html = "";
 			let css = "";
@@ -4053,61 +4086,202 @@ export class FileWatcher {
 			// Check for metadata changes in HTML comment (slug, title, status)
 			// This enables bidirectional sync: editing metadata in HTML updates WordPress
 			if (html) {
-				const metadataChanged =
-					await this.checkAndSyncHtmlMetadata(
-						postId,
-						html,
-						postFolder
-					);
+				const metadataChanged = await this.checkAndSyncHtmlMetadata(
+					postId,
+					html,
+					postFolder
+				);
 				if (metadataChanged) {
-					// If metadata changed (especially slug), the file path may have changed
-					// Skip the content sync for this call - the rename will trigger another sync
-					this.debugLogger.log(
-						`📝 Metadata changed - skipping content sync (will re-sync after rename)`
+					this.debugLogger.info(
+						`📝 [syncFile] SKIP: metadata changed — will re-sync after rename`
 					);
+					profileEnd("skip: metadata changed");
 					return;
 				}
 			}
 
-			// Sync to WordPress (restClient will handle logging)
-			const response = await this.restClient.syncFile(
-				postId,
-				html,
-				css
+	this.debugLogger.info(
+		`📋 [syncFile] Queued import-instant for post ${postId} (html=${html.length} bytes, css=${css.length} bytes)`
+	);
+
+	// Serialize all import-instant calls through the queue so shared hosting
+	// (Hostinger, etc.) doesn't 500 from concurrent PHP requests.
+	let response!: Awaited<ReturnType<typeof this.restClient.syncFile>>;
+	await new Promise<void>((resolve, reject) => {
+		this.enqueueImport(async () => {
+			// Log at the moment the API call actually fires (after queue wait),
+			// not when the file was read — makes the Output panel timestamps accurate.
+			this.debugLogger.info(
+				`📤 [syncFile] Calling import-instant API for post ${postId} (html=${html.length} bytes, css=${css.length} bytes)...`
 			);
+			// Retry up to 3 times on server errors (500/502/503) — shared hosting
+			// can transiently fail under memory pressure; a short wait usually clears it.
+			const maxRetries = 3;
+			const retryDelayMs = 5000;
+			let lastErr: any;
+			for (let attempt = 1; attempt <= maxRetries; attempt++) {
+				try {
+					response = await this.restClient.syncFile(postId, html, css);
+					resolve();
+					return;
+				} catch (err: any) {
+					lastErr = err;
+					const status = err?.response?.status ?? 0;
+					const isServerError = status >= 500 && status < 600;
+					const isNetworkError = !status && (
+						err?.code === 'ECONNRESET' ||
+						err?.code === 'ETIMEDOUT' ||
+						err?.message?.includes('network')
+					);
+					if ((isServerError || isNetworkError) && attempt < maxRetries) {
+						this.debugLogger.info(
+							`⚠️ [syncFile] HTTP ${status || 'network'} error — retrying in ${retryDelayMs / 1000}s (attempt ${attempt}/${maxRetries})...`
+						);
+						await new Promise<void>((r) => setTimeout(r, retryDelayMs));
+					} else {
+						break;
+					}
+				}
+			}
+			reject(lastErr);
+		});
+	});
 
 			// Record sync time AFTER successful sync
 			this.lastSyncTime.set(filePath, Date.now());
 
+			this.debugLogger.info(
+				`📥 [syncFile] Response: success=${response.success}, blocks_updated=${
+					response.blocks_updated
+				}, content_changed=${(response as any).content_changed}`
+			);
+
+			profileEnd(`post ${postId} success=${response.success}`);
+
 			if (response.success) {
+				const bCount = response.blocks_updated ?? 0;
 				this.statusBar.showSuccess(
-					`Synced ${fileName}`
+					bCount > 0 ? `${fileName} — ${bCount} block${bCount !== 1 ? "s" : ""} updated` : `${fileName} synced`,
+					3000
 				);
 
-				// Show notification if enabled
-				const config =
-					vscode.workspace.getConfiguration(
-						"skylit"
-					);
-				if (
-					config.get<boolean>(
-						"showNotifications",
-						true
-					)
-				) {
-					vscode.window.showInformationMessage(
-						`✅ Synced: ${fileName} (${
-							response.blocks_updated ||
-							0
-						} blocks)`
-					);
+				// Write canonical HTML (with metadata header) back to disk
+				// This ensures the file has the metadata comment header for post ID resolution
+				const canonical = (response as any).canonical_html;
+				if (canonical && typeof canonical === "string") {
+					const norm = filePath.replace(/\\/g, "/");
+					const htmlPath = norm.endsWith(".html")
+						? norm
+						: norm.replace(/\.css$/, ".html");
+					try {
+						const existing = await vsReadFile(htmlPath);
+						if (existing !== canonical) {
+							// Save cursor position before the write so we can restore it
+							let savedLine: number | null = null;
+							for (const ed of vscode.window.visibleTextEditors) {
+								if (ed.document.uri.fsPath.replace(/\\/g, "/") === htmlPath) {
+									savedLine = ed.selection.active.line;
+									break;
+								}
+							}
+
+							this.lastSyncTime.set(htmlPath, Date.now());
+							this.selfWrittenPaths.set(htmlPath, Date.now());
+							await vsWriteFile(htmlPath, canonical);
+							this.debugLogger.log(
+								`📝 Wrote canonical HTML with metadata header: ${path.basename(
+									htmlPath
+								)}`
+							);
+
+							// Restore cursor after VS Code reloads the changed file
+							if (savedLine !== null) {
+								const restoreTo = savedLine;
+								setTimeout(() => {
+									for (const ed of vscode.window.visibleTextEditors) {
+										if (ed.document.uri.fsPath.replace(/\\/g, "/") === htmlPath) {
+											const maxLine = ed.document.lineCount - 1;
+											const line = Math.min(restoreTo, maxLine);
+											const pos = new vscode.Position(line, 0);
+											ed.selection = new vscode.Selection(pos, pos);
+											ed.revealRange(
+												new vscode.Range(pos, pos),
+												vscode.TextEditorRevealType.InCenterIfOutsideViewport
+											);
+											this.debugLogger.log(
+												`🎯 Restored cursor to line ${line + 1} after canonical write`
+											);
+											break;
+										}
+									}
+								}, 300);
+							}
+						}
+					} catch {}
 				}
+
+				const canonicalCss = (response as any).canonical_css;
+				if (canonicalCss && typeof canonicalCss === "string") {
+					const cssPath = filePath
+						.replace(/\\/g, "/")
+						.replace(/\.html$/, ".css");
+					try {
+						const existing = await vsReadFile(cssPath);
+						if (existing !== canonicalCss) {
+							this.lastSyncTime.set(cssPath, Date.now());
+							this.selfWrittenPaths.set(cssPath, Date.now());
+							await vsWriteFile(cssPath, canonicalCss);
+						}
+					} catch {}
+				}
+
+				const config = vscode.workspace.getConfiguration("skylit");
+				if (config.get<boolean>("showNotifications", true)) {
+					const syncSummary = (response as any).sync_summary as string | undefined;
+					const blocksUpdated = response.blocks_updated ?? 0;
+					const contentChanged = (response as any).content_changed;
+					let syncMsg: string;
+					if (syncSummary) {
+						syncMsg = `✅ ${fileName} — ${syncSummary}`;
+					} else if (blocksUpdated > 0) {
+						syncMsg = `✅ ${fileName} synced — ${blocksUpdated} block${blocksUpdated !== 1 ? "s" : ""} updated`;
+					} else if (contentChanged === false) {
+						syncMsg = `✅ ${fileName} synced — no changes`;
+					} else {
+						syncMsg = `✅ ${fileName} synced`;
+					}
+					vscode.window.showInformationMessage(syncMsg);
+				}
+
+				// After canonical HTML is written, format-on-save may reformat the
+				// file, shifting line numbers. Delay then rescan metadata so cursor
+				// sync stays accurate even after formatters run.
+				const rescanPostId = postId;
+				setTimeout(async () => {
+					try {
+						const rescan = await this.restClient.rescanLines(rescanPostId);
+						if (rescan?.success && rescan.blocks) {
+							this.liveBlockLines.set(rescanPostId, rescan.blocks.map(b => ({
+								layoutBlockId: b.layoutBlockId,
+								line: b.line,
+								blockName: b.blockName,
+							})));
+							this.lastCursorBlockId = null;
+							this.debugLogger.info(
+								`📐 [Rescan] Updated ${rescan.count} block lines for post ${rescanPostId}`
+							);
+						}
+					} catch (err: any) {
+						this.debugLogger.log(
+							`📐 [Rescan] Failed for post ${rescanPostId}: ${err.message}`
+						);
+					}
+				}, 800);
 			}
 		} catch (error: any) {
-			this.debugLogger.log(`❌ Sync error: ${error.message}`);
-			vscode.window.showErrorMessage(
-				`Sync failed: ${error.message}`
-			);
+			profileEnd(`error: ${error.message}`);
+			this.debugLogger.info(`❌ [syncFile] ERROR: ${error.message}`);
+			vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
 		}
 	}
 
@@ -4121,13 +4295,10 @@ export class FileWatcher {
 	): Promise<void> {
 		try {
 			// Give VS Code a moment to reload the file
-			await new Promise((resolve) =>
-				setTimeout(resolve, 300)
-			);
+			await new Promise((resolve) => setTimeout(resolve, 300));
 
 			// Fetch block changes from WordPress
-			const blockChanges =
-				await this.restClient.getBlockChanges(postId);
+			const blockChanges = await this.restClient.getBlockChanges(postId);
 
 			if (!blockChanges.success || !blockChanges.has_data) {
 				this.debugLogger.log(
@@ -4136,13 +4307,10 @@ export class FileWatcher {
 				return;
 			}
 
-			const unchangedBlocks =
-				blockChanges.unchanged_blocks || [];
+			const unchangedBlocks = blockChanges.unchanged_blocks || [];
 
 			if (unchangedBlocks.length === 0) {
-				this.debugLogger.log(
-					"📂 No unchanged blocks to restore folds for"
-				);
+				this.debugLogger.log("📂 No unchanged blocks to restore folds for");
 				return;
 			}
 
@@ -4152,57 +4320,92 @@ export class FileWatcher {
 
 			// If file was unchanged, all blocks keep their folding
 			if (blockChanges.file_unchanged) {
-				this.debugLogger.log(
-					"📂 File unchanged - all folding preserved"
-				);
+				this.debugLogger.log("📂 File unchanged - all folding preserved");
 				return;
 			}
 
 			// Restore folding for unchanged blocks
-			await this.foldingManager.restoreFoldingState(
-				filePath,
-				unchangedBlocks
-			);
+			await this.foldingManager.restoreFoldingState(filePath, unchangedBlocks);
 		} catch (error: any) {
 			// Don't fail silently but also don't spam errors
-			this.debugLogger.log(
-				`⚠️ Could not restore folding: ${error.message}`
-			);
+			this.debugLogger.log(`⚠️ Could not restore folding: ${error.message}`);
 		}
 	}
 
 	/**
-	 * Extract post ID and folder from file path
-	 * Format: /post-types/pages/about-us_123/about-us_123.html
+	 * Extract post ID and folder path from a file path.
+	 * Resolution order:
+	 *   1. Legacy slug_ID folder name pattern
+	 *   2. Metadata cache reverse lookup (slug → postId)
+	 *   3. Parse Post ID from HTML metadata comment
 	 */
-	private extractPostInfo(
+	private async extractPostInfo(
 		filePath: string
-	): { postId: number; postFolder: string } | null {
-		// Normalize path
+	): Promise<{ postId: number; postFolder: string } | null> {
 		const normalizedPath = filePath.replace(/\\/g, "/");
 
-		// Determine if this is a file or folder based on extension
-		// Files have extensions like .html, .css, .json
-		const hasExtension = /\.[a-zA-Z0-9]+$/.test(
-			path.basename(normalizedPath)
-		);
-		const folder = hasExtension
-			? path.dirname(normalizedPath)
-			: normalizedPath;
+		const hasExtension = /\.[a-zA-Z0-9]+$/.test(path.basename(normalizedPath));
+		const folder = hasExtension ? path.dirname(normalizedPath) : normalizedPath;
 		const folderName = path.basename(folder);
 
-		// Extract post ID from folder name (format: slug_ID)
+		// 1. Legacy: extract post ID from folder name (format: slug_ID)
 		const match = folderName.match(/_(\d+)$/);
-		if (!match) {
-			return null;
+		if (match) {
+			this.debugLogger.info(
+				`🔍 [extractPostInfo] Resolved via legacy folder name: ${folderName} → post ${match[1]}`
+			);
+			return {
+				postId: parseInt(match[1], 10),
+				postFolder: folder.replace(/\\/g, "/"),
+			};
 		}
 
-		const postId = parseInt(match[1], 10);
+		// 2. Slug-only: reverse lookup in metadata cache
+		for (const [postId, meta] of this.metadataCache.entries()) {
+			if (meta.slug === folderName) {
+				this.debugLogger.info(
+					`🔍 [extractPostInfo] Resolved via metadata cache: slug="${folderName}" → post ${postId}`
+				);
+				return {
+					postId,
+					postFolder: folder.replace(/\\/g, "/"),
+				};
+			}
+		}
 
-		return {
-			postId,
-			postFolder: folder.replace(/\\/g, "/"),
-		};
+		this.debugLogger.info(
+			`🔍 [extractPostInfo] Metadata cache miss for slug="${folderName}" (cache has ${this.metadataCache.size} entries). Trying HTML header...`
+		);
+
+		// 3. Parse Post ID from the HTML metadata comment at top of file
+		try {
+			const htmlPath = posixJoin(folder, `${folderName}.html`);
+			const headContent = await vsReadFile(htmlPath);
+			const head = headContent.substring(0, 500);
+			// Match both "Post ID:" and "ID:" formats (patterns use short form)
+			const idMatch = head.match(/(?:Post\s+)?ID:\s*(\d+)/i);
+			if (idMatch) {
+				this.debugLogger.info(
+					`🔍 [extractPostInfo] Resolved via HTML header: Post ID ${idMatch[1]}`
+				);
+				return {
+					postId: parseInt(idMatch[1], 10),
+					postFolder: folder.replace(/\\/g, "/"),
+				};
+			}
+			this.debugLogger.info(
+				`🔍 [extractPostInfo] HTML header has no Post ID. First 200 chars: ${head.substring(0, 200)}`
+			);
+		} catch (err: any) {
+			this.debugLogger.info(
+				`🔍 [extractPostInfo] Could not read HTML file: ${err.message}`
+			);
+		}
+
+		this.debugLogger.info(
+			`⚠️ [extractPostInfo] FAILED: Could not resolve post ID for folder: ${folderName}`
+		);
+		return null;
 	}
 
 	/**
@@ -4212,49 +4415,118 @@ export class FileWatcher {
 	 */
 	private startCursorTracking() {
 		if (!this.cursorTrackingEnabled) {
-			this.debugLogger.log(
-				"⏭️ Cursor tracking disabled via settings"
-			);
+			this.debugLogger.log("⏭️ Cursor tracking disabled via settings");
 			return;
 		}
 
-		this.debugLogger.log(
-			"🎯 Starting cursor tracking for Gutenberg sync"
-		);
+		this.debugLogger.log("🎯 Starting cursor tracking for Gutenberg sync");
 		this.debugLogger.log(`   Dev folder: ${this.devFolder}`);
 
-		this.cursorSelectionListener =
-			vscode.window.onDidChangeTextEditorSelection((e) => {
+		this.cursorSelectionListener = vscode.window.onDidChangeTextEditorSelection(
+			(e) => {
 				this.handleCursorChange(e);
-			});
+			}
+		);
+
+		this.startLineTracking();
+	}
+
+	/**
+	 * Subscribe to text document changes and shift cached block line numbers
+	 * in real time — the same approach IDEs use for breakpoint tracking.
+	 * Keeps block lines accurate between saves without re-scanning.
+	 */
+	private startLineTracking() {
+		this.lineTrackingListener = vscode.workspace.onDidChangeTextDocument(
+			(event) => {
+				const filePath = event.document.uri.fsPath.replace(/\\/g, "/");
+				if (!filePath.endsWith(".html")) return;
+
+				const isContent =
+					filePath.includes("/post-types/") ||
+					filePath.includes("/templates/") ||
+					filePath.includes("/parts/") ||
+					filePath.includes("/patterns/");
+				if (!isContent) return;
+
+				const postId = this.getPostIdForFile(filePath);
+				if (!postId) return;
+
+				const blocks = this.liveBlockLines.get(postId);
+				if (!blocks || blocks.length === 0) return;
+
+				// Process changes bottom-to-top so earlier shifts don't affect later ones
+				const sorted = [...event.contentChanges].sort(
+					(a, b) => b.range.start.line - a.range.start.line
+				);
+
+				for (const change of sorted) {
+					const linesRemoved =
+						change.range.end.line - change.range.start.line;
+					const linesAdded = change.text.split("\n").length - 1;
+					const delta = linesAdded - linesRemoved;
+
+					if (delta === 0) continue;
+
+					// Full-file replacement (formatter, AI agent) — invalidate cache.
+					// Next cursor move will re-read from metadata JSON on disk.
+					if (
+						change.range.start.line === 0 &&
+						change.range.end.line >=
+							event.document.lineCount - Math.abs(delta) - 1
+					) {
+						this.liveBlockLines.delete(postId);
+						this.lastCursorBlockId = null;
+						this.debugLogger.log(
+							`📐 [LineTrack] Full-file replacement detected for post ${postId}, cache invalidated`
+						);
+						return;
+					}
+
+					const editLine = change.range.start.line + 1; // 1-based
+					for (const block of blocks) {
+						if (block.line > editLine) {
+							block.line += delta;
+						}
+					}
+				}
+			}
+		);
+
+		this.debugLogger.log("📐 Real-time line tracking started");
 	}
 
 	/**
 	 * Handle cursor position change with debouncing
 	 */
 	private handleCursorChange(e: vscode.TextEditorSelectionChangeEvent) {
-		const filePath = e.textEditor.document.uri.fsPath.replace(
-			/\\/g,
-			"/"
-		);
+		// Skip if we're in the cooldown window after a GT→IDE jump.
+		// Without this, the jump moves the cursor, which writes active-block.txt,
+		// which makes GT select the (possibly parent) block, causing a second jump.
+		if (Date.now() < this.jumpCooldownUntil) return;
 
-		// Only track HTML files in post-types folder
-		if (
-			!filePath.includes("/post-types/") ||
-			!filePath.endsWith(".html")
-		) {
-			return;
-		}
+		const filePath = e.textEditor.document.uri.fsPath.replace(/\\/g, "/");
+
+		// Only track HTML files in content folders
+		if (!filePath.endsWith(".html")) return;
+		const isContent =
+			filePath.includes("/post-types/") ||
+			filePath.includes("/templates/") ||
+			filePath.includes("/parts/") ||
+			filePath.includes("/patterns/");
+		if (!isContent) return;
 
 		// Clear existing debounce timer
 		if (this.cursorDebounceTimer) {
 			clearTimeout(this.cursorDebounceTimer);
 		}
 
-		// Debounce: wait 200ms after cursor stops moving
+		// Debounce: 120ms after cursor stops moving.
+		// Enough to skip continuous arrow-key movement; short enough to feel instant
+		// on deliberate cursor placement (click or single keypress).
 		this.cursorDebounceTimer = setTimeout(() => {
 			this.processCursorPosition(e.textEditor);
-		}, 200);
+		}, 120);
 	}
 
 	/**
@@ -4262,121 +4534,90 @@ export class FileWatcher {
 	 */
 	private async processCursorPosition(editor: vscode.TextEditor) {
 		try {
-			const filePath = editor.document.uri.fsPath.replace(
-				/\\/g,
-				"/"
-			);
-			const cursorLine = editor.selection.active.line + 1; // 1-based
+			const filePath = editor.document.uri.fsPath.replace(/\\/g, "/");
+			const cursorLine = editor.selection.active.line; // 0-based
 
-			this.debugLogger.log(
-				`🎯 [Cursor] Processing: line ${cursorLine} in ${filePath
-					.split("/")
-					.pop()}`
-			);
-
-			// Extract post ID from parent directory (e.g., "homepage_65/homepage_65.html" → 65)
-			// The folder name contains the _ID suffix, not the file name
 			const parentDir = path.dirname(filePath);
 			const postId = this.extractPostIdFromPath(parentDir);
 			if (!postId) {
-				this.debugLogger.log(
-					`🎯 [Cursor] ❌ Could not extract post ID from folder: ${path.basename(
-						parentDir
-					)}`
-				);
 				return;
 			}
 
-			this.debugLogger.log(`🎯 [Cursor] Post ID: ${postId}`);
-
-			// Read metadata JSON for this post
-			const metadataPath = posixJoin(
-				this.devFolder,
-				".skylit",
-				"metadata",
-				`${postId}.json`
-			);
-
-			this.debugLogger.log(
-				`🎯 [Cursor] Metadata path: ${metadataPath}`
-			);
-
-			if (!(await vsExists(metadataPath))) {
-				this.debugLogger.log(
-					`🎯 [Cursor] ❌ Metadata file does not exist`
+			let blocks = this.liveBlockLines.get(postId);
+			if (!blocks) {
+				const metadataPath = posixJoin(
+					this.devFolder,
+					".skylit",
+					"metadata",
+					`${postId}.json`
 				);
+				try {
+					const raw = await vsReadFile(metadataPath);
+					const meta = JSON.parse(raw);
+					if (meta?.blocks && Array.isArray(meta.blocks)) {
+						blocks = meta.blocks.map(
+							(b: { layoutBlockId: string; line: number; blockName: string }) => ({
+								layoutBlockId: b.layoutBlockId,
+								line: b.line,
+								blockName: b.blockName,
+							})
+						);
+						this.liveBlockLines.set(postId, blocks);
+						this.debugLogger.info(
+							`📐 [Cursor] Loaded ${blocks.length} block lines for post ${postId}`
+						);
+					}
+				} catch {
+					this.debugLogger.info(
+						`🎯 [Cursor] ⚠️ Could not read metadata for post ${postId}`
+					);
+					return;
+				}
+			}
+
+			let layoutBlockId: string | null = null;
+			if (blocks) {
+				const match = this.findBlockForLine(blocks, cursorLine + 1);
+				if (match) {
+					layoutBlockId = match.layoutBlockId;
+				}
+			}
+
+			if (!layoutBlockId) {
 				return;
 			}
 
-			const metadataContent = await vsReadFile(metadataPath);
-			const metadata = JSON.parse(metadataContent);
-
-			if (!metadata.blocks || metadata.blocks.length === 0) {
-				this.debugLogger.log(
-					`🎯 [Cursor] ❌ No blocks in metadata`
-				);
+			if (layoutBlockId === this.lastCursorBlockId) {
 				return;
 			}
 
-			this.debugLogger.log(
-				`🎯 [Cursor] Found ${metadata.blocks.length} blocks in metadata`
+			this.lastCursorBlockId = layoutBlockId;
+
+			const ts = Date.now();
+			this.debugLogger.info(
+				`🎯 [Cursor] line ${cursorLine + 1} → ${layoutBlockId.substring(0, 12)}… → REST+file`
 			);
 
-			// Find block for current cursor line
-			const block = this.findBlockForLine(
-				metadata.blocks,
-				cursorLine
-			);
+			// Primary: push via REST (direct DB write, bypasses all caching)
+			this.restClient.pushCursorBlock(postId, layoutBlockId, ts).catch(() => {});
 
-			if (!block) {
-				this.debugLogger.log(
-					`🎯 [Cursor] ❌ No block found for line ${cursorLine}`
-				);
-				return;
-			}
-
-			this.debugLogger.log(
-				`🎯 [Cursor] Found block: ${block.layoutBlockId} (${block.blockName}) at line ${block.line}`
-			);
-
-			// Only write if block changed (avoid redundant writes)
-			if (block.layoutBlockId === this.lastCursorBlockId) {
-				this.debugLogger.log(
-					`🎯 [Cursor] Same block, skipping write`
-				);
-				return;
-			}
-
-			this.lastCursorBlockId = block.layoutBlockId;
-
-			// Write active block file
+			// Fallback: write file with timestamp so GT dedup can detect changes
 			const activeBlockPath = posixJoin(
 				this.devFolder,
 				".skylit",
 				"active-block.txt"
 			);
-			const content = `${postId}:${block.layoutBlockId}`;
-
-			this.debugLogger.log(
-				`🎯 [Cursor] Writing to: ${activeBlockPath}`
-			);
-			this.debugLogger.log(`🎯 [Cursor] Content: ${content}`);
-
-			await vsWriteFile(activeBlockPath, content);
-
-			this.debugLogger.log(
-				`🎯 [Cursor] ✅ Active block file written!`
-			);
+			await vsWriteFile(activeBlockPath, `${postId}:${ts}:${layoutBlockId}`);
 		} catch (error: any) {
-			this.debugLogger.log(
-				`🎯 [Cursor] ❌ Error: ${error.message}`
-			);
+			this.debugLogger.info(`🎯 [Cursor] ❌ Error: ${error.message}`);
 		}
 	}
 
 	/**
-	 * Find which block contains the given line number
-	 * Uses the metadata blocks array which has line numbers for each block
+	 * Find which block contains the given line number (1-based).
+	 * Uses the metadata blocks array which has line numbers for each block.
+	 * Primary method for cursor → layoutBlockId resolution since
+	 * data-layout-block-id is stripped from the exported HTML.
 	 */
 	private findBlockForLine(
 		blocks: Array<{
@@ -4391,9 +4632,7 @@ export class FileWatcher {
 		}
 
 		// Sort blocks by line number
-		const sortedBlocks = [...blocks].sort(
-			(a, b) => a.line - b.line
-		);
+		const sortedBlocks = [...blocks].sort((a, b) => a.line - b.line);
 
 		// Find the block whose line is closest to (but not after) the target line
 		let bestMatch: (typeof blocks)[0] | null = null;
@@ -4423,6 +4662,18 @@ export class FileWatcher {
 	}
 
 	/**
+	 * Suppress cursor-to-GT sync for a short window after a GT→IDE jump.
+	 * Without this, the jump moves the IDE cursor, which triggers
+	 * processCursorPosition → active-block.txt write → GT selects block →
+	 * GT may shift focus to parent → different block selected → second jump.
+	 */
+	suppressCursorSyncBriefly() {
+		// Match CURSOR_LOCK_MS_GT on the GT side (3000ms) so both sides
+		// yield for the same window after a GT→IDE jump.
+		this.jumpCooldownUntil = Date.now() + 3000;
+	}
+
+	/**
 	 * Stop watching files
 	 */
 	dispose() {
@@ -4441,9 +4692,7 @@ export class FileWatcher {
 		// Stop VS Code native trash watcher
 		if (this.vscodeTrashWatcher) {
 			this.vscodeTrashWatcher.dispose();
-			this.debugLogger.log(
-				"👋 VS Code trash watcher stopped"
-			);
+			this.debugLogger.log("👋 VS Code trash watcher stopped");
 		}
 
 		// Stop theme folder watcher (bi-directional sync)
@@ -4461,9 +4710,13 @@ export class FileWatcher {
 		// Stop VS Code native new folder watcher
 		if (this.vscodeNewFolderWatcher) {
 			this.vscodeNewFolderWatcher.dispose();
-			this.debugLogger.log(
-				"👋 VS Code new folder watcher stopped"
-			);
+			this.debugLogger.log("👋 VS Code new folder watcher stopped");
+		}
+
+		// Stop VS Code native theme watcher
+		if (this.vscodeThemeWatcher) {
+			this.vscodeThemeWatcher.dispose();
+			this.debugLogger.log("👋 VS Code theme watcher stopped");
 		}
 
 		// Stop metadata watcher
@@ -4491,8 +4744,19 @@ export class FileWatcher {
 		this.newFolderTimers.forEach((timer) => clearTimeout(timer));
 		this.newFolderTimers.clear();
 
+		// Clear ACF/taxonomy batch debounce timers
+		if (this.acfJsonBatchTimer) {
+			clearTimeout(this.acfJsonBatchTimer);
+			this.acfJsonBatchTimer = null;
+		}
+		if (this.taxonomyJsonBatchTimer) {
+			clearTimeout(this.taxonomyJsonBatchTimer);
+			this.taxonomyJsonBatchTimer = null;
+		}
+
 		// Clear sync cooldown tracking
 		this.lastSyncTime.clear();
+		this.selfWrittenPaths.clear();
 
 		// Clear theme sync cooldown tracking
 		this.lastThemeSyncTime.clear();
@@ -4526,10 +4790,612 @@ export class FileWatcher {
 			this.cursorDebounceTimer = null;
 		}
 
+		// Stop line tracking
+		if (this.lineTrackingListener) {
+			this.lineTrackingListener.dispose();
+			this.lineTrackingListener = null;
+			this.debugLogger.log("👋 Line tracking stopped");
+		}
+		this.liveBlockLines.clear();
+
 		// Clear all polling intervals
-		this.pollingIntervals.forEach((interval) =>
-			clearInterval(interval)
-		);
+		this.pollingIntervals.forEach((interval) => clearInterval(interval));
 		this.pollingIntervals = [];
+	}
+
+	// =========================================================================
+	// Media Library Sync
+	// =========================================================================
+
+	/**
+	 * VS Code native watcher for media-library/ — works over SSH/remote just like
+	 * the content-folder watchers. Chokidar cannot watch remote SSH paths, so this
+	 * is the correct approach for Hostinger and other remote setups.
+	 */
+	private startMediaLibraryWatcher(): void {
+		if (!this.mediaSyncEnabled) {
+			this.debugLogger.log("⏭️ Media library watcher skipped — sync disabled");
+			return;
+		}
+		if (this.vscodeMediaWatcher) {
+			return; // Already started — idempotent
+		}
+
+		const mediaLibPath = posixJoin(this.devFolder, "media-library");
+		this.debugLogger.log(`👀 Starting media-library watcher: ${mediaLibPath}`);
+
+		const pattern = new vscode.RelativePattern(pathToUri(mediaLibPath), "**/*");
+
+		this.vscodeMediaWatcher = vscode.workspace.createFileSystemWatcher(
+			pattern,
+			false, // create
+			false, // change
+			false  // delete
+		);
+
+		const MEDIA_EXTENSIONS = new Set([
+			".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+			".mp4", ".webm", ".ogg", ".mov",
+			".mp3", ".wav", ".aac",
+			".pdf",
+		]);
+
+		const shouldProcess = (uri: vscode.Uri): boolean => {
+			const ext = path.extname(uri.fsPath).toLowerCase();
+			return MEDIA_EXTENSIONS.has(ext);
+		};
+
+		// Use uri.path (not uri.fsPath) so SSH/remote paths resolve correctly
+		const uriToPath = (uri: vscode.Uri) =>
+			uri.scheme === "file" ? uri.fsPath : uri.path;
+
+		this.vscodeMediaWatcher.onDidCreate((uri) => {
+			if (!shouldProcess(uri)) return;
+			const p = uriToPath(uri);
+			this.debugLogger.log(`📷 Media created: ${p}`);
+			this.handleMediaFileChange(p, "add");
+		});
+
+		this.vscodeMediaWatcher.onDidChange((uri) => {
+			if (!shouldProcess(uri)) return;
+			const p = uriToPath(uri);
+			this.debugLogger.log(`📷 Media changed: ${p}`);
+			this.handleMediaFileChange(p, "change");
+		});
+
+		this.vscodeMediaWatcher.onDidDelete((uri) => {
+			if (!shouldProcess(uri)) return;
+			const p = uriToPath(uri);
+			this.debugLogger.log(`📷 Media deleted: ${p}`);
+			this.handleMediaFileChange(p, "unlink");
+		});
+
+		this.debugLogger.info("✅ Media library watcher started");
+	}
+
+	/**
+	 * Load all .skylit/media/*.json files into the in-memory index.
+	 * Called once on connection. Uses VS Code FS API for SSH/remote compatibility.
+	 * Also prunes stale entries whose actual media file no longer exists on disk.
+	 */
+	public async loadMediaMetaIndex(): Promise<void> {
+		const mediaMetaDir = posixJoin(this.devFolder, ".skylit", "media");
+		this.mediaMetaIndex.clear();
+		try {
+			const dirUri = pathToUri(mediaMetaDir);
+			const entries = await vscode.workspace.fs.readDirectory(dirUri);
+
+			/** Stale entries: local file missing, metadata JSON already deleted from disk. */
+			const staleEntries: Array<{ attachmentId: number; localPath: string }> = [];
+
+			for (const [name] of entries) {
+				if (!name.endsWith(".json")) continue;
+				try {
+					const fileUri = pathToUri(posixJoin(mediaMetaDir, name));
+					const raw = Buffer.from(await vscode.workspace.fs.readFile(fileUri)).toString("utf-8");
+					const meta = JSON.parse(raw) as import("./types").MediaMetadata;
+					if (!meta.local_path) continue;
+
+					// Check whether the actual media file still exists
+					const mediaFileUri = pathToUri(posixJoin(this.devFolder, meta.local_path));
+					let fileExists = false;
+					try {
+						await vscode.workspace.fs.stat(mediaFileUri);
+						fileExists = true;
+					} catch {
+						fileExists = false;
+					}
+
+					if (fileExists) {
+						this.mediaMetaIndex.set(meta.local_path, meta);
+					} else {
+						// Stale — file was deleted while the extension was offline.
+						// Remove the metadata JSON now; schedule WP delete below.
+						this.debugLogger.log(`🧹 Stale media (file missing): ${meta.local_path} — queuing WP delete`);
+						staleEntries.push({ attachmentId: meta.attachment_id, localPath: meta.local_path });
+						try {
+							await vscode.workspace.fs.delete(fileUri, { useTrash: false });
+						} catch { /* ignore */ }
+					}
+				} catch {
+					// Skip malformed metadata files
+				}
+			}
+
+			this.debugLogger.info(
+				`📂 Media metadata index loaded: ${this.mediaMetaIndex.size} entries` +
+				(staleEntries.length ? `, ${staleEntries.length} stale (will delete from WP)` : "")
+			);
+
+			// Delete stale attachments from WordPress — only when sync direction allows
+			// local→WP deletes (same guard as the live watcher unlink path).
+			if (
+				staleEntries.length > 0 &&
+				this.mediaSyncEnabled &&
+				this.mediaSyncDirection !== "wp-to-local"
+			) {
+				this.debugLogger.info(`🗑️ Cleaning up ${staleEntries.length} WP attachment(s) deleted while offline…`);
+				for (const { attachmentId, localPath } of staleEntries) {
+					try {
+						await this.restClient.deleteMediaAttachment(attachmentId);
+						this.debugLogger.info(`✅ WP attachment deleted (offline cleanup): ${localPath} (ID ${attachmentId})`);
+					} catch (err: any) {
+						this.debugLogger.warn(`⚠️ Could not delete WP attachment ${attachmentId} (${localPath}): ${err.message}`);
+					}
+				}
+			} else if (staleEntries.length > 0) {
+				this.debugLogger.info(`⏭️ Stale WP attachments NOT deleted — sync disabled or direction is wp-to-local`);
+			}
+
+		} catch {
+			// Folder may not exist yet — not an error
+			this.debugLogger.info(`📂 Media metadata dir not found yet — starting fresh`);
+		}
+	}
+
+	/**
+	 * Write a metadata entry to .skylit/media/{attachment_id}.json and update the index.
+	 * Uses VS Code FS API so it works over SSH/remote.
+	 */
+	private async writeMediaMeta(meta: import("./types").MediaMetadata): Promise<void> {
+		const mediaMetaDir = posixJoin(this.devFolder, ".skylit", "media");
+		const filePath = posixJoin(mediaMetaDir, `${meta.attachment_id}.json`);
+		try {
+			const uri = pathToUri(filePath);
+			await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(meta, null, "\t"), "utf-8"));
+		} catch (err: any) {
+			this.debugLogger.log(`⚠️ Media: failed to write metadata: ${err.message}`);
+		}
+		this.mediaMetaIndex.set(meta.local_path, meta);
+	}
+
+	/**
+	 * Remove a metadata entry from disk and from the index.
+	 * Uses VS Code FS API so it works over SSH/remote.
+	 */
+	private async removeMediaMeta(attachmentId: number, localPath: string): Promise<void> {
+		const mediaMetaDir = posixJoin(this.devFolder, ".skylit", "media");
+		const filePath = posixJoin(mediaMetaDir, `${attachmentId}.json`);
+		try {
+			const uri = pathToUri(filePath);
+			await vscode.workspace.fs.delete(uri, { useTrash: false });
+		} catch { /* file may not exist — ignore */ }
+		this.mediaMetaIndex.delete(localPath);
+	}
+
+	/**
+	 * Handle a file event inside media-library/.
+	 * Routes add/change to push logic (with hash dedup + rename detection)
+	 * and unlink to the pending-delete buffer (1s rename window).
+	 */
+	private async handleMediaFileChange(filePath: string, eventType: "add" | "change" | "unlink"): Promise<"pushed" | "skipped" | "renamed" | "deleted" | "error" | "ignored"> {
+		if (!this.mediaSyncEnabled) return "ignored";
+
+		const normalizedPath = filePath.replace(/\\/g, "/");
+		// Strip the dev folder prefix to get the relative path — use devFolder (not localDevFolder)
+		// because VS Code native watcher URIs are based on devFolder path.
+		const devFolderNormalized = this.devFolder.replace(/\\/g, "/").replace(/\/$/, "");
+		const localDevFolderNormalized = this.localDevFolder.replace(/\\/g, "/").replace(/\/$/, "");
+
+		// Compute local_path relative to dev root (e.g. "media-library/test/photo.webp")
+		// Accept either devFolder or localDevFolder prefix (handles local + SSH cases)
+		let localPath: string;
+		if (normalizedPath.startsWith(devFolderNormalized + "/")) {
+			localPath = normalizedPath.substring(devFolderNormalized.length + 1);
+		} else if (normalizedPath.startsWith(localDevFolderNormalized + "/")) {
+			localPath = normalizedPath.substring(localDevFolderNormalized.length + 1);
+		} else {
+			localPath = path.basename(normalizedPath);
+		}
+
+		if (eventType === "add" || eventType === "change") {
+			// Read file via VS Code filesystem API — works over SSH/remote
+			let fileBuffer: Buffer;
+		try {
+			const uri = pathToUri(filePath);
+			const uint8 = await vscode.workspace.fs.readFile(uri);
+			fileBuffer = Buffer.from(uint8);
+		} catch {
+			this.debugLogger.log(`⚠️ Media: cannot read file (may not exist yet): ${filePath}`);
+			return "error";
+		}
+
+		// Compute hash
+		const hash = require("crypto").createHash("md5").update(fileBuffer).digest("hex");
+
+		// Hash dedup: skip if file is already in WP with same content
+		const existingMeta = this.mediaMetaIndex.get(localPath);
+		if (existingMeta && existingMeta.sync_hash === hash) {
+			this.debugLogger.log(`⏭️ Media skip (already in WP, hash matches): ${localPath} (ID: ${existingMeta.attachment_id})`);
+			return "skipped";
+		}
+
+			// Rename detection: check if any pending delete has this hash
+			const pendingEntry = this.pendingMediaDeletes.get(hash);
+			if (pendingEntry) {
+				// This is a rename/move — cancel delete, call rename endpoint
+				clearTimeout(pendingEntry.timer);
+				this.pendingMediaDeletes.delete(hash);
+
+				this.debugLogger.log(`🔀 Media rename detected: ${localPath} (attachment ${pendingEntry.attachmentId})`);
+
+			try {
+				// WP path is relative to media-library/
+				const newWpPath = localPath.replace(/^media-library\//, "");
+				await this.restClient.renameMediaFile(pendingEntry.attachmentId, newWpPath);
+
+				// Update metadata
+				const oldMeta = [...this.mediaMetaIndex.values()].find(
+					(m) => m.attachment_id === pendingEntry.attachmentId
+				);
+				if (oldMeta) {
+					this.mediaMetaIndex.delete(oldMeta.local_path);
+				}
+				const newMeta: import("./types").MediaMetadata = {
+					attachment_id: pendingEntry.attachmentId,
+					local_path: localPath,
+					wp_path: newWpPath,
+					sync_hash: hash,
+					modified_local: new Date().toISOString(),
+					modified_wp: new Date().toISOString(),
+				};
+			await this.writeMediaMeta(newMeta);
+			this.debugLogger.log(`✅ Media renamed: ${localPath}`);
+			} catch (err: any) {
+				this.debugLogger.log(`❌ Media rename failed: ${err.message}`);
+			}
+			return "renamed";
+			}
+
+			// New file or content changed — push to WP
+			const relPath = localPath.replace(/^media-library\//, "");
+			const ext = path.extname(filePath).toLowerCase();
+			const mimeMap: Record<string, string> = {
+				".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+				".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+				".mp4": "video/mp4", ".webm": "video/webm", ".ogg": "video/ogg",
+				".mp3": "audio/mpeg", ".wav": "audio/wav",
+				".pdf": "application/pdf",
+			};
+			const mimeType = mimeMap[ext] || "application/octet-stream";
+
+			this.debugLogger.log(`📤 Pushing media file: ${relPath}`);
+
+			try {
+				const response = await this.restClient.pushMediaFile(
+					filePath, relPath, fileBuffer, mimeType
+				);
+
+			const result = response.results?.[0];
+			if (result?.success && result.attachment_id) {
+				const meta: import("./types").MediaMetadata = {
+					attachment_id: result.attachment_id,
+					local_path: localPath,
+					wp_path: relPath,
+					sync_hash: hash,
+					modified_local: new Date().toISOString(),
+					modified_wp: new Date().toISOString(),
+				};
+				await this.writeMediaMeta(meta);
+				this.debugLogger.info(`✅ Media pushed: ${relPath} (ID: ${result.attachment_id})`);
+				return "pushed";
+			} else {
+				this.debugLogger.warn(`⚠️ Media push failed: ${result?.error || "unknown error"}`);
+				return "error";
+			}
+		} catch (err: any) {
+			this.debugLogger.warn(`❌ Media push error: ${err.message}`);
+			return "error";
+		}
+
+	} else if (eventType === "unlink") {
+		// File deleted — put in pending buffer for 1 second (rename detection window)
+		const existingMeta = this.mediaMetaIndex.get(localPath);
+		if (!existingMeta) {
+			this.debugLogger.log(`⚠️ Media deleted but no metadata found: ${localPath}`);
+			return "ignored";
+		}
+
+		const { attachment_id: attachmentId, sync_hash: hash } = existingMeta;
+
+		this.debugLogger.log(`🗑️ Media delete queued: ${localPath} (1s rename window)`);
+
+		const timer = setTimeout(async () => {
+			this.pendingMediaDeletes.delete(hash);
+
+			// Check sync direction
+			if (this.mediaSyncDirection === "wp-to-local") {
+				this.debugLogger.log(`⏭️ Media delete skipped (wp-to-local direction): ${localPath}`);
+				return;
+			}
+
+			this.debugLogger.log(`🗑️ Media deleting from WP: attachment ${attachmentId}`);
+			try {
+				await this.restClient.deleteMediaAttachment(attachmentId);
+				await this.removeMediaMeta(attachmentId, localPath);
+				this.debugLogger.log(`✅ Media deleted from WP: attachment ${attachmentId}`);
+			} catch (err: any) {
+				this.debugLogger.log(`❌ Media delete from WP failed: ${err.message}`);
+			}
+		}, 1000);
+
+		this.pendingMediaDeletes.set(hash, { attachmentId, timer });
+		return "deleted";
+	}
+
+	return "ignored";
+	}
+
+	/**
+	 * Fetch media sync settings from WP and cache them.
+	 * Called during connection setup.
+	 */
+	public async refreshMediaSyncSettings(): Promise<void> {
+		try {
+			const settings = await this.restClient.getMediaSettings();
+			this.mediaSyncEnabled = settings.enabled;
+			this.mediaSyncDirection = settings.direction;
+			this.debugLogger.info(
+				`📷 Media sync: ${settings.enabled ? "enabled" : "disabled"}, direction: ${settings.direction}`
+			);
+		} catch (err: any) {
+			this.debugLogger.warn(`⚠️ Media settings endpoint failed (${err?.message || err}) — assuming enabled/bidirectional`);
+			this.mediaSyncEnabled = true;
+			this.mediaSyncDirection = "bidirectional";
+		}
+
+		if (this.mediaSyncEnabled) {
+			try {
+				await this.loadMediaMetaIndex();
+			} catch (err: any) {
+				this.debugLogger.warn(`⚠️ Media meta index load failed: ${err?.message || err}`);
+			}
+			try {
+				this.startMediaLibraryWatcher();
+			} catch (err: any) {
+				this.debugLogger.warn(`⚠️ Media watcher start failed: ${err?.message || err}`);
+			}
+			if (this.mediaSyncDirection !== "wp-to-local") {
+				this.syncUntrackedMediaFiles().catch((err: any) => {
+					this.debugLogger.warn(`⚠️ Media untracked sync failed: ${err?.message || err}`);
+				});
+			}
+		}
+	}
+
+	/**
+	 * Scan media-library/ recursively and push any file that has no metadata entry.
+	 * Runs in the background on connection — does not block the editor.
+	 */
+	private async syncUntrackedMediaFiles(): Promise<void> {
+		const MEDIA_EXTENSIONS = new Set([
+			".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+			".mp4", ".webm", ".ogg", ".mov",
+			".mp3", ".wav", ".aac",
+			".pdf",
+		]);
+
+		const mediaLibUri = pathToUri(posixJoin(this.devFolder, "media-library"));
+
+		const collectFiles = async (dirUri: vscode.Uri): Promise<vscode.Uri[]> => {
+			const results: vscode.Uri[] = [];
+			try {
+				const entries = await vscode.workspace.fs.readDirectory(dirUri);
+				for (const [name, type] of entries) {
+					const childUri = vscode.Uri.joinPath(dirUri, name);
+					if (type === vscode.FileType.Directory) {
+						const nested = await collectFiles(childUri);
+						results.push(...nested);
+					} else if (type === vscode.FileType.File) {
+						if (MEDIA_EXTENSIONS.has(path.extname(name).toLowerCase())) {
+							results.push(childUri);
+						}
+					}
+				}
+			} catch { /* folder may not exist yet */ }
+			return results;
+		};
+
+		let files: vscode.Uri[];
+		try {
+			files = await collectFiles(mediaLibUri);
+		} catch {
+			return;
+		}
+
+		const untracked = files.filter((uri) => {
+			const normalizedPath = uri.path.replace(/\\/g, "/");
+			const devFolderNormalized = this.devFolder.replace(/\\/g, "/").replace(/\/$/, "");
+			const localPath = normalizedPath.startsWith(devFolderNormalized + "/")
+				? normalizedPath.substring(devFolderNormalized.length + 1)
+				: path.basename(normalizedPath);
+			return !this.mediaMetaIndex.has(localPath);
+		});
+
+		if (untracked.length === 0) {
+			this.debugLogger.info("✅ Media: no untracked files found on connection check");
+			return;
+		}
+
+		this.debugLogger.info(`📤 Media: found ${untracked.length} untracked file(s) — pushing to WP`);
+
+		for (const uri of untracked) {
+			// uri.fsPath may be empty for remote URIs — use uri.path instead
+			const filePath = uri.scheme === "file" ? uri.fsPath : uri.path;
+			this.debugLogger.log(`📤 Media: pushing untracked: ${filePath}`);
+			try {
+				await this.handleMediaFileChange(filePath, "add");
+			} catch (err: any) {
+				this.debugLogger.log(`⚠️ Media untracked push failed for ${filePath}: ${err.message}`);
+			}
+		}
+	}
+
+	/**
+	 * Manual import: pull all WP media attachments into media-library/ (paginated).
+	 * Calls POST /media/import in a loop until done.
+	 */
+	public async importMediaFromWP(
+		progress?: (message: string, done: number, total: number) => void
+	): Promise<{ processed: number; skipped: number; errors: number }> {
+		let offset = 0;
+		let total = 0;
+		let processed = 0;
+		let skipped = 0;
+		const errors = 0;
+
+		this.debugLogger.info("📥 Manual import: pulling WP media → media-library/");
+
+		// eslint-disable-next-line no-constant-condition
+		while (true) {
+			let batch: Awaited<ReturnType<typeof this.restClient.importMediaBatch>>;
+			try {
+				batch = await this.restClient.importMediaBatch(offset);
+			} catch (err: any) {
+				this.debugLogger.warn(`❌ Import batch failed at offset ${offset}: ${err.message}`);
+				break;
+			}
+
+			processed += batch.processed;
+			skipped += batch.skipped;
+			total = batch.total || total;
+			offset = batch.offset;
+
+			progress?.(
+				`Imported ${processed} / ${total} (${skipped} skipped)`,
+				Math.min(offset, total),
+				total
+			);
+
+			if (batch.done || batch.message) break;
+		}
+
+		this.debugLogger.info(`✅ Import complete — processed: ${processed}, skipped: ${skipped}`);
+
+		// Reload the metadata index so the watcher reflects newly imported files
+		try {
+			await this.loadMediaMetaIndex();
+		} catch { /* non-fatal */ }
+
+		return { processed, skipped, errors };
+	}
+
+	/**
+	 * Full media sync: honours the direction setting (WP→Dev, Dev→WP, or bidirectional).
+	 * For WP→Dev / bidirectional: pulls from WP (paginated).
+	 * For Dev→WP: pushes all local files.
+	 */
+	public async fullMediaSync(
+		progress?: (message: string, done: number, total: number) => void
+	): Promise<{ processed: number; skipped: number; errors: number }> {
+		this.debugLogger.info(`🔄 Full media sync (direction: ${this.mediaSyncDirection})`);
+
+		if (this.mediaSyncDirection === "local-to-wp") {
+			// Push all local files to WP
+			const r = await this.pushAllMediaToWP(progress);
+			return { processed: r.pushed, skipped: r.skipped, errors: r.errors };
+		}
+
+		// WP→Dev or bidirectional: import from WP, then also push any untracked local files
+		const importResult = await this.importMediaFromWP(progress);
+
+		if (this.mediaSyncDirection === "bidirectional") {
+			// Also push any local files not yet in WP
+			this.debugLogger.info("🔄 Bidirectional: also pushing untracked local files → WP");
+			await this.syncUntrackedMediaFiles();
+		}
+
+		return importResult;
+	}
+
+	/**
+	 * Manual push: scan media-library/ and push ALL files (tracked + untracked) to WordPress.
+	 * This is the "push all" action triggered from the IDE command palette or status bar menu.
+	 * Returns a summary { pushed, skipped, errors }.
+	 */
+	public async pushAllMediaToWP(
+		progress?: (message: string, pushed: number, total: number) => void
+	): Promise<{ pushed: number; skipped: number; errors: number }> {
+		const MEDIA_EXTENSIONS = new Set([
+			".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+			".mp4", ".webm", ".ogg", ".mov",
+			".mp3", ".wav", ".aac",
+			".pdf",
+		]);
+
+		const mediaLibUri = pathToUri(posixJoin(this.devFolder, "media-library"));
+
+		const collectFiles = async (dirUri: vscode.Uri): Promise<vscode.Uri[]> => {
+			const results: vscode.Uri[] = [];
+			try {
+				const entries = await vscode.workspace.fs.readDirectory(dirUri);
+				for (const [name, type] of entries) {
+					const childUri = vscode.Uri.joinPath(dirUri, name);
+					if (type === vscode.FileType.Directory) {
+						results.push(...await collectFiles(childUri));
+					} else if (type === vscode.FileType.File) {
+						if (MEDIA_EXTENSIONS.has(path.extname(name).toLowerCase())) {
+							results.push(childUri);
+						}
+					}
+				}
+			} catch { /* folder may not exist */ }
+			return results;
+		};
+
+		const files = await collectFiles(mediaLibUri);
+		if (files.length === 0) {
+			this.debugLogger.info("📷 Manual push: no media files found in media-library/");
+			return { pushed: 0, skipped: 0, errors: 0 };
+		}
+
+		this.debugLogger.info(`📤 Manual push: scanning ${files.length} media file(s)…`);
+
+		let pushed = 0;
+		let skipped = 0;
+		let errors = 0;
+
+		for (let i = 0; i < files.length; i++) {
+			const uri = files[i];
+			const filePath = uri.scheme === "file" ? uri.fsPath : uri.path;
+			const relName = path.basename(filePath);
+
+			progress?.(relName, i + 1, files.length);
+
+			// "change" triggers hash-dedup — already-synced files return "skipped"
+			const result = await this.handleMediaFileChange(filePath, "change");
+			if (result === "pushed") {
+				pushed++;
+			} else if (result === "skipped") {
+				skipped++;
+				this.debugLogger.log(`⏭️ Manual push: already in WP, skipping — ${relName}`);
+			} else if (result === "error") {
+				errors++;
+			}
+			// "ignored" / "renamed" / "deleted" don't count in either bucket
+		}
+
+		this.debugLogger.info(`✅ Manual push complete — pushed: ${pushed}, skipped: ${skipped} (already in WP), errors: ${errors}`);
+		return { pushed, skipped, errors };
 	}
 }

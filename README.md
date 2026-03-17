@@ -27,6 +27,10 @@ Requires the Skylit.DEV WordPress plugin. This extension will not work without t
 - Connection status and logs
 - Manual "Sync current file" command
 - Works on local, SSH, WSL (environment dependent)
+- **Media Library Sync** — bidirectional sync between `media-library/` and WordPress media library
+  - Real-time: local files push to WP on save; WP Admin uploads copied to dev automatically
+  - Manual commands: Push All Media, Import All Media, Full Media Sync
+  - SSH/remote compatible via VS Code native file watcher
 
 ## Settings
 
@@ -52,6 +56,9 @@ Command Palette (Ctrl+Shift+P / Cmd+Shift+P)
 - Skylit: Manage Post (change status, slug, title, schedule)
 - Skylit: Delete Post (trash or permanently delete)
 - Skylit: Convert Post Type (for moved folders)
+- Skylit: Push All Media to WordPress
+- Skylit: Import All Media from WordPress
+- Skylit: Full Media Sync
 
 ## Status Bar
 
@@ -65,16 +72,19 @@ Click the status to see options and logs.
 ## Troubleshooting
 
 Extension won't connect
+
 - Confirm the WordPress plugin is installed and active
 - Regenerate the auth token in WordPress and re-enter it
 - Ensure REST API is reachable from your environment
 
 Files aren't syncing
+
 - Check the status bar shows "Connected"
 - Make sure you're editing files in the correct folder structure
 - Enable Debug Output to inspect logs
 
 Cursor sync not working
+
 - Enable Cursor Tracking in settings
 - Refresh the Gutenberg editor
 - Verify the plugin supports this feature
@@ -93,11 +103,13 @@ Cursor sync not working
 
 ## License
 
-GPL-2.0-or-later
+Proprietary - All Rights Reserved. Copyright (c) 2026 Dimy Osman.
+See [LICENSE](LICENSE) for full terms. No forking, redistribution, or derivative works permitted.
 
 **Technology:** Axios (HTTP client)
 
 **What it does:**
+
 - Sends authenticated HTTP requests to WordPress
 - Handles token-based authentication
 - Manages request/response cycle
@@ -105,29 +117,32 @@ GPL-2.0-or-later
 **API Endpoints Used:**
 
 1. **File Sync:** `POST /wp-json/skylit/v1/sync/import-instant`
-   ```json
-   {
-     "post_id": 123,
-     "html": "<section>...</section>",
-     "css": ".class { color: red; }",
-     "token": "abc123..."
-   }
-   ```
+
+      ```json
+      {
+      	"post_id": 123,
+      	"html": "<section>...</section>",
+      	"css": ".class { color: red; }",
+      	"token": "abc123..."
+      }
+      ```
 
 2. **Folder Actions:** `POST /wp-json/skylit/v1/sync/folder-action`
-   ```json
-   {
-     "post_id": 123,
-     "action": "trash|restore|delete",
-     "token": "abc123..."
-   }
-   ```
+
+      ```json
+      {
+      	"post_id": 123,
+      	"action": "trash|restore|delete",
+      	"token": "abc123..."
+      }
+      ```
 
 3. **Theme Folder:** `GET /wp-json/skylit/v1/theme/path`
-   - Retrieves WordPress theme folder path
-   - Used for bidirectional theme file sync
+      - Retrieves WordPress theme folder path
+      - Used for bidirectional theme file sync
 
 **Authentication:**
+
 - Token stored in VS Code SecretStorage (encrypted)
 - Sent in request body (not headers for compatibility)
 - WordPress validates token against saved value in options table
@@ -135,6 +150,7 @@ GPL-2.0-or-later
 #### 3. Workspace Manager (`workspaceManager.ts`)
 
 **What it does:**
+
 - Scans workspace for WordPress installations
 - Looks for `wp-config.php` files
 - Extracts site URL from wp-config
@@ -142,6 +158,7 @@ GPL-2.0-or-later
 - Supports multiple WordPress sites in one workspace
 
 **Detection algorithm:**
+
 ```typescript
 1. Find all wp-config.php files in workspace
 2. For each wp-config:
@@ -155,11 +172,13 @@ GPL-2.0-or-later
 #### 4. Status Bar (`statusBar.ts`)
 
 **What it does:**
+
 - Shows connection status in VS Code status bar
 - Updates based on connection/sync state
 - Provides quick menu access
 
 **States:**
+
 - `✅ Skylit: Connected` - Watching files, ready to sync
 - `🔄 Skylit: Syncing...` - Currently sending data to WordPress
 - `❌ Skylit: Error` - Connection failed or auth invalid
@@ -168,11 +187,13 @@ GPL-2.0-or-later
 #### 5. Protocol Handler (`protocolHandler.ts`)
 
 **What it does:**
+
 - Registers `skylit://` URI scheme
 - WordPress can open IDE files via: `skylit://open?file=/path/to/file.html&line=42`
 - Used for "Jump to Code" feature from Gutenberg
 
 **How Gutenberg → IDE works:**
+
 1. User clicks block in Gutenberg editor
 2. JavaScript captures click, sends AJAX to WordPress
 3. WordPress searches HTML file for block's position
@@ -221,12 +242,14 @@ T=3100ms: Gutenberg refreshes editor with new blocks
 **How folder watching works:**
 
 Extension watches for these specific patterns:
+
 ```
 pages/about_456/         ← Original location
 _trash/pages/about_456/  ← Trashed location
 ```
 
 **Trash detection:**
+
 ```typescript
 // When folder moves TO _trash/
 1. Extension detects: unlink event for pages/about_456/
@@ -238,6 +261,7 @@ _trash/pages/about_456/  ← Trashed location
 ```
 
 **Restore detection:**
+
 ```typescript
 // When folder moves FROM _trash/
 1. Extension detects: add event for pages/about_456/
@@ -249,6 +273,7 @@ _trash/pages/about_456/  ← Trashed location
 ```
 
 **Delete detection:**
+
 ```typescript
 // When folder is permanently deleted from _trash/
 1. Extension detects: unlink event for _trash/pages/about_456/
@@ -279,12 +304,14 @@ _trash/pages/about_456/  ← Trashed location
 **WordPress theme files sync both directions:**
 
 **Theme → Dev:**
+
 - WordPress child theme files (`.php`, `.css`, `.js`)
 - When modified in WordPress Customizer
 - Extension polls WordPress every 5 seconds
 - Downloads changed files to `themes/child-theme/` folder
 
 **Dev → Theme:**
+
 - When you edit theme files in IDE
 - Extension uploads to WordPress theme directory
 - WordPress refreshes Customizer automatically
@@ -296,31 +323,34 @@ _trash/pages/about_456/  ← Trashed location
 ### 1. Prerequisites
 
 **You must have:**
+
 - Skylit Dev I/O WordPress plugin v3.5.0+ installed and activated
 - A WordPress development folder structure like this:
-  ```
-  wp-content/
-  ├── prj-dev-root/          ← Extension watches this
-  │   ├── pages/
-  │   │   └── home_123/
-  │   │       ├── home_123.html
-  │   │       └── home_123.css
-  │   ├── posts/
-  │   ├── products/
-  │   └── _trash/
-  ├── themes/
-  └── plugins/
-  ```
+     ```
+     wp-content/
+     ├── prj-dev-root/          ← Extension watches this
+     │   ├── pages/
+     │   │   └── home_123/
+     │   │       ├── home_123.html
+     │   │       └── home_123.css
+     │   ├── posts/
+     │   ├── products/
+     │   └── _trash/
+     ├── themes/
+     └── plugins/
+     ```
 
 ### 2. Install Extension
 
 **From Marketplace:**
+
 1. Open VS Code/Cursor
 2. Extensions panel (Ctrl+Shift+X)
 3. Search: "Skylit.DEV I/O"
 4. Click Install
 
 **From VSIX file:**
+
 1. Download `skylit-dev-io-X.X.X.vsix`
 2. Extensions panel → `...` → Install from VSIX
 3. Select downloaded file
@@ -334,6 +364,7 @@ _trash/pages/about_456/  ← Trashed location
 5. Copy the generated token (long alphanumeric string)
 
 **What this does:**
+
 - Creates a random 64-character token
 - Saves to WordPress options: `update_option('skylit_extension_token', $token)`
 - Extension uses this token to authenticate API requests
@@ -350,6 +381,7 @@ _trash/pages/about_456/  ← Trashed location
 8. Status bar updates: **"✅ Skylit.DEV I/O"** (green connected state)
 
 **What happens internally:**
+
 ```typescript
 1. Workspace scanned: find wp-config.php, extract site URL
 2. User clicks "Connect to WordPress" → prompts appear
@@ -372,27 +404,28 @@ Open VS Code Settings (Ctrl+,) and search for "Skylit":
 
 ```jsonc
 {
-  // Auto-connect when WordPress detected in workspace (deprecated in v1.3.4)
-  // Connection is now always user-initiated via status bar click
-  "skylit.autoConnect": true,
-  
-  // Milliseconds to wait after file change before syncing
-  // Higher = fewer API calls, lower = faster sync
-  "skylit.debounceMs": 500,
-  
-  // Show desktop notifications for sync success/errors
-  "skylit.showNotifications": true,
-  
-  // Override auto-detected WordPress site URL
-  // Leave empty to auto-detect from wp-config.php
-  // Set this to skip the URL prompt on first connection
-  "skylit.siteUrl": ""
+	// Auto-connect when WordPress detected in workspace (deprecated in v1.3.4)
+	// Connection is now always user-initiated via status bar click
+	"skylit.autoConnect": true,
+
+	// Milliseconds to wait after file change before syncing
+	// Higher = fewer API calls, lower = faster sync
+	"skylit.debounceMs": 500,
+
+	// Show desktop notifications for sync success/errors
+	"skylit.showNotifications": true,
+
+	// Override auto-detected WordPress site URL
+	// Leave empty to auto-detect from wp-config.php
+	// Set this to skip the URL prompt on first connection
+	"skylit.siteUrl": ""
 }
 ```
 
 ### Debounce Explanation
 
 **Without debounce:**
+
 ```
 You type: "Hello World"
 H → sync
@@ -406,6 +439,7 @@ Hello W → sync
 ```
 
 **With 500ms debounce:**
+
 ```
 You type: "Hello World"
 H → (wait)
@@ -422,18 +456,18 @@ Hello World → (wait 500ms) → sync
 
 Access via Command Palette (Ctrl+Shift+P / Cmd+Shift+P):
 
-| Command | What It Does |
-|---------|--------------|
-| `Skylit: Scan for WordPress` | Re-scan workspace for WordPress installations |
-| `Skylit: Connect to WordPress` | Start file watching and connect to WordPress |
-| `Skylit: Disconnect` | Stop file watching (changes won't sync) |
-| `Skylit: Setup Auth Token` | Enter/update WordPress authentication token |
-| `Skylit: Sync Current File` | Force immediate sync of currently open file |
-| `Skylit: Show Menu` | Open quick menu from status bar |
-| `Skylit: Request WordPress ID` | Create WordPress post for folder without ID |
-| `Skylit: Manage Post` | Change status, slug, title, or schedule post |
-| `Skylit: Delete Post` | Trash or permanently delete post + folder |
-| `Skylit: Convert Post Type` | Convert post type (e.g., page → template) |
+| Command                        | What It Does                                  |
+| ------------------------------ | --------------------------------------------- |
+| `Skylit: Scan for WordPress`   | Re-scan workspace for WordPress installations |
+| `Skylit: Connect to WordPress` | Start file watching and connect to WordPress  |
+| `Skylit: Disconnect`           | Stop file watching (changes won't sync)       |
+| `Skylit: Setup Auth Token`     | Enter/update WordPress authentication token   |
+| `Skylit: Sync Current File`    | Force immediate sync of currently open file   |
+| `Skylit: Show Menu`            | Open quick menu from status bar               |
+| `Skylit: Request WordPress ID` | Create WordPress post for folder without ID   |
+| `Skylit: Manage Post`          | Change status, slug, title, or schedule post  |
+| `Skylit: Delete Post`          | Trash or permanently delete post + folder     |
+| `Skylit: Convert Post Type`    | Convert post type (e.g., page → template)     |
 
 ### Context Menu (Right-click folder or HTML file)
 
@@ -450,6 +484,7 @@ Access via Command Palette (Ctrl+Shift+P / Cmd+Shift+P):
 **Symptom:** Status bar stuck on "Disconnected" or "Error"
 
 **Check:**
+
 ```bash
 # 1. Is WordPress running?
 curl http://localhost:8000
@@ -465,6 +500,7 @@ curl http://localhost:8000/wp-json/
 ```
 
 **Fix:**
+
 1. Click status bar → "Disconnect"
 2. WordPress Admin → Skylit → About → Generate New Token
 3. Click status bar → "Setup Auth Token"
@@ -476,12 +512,14 @@ curl http://localhost:8000/wp-json/
 **Symptom:** You edit files, but Gutenberg doesn't update
 
 **Check:**
+
 1. Status bar shows "✅ Connected" (not disconnected/error)
 2. File is inside `prj-dev-root/` folder
 3. File is `*.html` or `*.css` (other extensions not watched)
 4. Post folder follows format: `{slug}_{post_id}/`
 
 **Debug:**
+
 ```typescript
 // Open Output panel
 View → Output → Select "Skylit Dev UI"
@@ -505,6 +543,7 @@ View → Output → Select "Skylit Dev UI"
 ```
 
 **Force sync:**
+
 1. Open file in editor
 2. Command Palette → "Skylit: Sync Current File"
 3. Check Output panel for response
@@ -514,6 +553,7 @@ View → Output → Select "Skylit Dev UI"
 **Symptom:** Moving folders to `_trash/` doesn't trash posts
 
 **Common mistakes:**
+
 ```
 ✗ Wrong: pages/home_123 → Recycle Bin (OS trash, extension can't detect)
 ✓ Right: pages/home_123 → _trash/pages/home_123 (extension detects)
@@ -526,6 +566,7 @@ View → Output → Select "Skylit Dev UI"
 ```
 
 **Check folder name:**
+
 ```typescript
 // Folder name must be: {slug}_{post_id}
 pages/about_456/          ← Correct
@@ -539,21 +580,23 @@ pages/about-page_456/     ← Correct (slug can have hyphens)
 **Symptom:** Extension feels slow, many notifications
 
 **Possible causes:**
+
 1. **Debounce too low:** Set `skylit.debounceMs` higher (1000-2000ms)
 2. **Too many files:** Extension watches entire `prj-dev-root/`, if you have 1000s of files, performance drops
 3. **Network latency:** Slow connection to WordPress server
 
 **Optimize:**
+
 ```jsonc
 {
-  // Increase debounce (wait longer before syncing)
-  "skylit.debounceMs": 1500,
-  
-  // Disable notifications (less UI overhead)
-  "skylit.showNotifications": false,
-  
-  // Manually control connection
-  "skylit.autoConnect": false
+	// Increase debounce (wait longer before syncing)
+	"skylit.debounceMs": 1500,
+
+	// Disable notifications (less UI overhead)
+	"skylit.showNotifications": false,
+
+	// Manually control connection
+	"skylit.autoConnect": false
 }
 ```
 
@@ -562,6 +605,7 @@ pages/about-page_456/     ← Correct (slug can have hyphens)
 ## Cross-Platform Support
 
 This extension is fully cross-platform and works identically on:
+
 - ✅ Windows (local)
 - ✅ macOS (local)
 - ✅ Linux (local)
@@ -569,6 +613,7 @@ This extension is fully cross-platform and works identically on:
 - ✅ WSL (Windows Subsystem for Linux)
 
 **How this is achieved:**
+
 - All dependencies bundled via webpack into single JavaScript file
 - Platform-specific modules (like `fsevents` on macOS) marked as optional
 - Uses Node.js `path` module for cross-platform path handling
@@ -576,6 +621,7 @@ This extension is fully cross-platform and works identically on:
 
 **Remote SSH:**
 When you connect to a remote server via SSH, the extension runs **on the remote server** (not your local machine). This means:
+
 - File watching happens on the server
 - API calls are made from server to WordPress (likely localhost on server)
 - No network latency between extension and WordPress
@@ -587,10 +633,12 @@ When you connect to a remote server via SSH, the extension runs **on the remote 
 ### Dependencies
 
 **Runtime:**
+
 - `chokidar` ^3.5.3 - File system watcher
 - `axios` ^1.6.0 - HTTP client
 
 **Dev:**
+
 - `typescript` ^5.0.0 - Type-safe compilation
 - `webpack` ^5.104.1 - Dependency bundling
 - `ts-loader` ^9.5.4 - TypeScript webpack loader
@@ -614,6 +662,7 @@ When you connect to a remote server via SSH, the extension runs **on the remote 
 ## Roadmap
 
 ### Current Version (1.3.1)
+
 - ✅ Cross-platform support (Windows, Mac, Linux, SSH)
 - ✅ File sync (HTML/CSS)
 - ✅ Folder actions (trash/restore/delete)
@@ -623,6 +672,7 @@ When you connect to a remote server via SSH, the extension runs **on the remote 
 - ✅ New folder detection
 
 ### Future Versions
+
 - **v1.4.0**: WebSocket support (eliminate polling, < 500ms latency)
 - **v1.5.0**: Conflict detection (warn if file edited in both places)
 - **v1.6.0**: Visual diff viewer (see changes before syncing)
@@ -632,7 +682,8 @@ When you connect to a remote server via SSH, the extension runs **on the remote 
 
 ## License
 
-GPL-2.0-or-later
+Proprietary - All Rights Reserved. Copyright (c) 2026 Dimy Osman.
+See [LICENSE](LICENSE) for full terms. No forking, redistribution, or derivative works permitted.
 
 ---
 

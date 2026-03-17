@@ -11,6 +11,7 @@ import * as vscode from 'vscode';
 export class DebugLogger {
     private outputChannel: vscode.OutputChannel;
     private isDebugEnabled: boolean = false;
+    private isProfileEnabled: boolean = false;
 
     constructor(outputChannel: vscode.OutputChannel) {
         this.outputChannel = outputChannel;
@@ -18,7 +19,7 @@ export class DebugLogger {
         
         // Listen for settings changes
         vscode.workspace.onDidChangeConfiguration((e) => {
-            if (e.affectsConfiguration('skylit.debugOutput')) {
+            if (e.affectsConfiguration('skylit.debugOutput') || e.affectsConfiguration('skylit.debugProfile')) {
                 this.updateDebugStatus();
             }
         });
@@ -30,6 +31,7 @@ export class DebugLogger {
     private updateDebugStatus() {
         const config = vscode.workspace.getConfiguration('skylit');
         this.isDebugEnabled = config.get<boolean>('debugOutput', false);
+        this.isProfileEnabled = config.get<boolean>('debugProfile', false);
     }
 
     /**
@@ -37,6 +39,36 @@ export class DebugLogger {
      */
     public isEnabled(): boolean {
         return this.isDebugEnabled;
+    }
+
+    /**
+     * Check if profile/timing logging is enabled
+     */
+    public isProfileEnabledFlag(): boolean {
+        return this.isProfileEnabled;
+    }
+
+    /**
+     * Log a profile line: process name, duration ms, heap (when debugProfile is on).
+     * Only outputs when skylit.debugProfile is true; use with debugOutput for full log.
+     */
+    public profile(label: string, durationMs: number, extra?: string) {
+        if (!this.isProfileEnabled) return;
+        const heap = typeof process !== 'undefined' && process.memoryUsage ? Math.round(process.memoryUsage().heapUsed / 1024) : 0;
+        const extraStr = extra ? ` ${extra}` : '';
+        this.outputChannel.appendLine(`[Profile] ${label} ${durationMs}ms heap=${heap}kb${extraStr}`);
+    }
+
+    /**
+     * Start a profile timer; call the returned function to end and log duration.
+     * The returned function accepts an optional extra string (e.g. "skip: reason" or "post 123").
+     */
+    public profileStart(label: string): (extra?: string) => void {
+        if (!this.isProfileEnabled) return () => {};
+        const start = Date.now();
+        return (extra?: string) => {
+            this.profile(label, Date.now() - start, extra);
+        };
     }
 
     /**

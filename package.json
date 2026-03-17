@@ -2,7 +2,7 @@
 	"name": "skylit-dev-io",
 	"displayName": "Skylit.DEV I/O - WordPress Sync",
 	"description": "VS Code/Cursor extension for instant WordPress Gutenberg sync. Solves WP Cron unreliability on local development. Requires Skylit.DEV WordPress plugin.",
-	"version": "1.16.2",
+	"version": "1.53.9",
 	"publisher": "dimy-osman",
 	"license": "SEE LICENSE IN LICENSE",
 	"engines": {
@@ -54,6 +54,18 @@
 				"title": "Skylit: Sync Current File"
 			},
 			{
+				"command": "skylit.pushMediaToWP",
+				"title": "Skylit: Push All Media to WordPress"
+			},
+			{
+				"command": "skylit.importMediaFromWP",
+				"title": "Skylit: Import All Media from WordPress"
+			},
+			{
+				"command": "skylit.fullMediaSync",
+				"title": "Skylit: Full Media Sync (bidirectional)"
+			},
+			{
 				"command": "skylit.showMenu",
 				"title": "Skylit: Show Menu"
 			},
@@ -84,6 +96,42 @@
 			{
 				"command": "skylit.relocateDevFolder",
 				"title": "Skylit: Relocate Dev Folder (move to local or another location)"
+			},
+			{
+				"command": "skylit.openInGutenberg",
+				"title": "Skylit: Open in Gutenberg"
+			},
+			{
+				"command": "skylit.repairMetadata",
+				"title": "Skylit: Repair Block Metadata"
+			},
+			{
+				"command": "skylit.repairBlocks",
+				"title": "Skylit: Repair Blocks (force re-import current page)"
+			},
+			{
+				"command": "skylit.repairCssStorage",
+				"title": "Skylit: Repair CSS Storage (current page in DB)"
+			},
+			{
+				"command": "skylit.repairCssStorageAll",
+				"title": "Skylit: Repair CSS Storage (all posts, batched)"
+			},
+			{
+				"command": "skylit.repairAll",
+				"title": "Skylit: Repair All Posts (clear sync hashes)"
+			},
+			{
+				"command": "skylit.manageSites",
+				"title": "Skylit: Manage Sites (view, switch, remove paired domains)"
+			},
+			{
+				"command": "skylit.switchSite",
+				"title": "Skylit: Switch Site (change active WordPress connection)"
+			},
+			{
+				"command": "skylit.settings",
+				"title": "Skylit: Settings"
 			}
 		],
 		"menus": {
@@ -102,6 +150,11 @@
 					"command": "skylit.deletePost",
 					"when": "explorerResourceIsFolder",
 					"group": "skylit@3"
+				},
+				{
+					"command": "skylit.openInGutenberg",
+					"when": "explorerResourceIsFolder",
+					"group": "skylit@4"
 				}
 			],
 			"editor/context": [
@@ -119,9 +172,22 @@
 					"command": "skylit.deletePost",
 					"when": "resourceExtname == .html",
 					"group": "skylit@3"
+				},
+				{
+					"command": "skylit.openInGutenberg",
+					"when": "resourceExtname == .html",
+					"group": "skylit@4"
 				}
 			]
 		},
+		"keybindings": [
+			{
+				"command": "skylit.openInGutenberg",
+				"key": "ctrl+alt+g",
+				"mac": "cmd+alt+g",
+				"when": "editorTextFocus && resourceExtname == .html"
+			}
+		],
 		"configuration": {
 			"title": "Skylit.DEV I/O",
 			"properties": {
@@ -148,7 +214,8 @@
 				"skylit.siteUrl": {
 					"type": "string",
 					"default": "",
-					"description": "WordPress site URL (auto-detected from wp-config.php if empty). Required for remote dev folder mode."
+					"scope": "window",
+					"description": "WordPress site URL (workspace-scoped). Auto-detected from wp-config.php if empty. Required for remote dev folder mode. NOTE: Should be set per-workspace, not globally."
 				},
 				"skylit.localDevPath": {
 					"type": "string",
@@ -159,6 +226,11 @@
 					"type": "boolean",
 					"default": false,
 					"description": "Enable debug output in the Output panel (useful for troubleshooting)"
+				},
+				"skylit.debugProfile": {
+					"type": "boolean",
+					"default": false,
+					"description": "Log process/timing/resource usage (which process, duration ms, heap). Enable with debugOutput to see exact picture of what consumes what and why."
 				}
 			}
 		}
@@ -177,6 +249,7 @@
 		"@types/vscode": "^1.80.0",
 		"@typescript-eslint/eslint-plugin": "^6.0.0",
 		"@typescript-eslint/parser": "^6.0.0",
+		"@vscode/vsce": "^3.7.1",
 		"eslint": "^8.0.0",
 		"ts-loader": "^9.5.4",
 		"typescript": "^5.0.0",

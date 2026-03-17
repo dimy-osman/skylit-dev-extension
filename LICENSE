@@ -1,20 +1,77 @@
-GNU GENERAL PUBLIC LICENSE
-Version 2, June 1991
+Skylit.DEV I/O - Proprietary Software License
 
-Copyright (C) 1989, 1991 Free Software Foundation, Inc.
-51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
+Copyright (c) 2026 Dimy Osman. All Rights Reserved.
 
-Everyone is permitted to copy and distribute verbatim copies
-of this license document, but changing it is not allowed.
+NOTICE: This software and all associated files, documentation, and assets
+(collectively, the "Software") are the proprietary property of Dimy Osman
+and Skylit.DEV ("Licensor"). The Software is protected by copyright laws,
+international treaties, and other intellectual property laws.
 
-(Full GPL-2.0 license text would go here - truncated for brevity)
+1. GRANT OF LICENSE
+   A valid license key, purchased from the Licensor, grants you ("Licensee")
+   a non-exclusive, non-transferable, revocable right to install and use the
+   Software on the number of sites specified by your license tier.
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
+2. RESTRICTIONS
+   You may NOT, under any circumstances:
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+   a) Copy, reproduce, duplicate, or distribute the Software or any portion
+      thereof to any third party, whether free of charge or for compensation.
+
+   b) Fork, clone, mirror, or create derivative works based on the Software,
+      its source code, architecture, or design.
+
+   c) Sublicense, lease, rent, lend, sell, resell, or otherwise transfer the
+      Software or any rights therein to any third party.
+
+   d) Reverse engineer, decompile, disassemble, or otherwise attempt to
+      derive the source code, algorithms, or data structures of the Software,
+      except to the limited extent expressly permitted by applicable law
+      notwithstanding this restriction.
+
+   e) Remove, alter, or obscure any copyright notices, proprietary legends,
+      trademarks, or branding contained in or on the Software.
+
+   f) Use the Software to build a competing product or service.
+
+   g) Share, publish, or disclose your license key or authentication
+      credentials to any third party.
+
+   h) Use the Software beyond the scope of the purchased license tier.
+
+3. OWNERSHIP
+   The Software, including all copies, modifications, enhancements, and
+   derivative works, is and shall remain the sole and exclusive property
+   of the Licensor. Nothing in this license transfers ownership of the
+   Software or any intellectual property rights to the Licensee.
+
+4. TERMINATION
+   This license is effective until terminated. It will terminate automatically
+   without notice if you fail to comply with any term of this agreement. Upon
+   termination, you must immediately cease all use of the Software and destroy
+   all copies in your possession or control.
+
+5. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. THE LICENSOR DOES
+   NOT WARRANT THAT THE SOFTWARE WILL BE ERROR-FREE OR UNINTERRUPTED.
+
+6. LIMITATION OF LIABILITY
+   IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL,
+   SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES ARISING OUT OF OR RELATED
+   TO THE USE OF OR INABILITY TO USE THE SOFTWARE, EVEN IF ADVISED OF THE
+   POSSIBILITY OF SUCH DAMAGES. THE LICENSOR'S TOTAL LIABILITY SHALL NOT
+   EXCEED THE AMOUNT PAID BY THE LICENSEE FOR THE SOFTWARE LICENSE.
+
+7. GOVERNING LAW
+   This agreement shall be governed by and construed in accordance with
+   applicable law, without regard to conflict of law principles.
+
+8. ENTIRE AGREEMENT
+   This license constitutes the entire agreement between the parties
+   regarding the Software and supersedes all prior agreements,
+   understandings, and representations.
+
+For licensing inquiries: https://skylit.dev/license
+Contact: hello@skylit.dev

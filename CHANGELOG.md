@@ -2,6 +2,209 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.53.9] - 2026-03-17
+
+### Fixed
+
+- **Startup sync serialisation** — All `import-instant` calls issued during the startup reconciliation loop (WP ↔ Dev) are now routed through `enqueueImport` so they run one at a time, eliminating the concurrent-request storm that caused HTTP 500 errors on shared hosting when many posts changed while the extension was offline.
+- **Retry-with-backoff for `import-instant`** — Individual sync calls now retry up to 3 times on HTTP 500/502/503 or network errors, with a 5-second delay between attempts, before reporting failure.
+- **Taxonomy JSON feedback-loop prevention** — After the extension syncs `taxonomies/*.json` files to WordPress, the plugin writes updated term data back to those same files. The extension now stamps each taxonomy JSON path with `lastThemeSyncTime` and suppresses re-fires within a 10-second cooldown window, breaking the infinite sync loop in same-machine mode.
+
+### Changed
+
+- **`importQueueIntervalMs` reverted to 1 500 ms** — The gap between sequential `import-instant` queue entries was temporarily raised to 4 500 ms to compensate for server load; after root-cause analysis confirmed that incorrect CPT metadata data types (not concurrency) were the primary source of 500 errors, the interval was returned to 1 500 ms for a more responsive experience.
+
+### Added
+
+- **`import-instant` queue** — A client-side serialisation queue (`enqueueImport`) channels all `import-instant` API calls through a single in-flight slot with a configurable inter-call gap, preventing parallel PHP processes from exhausting shared-hosting worker pools.
+- **Taxonomy JSON batch debounce** — Multiple `taxonomies/*.json` changes fired in quick succession are coalesced into a single `syncTaxonomyJsonToWp` call after a 2-second settling period, reducing unnecessary API traffic when ACF or WP writes several taxonomy files at once.
+
+## [1.52.2] - 2026-03-05
+
+### Changed
+
+- **Version bump** — 1.52.2. Compatible with plugin 5.77.20 (IDE→GT import fix, CSS corruption fixes).
+
+## [1.52.1] - 2026-03-04
+
+### Fixed
+
+- **Slug-only folders for Skylit commands** — `Skylit: Manage Post`, `Delete Post`, and `Convert Post Type` now resolve post ID via `getPostIdForFile()` (metadata cache / HTML header) when the folder has no `_ID` suffix, so slug-only pattern/page folders work.
+- **Pattern metadata parsing** — `extractPostInfo` now matches both `Post ID:` and `ID:` in HTML metadata headers for pattern files.
+- **Import-instant includes page CSS** — `syncFile` sends `css_hash`; import-instant checks both `html_hash` and `css_hash` before skipping, so page CSS changes trigger import and preview refresh.
+- **Cursor sync "block not found" spam** — `lastSyncedCursorBlockId` is updated even when the target block is not found, so the same missing block is not logged repeatedly.
+
+### Technical
+
+- Extension uses `POST /sync/update-from-metadata` for post updates (status, slug, title, etc.) when managing posts from the IDE.
+
+## [1.52.0] - 2026-03-04
+
+### Fixed
+
+- **🔒 CRITICAL: Workspace-only siteUrl enforcement**: Extension no longer uses user-level `siteUrl` settings
+  - Previously, if `skylit.siteUrl` was set in User Settings, the extension would attempt to connect in ALL workspaces
+  - This caused unwanted connections, workspace lock conflicts, and notifications in unrelated projects
+  - Now: `siteUrl` is strictly workspace-scoped. User-level values are ignored.
+  - Extension only connects when the current workspace has `siteUrl` configured in `.vscode/settings.json`
+  - Added migration warning: If user-level `siteUrl` is detected, shows one-time notification suggesting to move to workspace settings
+  - Fixes multi-window workflow where users work on multiple projects simultaneously
+  
+### Changed
+
+- **Configuration scope**: `skylit.siteUrl` is now marked as `"scope": "window"` in package.json
+- **Auto-connect behavior**: Extension only auto-connects when workspace has explicit `siteUrl` configuration
+- **Status bar**: Shows "Configure workspace siteUrl" instead of trying to connect with user-level settings
+
+### Added
+
+- New helper functions in extension.ts:
+  - `getWorkspaceSiteUrl()` - Gets workspace-level `siteUrl` only (ignores user level)
+  - `getUserLevelSiteUrl()` - Detects if user has user-level `siteUrl` configured (for migration warning)
+- One-time migration notification when user-level `siteUrl` is detected
+
+### Technical Details
+
+- Uses `inspect()` API to separate workspace-level values from user-level values
+- Only `workspaceValue` and `workspaceFolderValue` are used for connection
+- `globalValue` (user-level) is detected but ignored for `siteUrl`
+- Migration warning stored in global state to show only once per install
+
+## [1.49.3] - 2026-03-03
+
+### Fixed
+
+- **IDE→GT cursor sync not updating active-block.txt**: Cursor tracking was logging at debug-only level, masking silent failures. Promoted critical cursor sync logs (metadata load, block writes, errors) to always-visible `info` level. Also reset `lastCursorBlockId` dedup guard on full-file replacement and rescan-lines — previously, after format-on-save or file reload, the dedup guard held the old block ID and suppressed subsequent writes even though the cursor had moved to a different block.
+
+- **IDE saves blocked by circular sync prevention**: `checkForChanges` was returning `skip_import=true` for legitimate user saves because Gutenberg's frequent exports kept refreshing the server-side export timestamp. Replaced server-round-trip check with local `selfWrittenPaths` tracking — only files the extension itself wrote (canonical HTML writeback, startup sync) are skipped. User-initiated saves now always proceed to import-instant.
+
+- **Sync cooldown too aggressive**: Reduced `syncCooldownMs` from 3s to 1.5s so rapid saves aren't dropped.
+
+## [1.49.1] - 2026-03-03
+
+### Changed
+
+- **Version bump** — 1.49.1. Ensures latest rescan-lines and sync fixes are distributed; use this build to avoid cache issues.
+
+## [1.49.0] - 2026-03-03
+
+### Added
+
+- **Rescan-lines after IDE save**: Extension now calls `POST /sync/rescan-lines/{post_id}` 800ms after import-instant completes. This uses sequential structural matching (DB blocks → HTML file) to update metadata line numbers, keeping jump-to-line and cursor sync accurate even after format-on-save reformats the HTML.
+
+- **REST client `rescanLines()` method**: New API method for the rescan-lines endpoint.
+
+### Fixed
+
+- **Cursor sync broken after format-on-save**: Previously, if format-on-save changed line counts (e.g. 608 → 1019 lines), metadata became stale and cursor sync / jump-to-line would go to wrong positions. The post-save rescan fixes this by re-mapping blocks to their actual positions in the formatted file.
+
+## [1.48.5] - 2026-03-03
+
+### Fixed
+
+- **IDE→WP import diagnostic**: Added info-level logging to `syncFile` and `extractPostInfo` so every bailout point (startup skip, cooldown, no post info, circular sync prevention, metadata change, error) is visible in the extension output panel. Previously these were at debug level and invisible, making it impossible to diagnose why IDE saves weren't reaching WordPress.
+
+## [1.48.4] - 2026-03-03
+
+### Fixed
+
+- **Lottie block settings not syncing from IDE to GT**: Improved lottie-player round-trip by adding `data-skylit-*` attr parsing priority in compiler, whitelisting boolean/play attrs in the cleanup step so metadata attrs survive, adding lottie to the PHP block schema, aligning `background` default handling between PHP and JS save(), and adding debug logging for lottie extraction and innerHTML generation.
+
+- **Jump-to-line infinite loop**: Fixed jump-to-code polling re-executing the same jump endlessly when server-level HTTP caching (e.g. LiteSpeed) returned stale GET responses. Replaced time-based dedup with server-timestamp dedup, added cache-busting query params, no-cache response headers, and an explicit POST `/sync/clear-jump` endpoint to reliably delete the transient.
+
+## [1.47.9] - 2026-03-01
+
+### Changed
+
+- **Version bump** — 1.47.9.
+
+## [1.47.8] - 2026-03-01
+
+### Fixed
+
+- **Cursor jumps to end of file on save**: When an export write or canonical HTML write replaced the file externally, VS Code reloaded it and moved the cursor to EOF. Now both `writeExportLocally` (export poller) and the canonical HTML write (sync response) save the cursor position before writing and restore it after a short delay. Uses block-aware restore via `active-block.txt` + payload metadata to find the correct line even when content shifts.
+
+## [1.47.7] - 2026-03-01
+
+### Fixed
+
+- **Second unwanted jump after GT→IDE Ctrl+Alt+Click**: After jumping to the correct line in the IDE, the cursor change triggered `processCursorPosition` → wrote `active-block.txt` → GT polled and selected the block → Gutenberg sometimes shifted focus to a parent block → different `cursor_block_id` sent back → second jump to the wrong line. Fixed by adding a 2.5-second cursor sync cooldown (`suppressCursorSyncBriefly`) that activates after every GT→IDE jump. During the cooldown, cursor changes are ignored and no `active-block.txt` writes occur.
+
+## [1.47.6] - 2026-02-28
+
+### Added
+
+- **Real-time line tracking** — Block line numbers are now shifted in memory on every edit (`onDidChangeTextDocument`), the same way IDEs track breakpoints. Lines stay accurate between saves without re-reading metadata from disk. Cache is invalidated on full-file replacement (formatter, AI agent) or when metadata JSON changes on disk (GT save, IDE save re-export).
+
+## [1.47.5] - 2026-02-28
+
+### Fixed
+
+- **Block selector (IDE → GT)** — Cursor position now resolved via metadata JSON (`findBlockForLine`) instead of scanning the HTML document for `data-layout-block-id` (which is stripped from exported HTML and was never found). This restores IDE→GT block selection entirely.
+
+## [1.47.4] - 2026-02-28
+
+### Fixed
+
+- **Jump-to-line (GT → IDE)** — Shorter dedup window (2s) so rapid or repeated clicks to different blocks are no longer ignored.
+- **Block selector (IDE → GT)** — Cursor position now derived by scanning the live document for `data-layout-block-id` instead of metadata JSON, avoiding wrong or missing block selection when HTML was edited and metadata was stale.
+- **Scrolling** — Block highlight/scroll only runs when the block is not already visible; uses `nearest` alignment to reduce editor jumpiness.
+
+## [1.47.1] - 2026-02-27
+
+### Added
+
+- **Repair commands** — New commands for diagnosing and fixing sync/encoding issues:
+  - **Skylit: Repair Blocks (force re-import current page)** — Re-import current page from file to fix block structure.
+  - **Skylit: Repair CSS Storage (current page in DB)** — Repair corrupted block CSS storage for the current post.
+  - **Skylit: Repair CSS Storage (all posts, batched)** — Batch repair CSS storage across all posts.
+  - **Skylit: Repair All Posts (clear sync hashes)** — Clear all sync hashes so content re-compiles on next sync.
+- Commands available from Command Palette and status bar menu; repair endpoints require plugin 5.65.0+.
+
+## [1.34.0] - 2026-02-26
+
+### Fixed
+
+- **Robust token validation** — Raw HTTP diagnostics, query-param auth fallback when Authorization header is stripped (e.g. Hostinger/LiteSpeed); token no longer deleted on server errors so connection can recover.
+- Works with plugin 5.46.0 lightweight auth/discover/status routes.
+
+## [1.32.0] - 2026-02-25
+
+### Fixed
+
+- **Auth token validation loop** — Prevents validation loop; supports opt-in metadata repair from plugin 5.44.0.
+
+## [1.31.0] - 2026-02-25
+
+### Performance
+
+- **Memory and sync optimization** — Context-aware loading, hash-aware sync, tuned polling; aligns with plugin 5.43.0.
+
+## [1.17.0] - 2026-02-23
+
+### Added
+
+- **Slug-only folders** — New folders use slug-only names (no `_ID` suffix); metadata in `.skylit/metadata/{post_id}.json`; seamless AI/IDE page creation without renaming.
+- Requires plugin 5.18.0 (migration tool, WP Cron removed).
+
+## [1.16.6] - 2026-02-22
+
+### Fixed
+
+- **SSH / remote dev path** — When dev folder is on SSH remote, skip native file watchers and use save-dialog flow for local path; avoids watcher failures on remote filesystems.
+
+## [1.16.0] - 2026-02-22
+
+### Added
+
+- **Remote dev folder support** — Full compatibility with plugin remote mode: push-files endpoint and guards; extension supports plugin-initiated relocation (plugin 5.17.0).
+
+## [1.15.15] - 2026-02-22
+
+### Added
+
+- **Remote dev folder mode** — Relocation polling so extension stays in sync when plugin moves or relocates the dev folder (plugin 5.16.47).
+
 ## [1.13.0] - 2026-02-05
 
 ### ✨ New Command: Manage Post

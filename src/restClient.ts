@@ -4,6 +4,7 @@
  */
 
 import axios, { AxiosInstance, AxiosError } from "axios";
+import { createHash } from "crypto";
 import * as vscode from "vscode";
 import { DebugLogger } from "./debugLogger";
 import {
@@ -13,6 +14,14 @@ import {
 	StatusResponse,
 	BlockLocationResponse,
 	AssetSyncResponse,
+	PendingExportsResponse,
+	ExportPayload,
+	ExportAllResponse,
+	DiscoverResponse,
+	SkillsetFilesResponse,
+	MediaPushResponse,
+	MediaRenameResponse,
+	MediaSettingsResponse,
 } from "./types";
 
 export class RestClient {
@@ -20,6 +29,15 @@ export class RestClient {
 	private debugLogger: DebugLogger;
 	private baseUrl: string;
 	private token: string;
+	public isRemoteMode: boolean = false;
+	private useQueryParamAuth: boolean = false;
+
+	/**
+	 * Get the base site URL this client is connected to
+	 */
+	getSiteUrl(): string {
+		return this.baseUrl;
+	}
 
 	constructor(siteUrl: string, token: string, debugLogger: DebugLogger) {
 		this.baseUrl = siteUrl.replace(/\/$/, ""); // Remove trailing slash
@@ -36,6 +54,15 @@ export class RestClient {
 			},
 		});
 
+		// Request interceptor: append token as query param when header auth is stripped
+		this.client.interceptors.request.use((config) => {
+			if (this.useQueryParamAuth) {
+				config.params = config.params || {};
+				config.params._skylit_token = this.token;
+			}
+			return config;
+		});
+
 		// Add response interceptor for error handling
 		this.client.interceptors.response.use(
 			(response) => response,
@@ -44,79 +71,357 @@ export class RestClient {
 	}
 
 	/**
+	 * Discovery endpoint (no auth required) - returns canonical siteUrl and devPath
+	 * Call this BEFORE authentication to get the correct site URL
+	 */
+	static async discover(
+		baseUrl: string,
+		debugLogger: DebugLogger
+	): Promise<DiscoverResponse | null> {
+		const url = `${baseUrl.replace(/\/$/, "")}/wp-json/skylit/v1/sync/discover`;
+		debugLogger.log(`🔍 Discovering site config from ${url}`);
+
+		try {
+			const response = await axios.get(url, {
+				timeout: 10000,
+			});
+			if (response.data?.siteUrl) {
+				debugLogger.log(
+					`   ✅ Discovered: siteUrl=${response.data.siteUrl}, devPath=${
+						response.data.devPath || "(remote)"
+					}, remoteCapable=${response.data.remoteCapable || false}`
+				);
+				return {
+					siteUrl: response.data.siteUrl.replace(/\/$/, ""),
+					devPath: response.data.devPath || "",
+					remoteCapable: response.data.remoteCapable || false,
+				};
+			}
+		} catch (error: any) {
+			debugLogger.log(`   ⚠️ Discovery failed: ${error.message}`);
+		}
+		return null;
+	}
+
+	/**
 	 * Validate auth token
 	 */
-	async validateToken(): Promise<boolean> {
+	/**
+	 * Result of token validation with reason for failure.
+	 * `tokenInvalid` is true ONLY when the server explicitly rejected the token.
+	 * When false, the failure is due to network/server issues and the token should be kept.
+	 */
+	async validateToken(): Promise<{ valid: boolean; tokenInvalid: boolean }> {
+		const tokenPreview = this.token
+			? `${this.token.substring(0, 12)}...${this.token.substring(this.token.length - 4)}`
+			: "(empty)";
+		const url = `${this.baseUrl}/wp-json/skylit/v1/sync/validate-token`;
+
+		// Attempt 1: Header-based auth (standard Bearer token)
+		this.debugLogger.log(
+			`🔑 Validating token (${tokenPreview}) against ${this.baseUrl}...`
+		);
 		try {
-			this.debugLogger.log("🔑 Validating auth token...");
+			const resp = await axios.get(url, {
+				timeout: 30000,
+				headers: {
+					Authorization: `Bearer ${this.token}`,
+					"Content-Type": "application/json",
+				},
+				validateStatus: () => true,
+			});
 
-			const response =
-				await this.client.get<TokenValidationResponse>(
-					"/sync/validate-token"
-				);
+			this.debugLogger.log(
+				`   Header auth → HTTP ${resp.status} — ${JSON.stringify(resp.data)}`
+			);
 
-			if (response.data.valid) {
-				const userId =
-					response.data.user_id || "Unknown";
-				this.debugLogger.log(
-					`✅ Token valid for user ID: ${userId}`
-				);
-				return true;
+			if (resp.status === 200 && resp.data?.valid) {
+				this.debugLogger.log(`✅ Token valid (header auth) for user ${resp.data.user_id}`);
+				return { valid: true, tokenInvalid: false };
 			}
 
-			return false;
-		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Token validation failed: ${error.message}`
-			);
-			return false;
+			// 404 = REST route not registered = plugin crashed/deactivated
+			if (resp.status === 404) {
+				this.debugLogger.error(
+					"❌ Skylit REST API not found (HTTP 404). Plugin may have crashed or is deactivated."
+				);
+				return { valid: false, tokenInvalid: false };
+			}
+
+			// 500 = server error (likely memory exhaustion)
+			if (resp.status >= 500) {
+				this.debugLogger.error(
+					`❌ Server error (HTTP ${resp.status}). Check PHP error log — likely memory exhaustion.`
+				);
+				return { valid: false, tokenInvalid: false };
+			}
+		} catch (err: any) {
+			this.debugLogger.log(`   Header auth network error: ${err.message}`);
 		}
+
+		// Attempt 2: Query parameter auth (for hosts that strip Authorization header)
+		this.debugLogger.log(
+			"🔄 Header auth failed — retrying with query parameter auth..."
+		);
+		try {
+			const resp2 = await axios.get(url, {
+				timeout: 30000,
+				params: { _skylit_token: this.token },
+				headers: { "Content-Type": "application/json" },
+				validateStatus: () => true,
+			});
+
+			this.debugLogger.log(
+				`   Query param auth → HTTP ${resp2.status} — ${JSON.stringify(resp2.data)}`
+			);
+
+			if (resp2.status === 200 && resp2.data?.valid) {
+				this.useQueryParamAuth = true;
+				this.debugLogger.log(
+					`✅ Token valid (query param mode) for user ${resp2.data.user_id}`
+				);
+				this.debugLogger.info(
+					"ℹ️ Your host strips the Authorization header. Using query param auth.\n" +
+					"   For better security, add to .htaccess: RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]"
+				);
+				return { valid: true, tokenInvalid: false };
+			}
+
+			if (resp2.status === 404) {
+				this.debugLogger.error(
+					"❌ Skylit REST API not found (404). The plugin is not active on this WordPress site."
+				);
+				return { valid: false, tokenInvalid: false };
+			}
+
+			if (resp2.status >= 500) {
+				this.debugLogger.error(
+					`❌ Server error (HTTP ${resp2.status}). WordPress is crashing — check PHP error log.`
+				);
+				return { valid: false, tokenInvalid: false };
+			}
+
+			// 401 from both header and query param = token is genuinely wrong
+			if (resp2.status === 401) {
+				this.debugLogger.log("❌ Token rejected by WordPress (401 on both auth methods).");
+				return { valid: false, tokenInvalid: true };
+			}
+		} catch (err: any) {
+			this.debugLogger.log(`   Query param auth network error: ${err.message}`);
+		}
+
+		this.debugLogger.log("❌ Could not validate token — server may be down or unreachable.");
+		return { valid: false, tokenInvalid: false };
 	}
 
 	/**
 	 * Get plugin status
 	 */
 	async getStatus(): Promise<StatusResponse> {
-		const response = await this.client.get<StatusResponse>(
-			"/sync/status"
-		);
+		const response = await this.client.get<StatusResponse>("/sync/status");
 		return response.data;
 	}
 
 	/**
-	 * Sync file instantly to WordPress
+	 * Sync file instantly to WordPress.
+	 *
+	 * Automatically retries on HTTP 503 (plugin's import queue timeout).
+	 * The plugin sets a Retry-After header; we honour it so shared-hosting
+	 * PHP workers have time to drain before the next attempt.
 	 */
 	async syncFile(
 		postId: number,
 		html: string,
-		css: string
+		css: string,
+		_retriesLeft: number = 4
 	): Promise<SyncResponse> {
+		const profileEnd = this.debugLogger.profileStart("REST import-instant");
 		this.debugLogger.log(`📤 Syncing post ${postId}...`);
 
 		try {
+			const html_hash = createHash("md5").update(html).digest("hex");
+			const css_hash = css
+				? createHash("md5").update(css).digest("hex")
+				: null;
+			const body: Record<string, unknown> = {
+				post_id: postId,
+				html: html,
+				css: css,
+				trigger: "extension",
+				html_hash,
+				css_hash,
+			};
+			if (this.isRemoteMode) {
+				body.include_canonical = true;
+			}
 			const response = await this.client.post<SyncResponse>(
 				"/sync/import-instant",
-				{
-					post_id: postId,
-					html: html,
-					css: css,
-					trigger: "extension",
-				}
+				body
 			);
 
+			profileEnd(`post ${postId} blocks=${response.data.blocks_updated ?? 0}`);
 			if (response.data.success) {
 				this.debugLogger.log(
-					`✅ Synced! ${
-						response.data.blocks_updated ||
-						0
-					} blocks updated`
+					`✅ Synced! ${response.data.blocks_updated || 0} blocks updated`
 				);
 			}
 
 			return response.data;
 		} catch (error: any) {
+			profileEnd(`post ${postId} error`);
+
+			const httpStatus = error?.response?.status ?? error?.status;
+
+			// 503 = plugin's import serialization queue timed out (too many concurrent
+			// imports).  Wait for the Retry-After period and try again, up to _retriesLeft
+			// attempts.  This handles bursts where the AI saves many files at once.
+			if (httpStatus === 503 && _retriesLeft > 0) {
+				const retryAfterSec = parseInt(
+					error?.response?.headers?.["retry-after"] ?? "5",
+					10
+				);
+				const waitMs = retryAfterSec * 1000;
+				this.debugLogger.log(
+					`⏳ [syncFile] post ${postId} → 503, retrying in ${retryAfterSec}s (${_retriesLeft} retries left)...`
+				);
+				await new Promise<void>((r) => setTimeout(r, waitMs));
+				return this.syncFile(postId, html, css, _retriesLeft - 1);
+			}
+
+			// Log the full response body so PHP errors are visible in the Output panel,
+			// not just the generic "Request failed with status code 500" message.
+			const responseBody = error?.response?.data;
+			const bodyDetail = responseBody
+				? (typeof responseBody === "string"
+					? responseBody.substring(0, 500)
+					: JSON.stringify(responseBody).substring(0, 500))
+				: "(no response body)";
 			this.debugLogger.log(
-				`❌ Sync failed: ${error.message}`
+				`❌ Sync failed [${httpStatus ?? "?"}] post ${postId}: ${error.message} | body: ${bodyDetail}`
+			);
+			throw error;
+		}
+	}
+
+	/**
+	 * Force-sync a file to WordPress, bypassing the hash check.
+	 */
+	async forceSyncFile(
+		postId: number,
+		html: string,
+		css: string
+	): Promise<SyncResponse> {
+		this.debugLogger.log(`🔧 Force-syncing post ${postId}...`);
+		try {
+			const body: Record<string, unknown> = {
+				post_id: postId,
+				html,
+				css,
+				trigger: "repair",
+				force: true,
+			};
+			if (this.isRemoteMode) {
+				body.include_canonical = true;
+			}
+			const response = await this.client.post<SyncResponse>(
+				"/sync/import-instant",
+				body
+			);
+			this.debugLogger.log(
+				`✅ Force sync done: ${response.data.blocks_updated || 0} blocks`
+			);
+			return response.data;
+		} catch (error: any) {
+			this.debugLogger.log(`❌ Force sync failed: ${error.message}`);
+			throw error;
+		}
+	}
+
+	/**
+	 * Diagnose a post's block integrity and optionally repair.
+	 */
+	async diagnosePost(
+		postId: number,
+		repair: boolean = false
+	): Promise<any> {
+		this.debugLogger.log(
+			`🔍 Diagnosing post ${postId}${repair ? " (with repair)" : ""}...`
+		);
+		try {
+			const response = await this.client.post<any>(
+				`/sync/diagnose/${postId}`,
+				{ repair }
+			);
+			return response.data;
+		} catch (error: any) {
+			this.debugLogger.log(`❌ Diagnose failed: ${error.message}`);
+			throw error;
+		}
+	}
+
+	/**
+	 * Clear all sync hashes to force re-import on next cycle.
+	 */
+	async repairAll(): Promise<any> {
+		this.debugLogger.log("🔧 Clearing all sync hashes...");
+		try {
+			const response = await this.client.post<any>("/sync/repair-all", {});
+			this.debugLogger.log(
+				`✅ Repair-all: ${response.data.hashes_cleared} hashes cleared`
+			);
+			return response.data;
+		} catch (error: any) {
+			this.debugLogger.log(`❌ Repair-all failed: ${error.message}`);
+			throw error;
+		}
+	}
+
+	/**
+	 * Repair corrupted CSS storage for a single post.
+	 * Normalizes block CSS attrs and inline <style> payloads in DB content.
+	 */
+	async repairCssStorage(postId: number): Promise<any> {
+		this.debugLogger.log(`🧼 Repairing CSS storage for post ${postId}...`);
+		try {
+			const response = await this.client.post<any>(
+				`/repair/css-storage/${postId}`,
+				{}
+			);
+			this.debugLogger.log(
+				`✅ CSS storage repair finished (changed=${response.data?.changed ? "yes" : "no"})`
+			);
+			return response.data;
+		} catch (error: any) {
+			this.debugLogger.log(`❌ CSS storage repair failed: ${error.message}`);
+			throw error;
+		}
+	}
+
+	/**
+	 * Repair corrupted CSS storage across posts in batches.
+	 * Uses cursor pagination to keep server memory usage bounded.
+	 */
+	async repairCssStorageAllBatch(
+		cursor: number = 0,
+		limit: number = 15,
+		refreshFiles: boolean = false
+	): Promise<any> {
+		this.debugLogger.log(
+			`🧼 Repairing CSS storage batch (cursor=${cursor}, limit=${limit}, refreshFiles=${refreshFiles})...`
+		);
+		try {
+			const response = await this.client.post<any>(
+				"/repair/css-storage-all",
+				{
+					cursor,
+					limit,
+					refresh_files: refreshFiles,
+				}
+			);
+			return response.data;
+		} catch (error: any) {
+			this.debugLogger.log(
+				`❌ CSS storage batch repair failed: ${error.message}`
 			);
 			throw error;
 		}
@@ -129,19 +434,16 @@ export class RestClient {
 		postId: number,
 		action: "trash" | "restore" | "delete"
 	): Promise<FolderActionResponse> {
-		this.debugLogger.log(
-			`📁 Folder action: ${action} post ${postId}`
-		);
+		this.debugLogger.log(`📁 Folder action: ${action} post ${postId}`);
 
 		try {
-			const response =
-				await this.client.post<FolderActionResponse>(
-					"/sync/folder-action",
-					{
-						post_id: postId,
-						action: action,
-					}
-				);
+			const response = await this.client.post<FolderActionResponse>(
+				"/sync/folder-action",
+				{
+					post_id: postId,
+					action: action,
+				}
+			);
 
 			if (response.data.success) {
 				this.debugLogger.log(`✅ ${action} successful`);
@@ -149,9 +451,7 @@ export class RestClient {
 
 			return response.data;
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Folder action failed: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Folder action failed: ${error.message}`);
 			throw error;
 		}
 	}
@@ -177,23 +477,63 @@ export class RestClient {
 	/**
 	 * Check for file changes (used for circular sync prevention)
 	 */
-	async checkForChanges(
-		postId: number
-	): Promise<{ skip_import: boolean }> {
+	async checkForChanges(postId: number): Promise<{ skip_import: boolean }> {
 		const response = await this.client.get(`/sync/check/${postId}`);
 		return response.data;
 	}
 
 	/**
-	 * Poll for pending jump requests (jump-to-code)
+	 * Poll for pending jump requests (jump-to-code).
+	 * Cache-busted to avoid LiteSpeed / server-level HTTP caching.
 	 */
 	async getPendingJump(): Promise<{
 		pending: boolean;
 		file?: string;
 		line?: number;
 		column?: number;
+		timestamp?: number;
 	}> {
-		const response = await this.client.get("/sync/get-jump");
+		const response = await this.client.get("/sync/get-jump", {
+			params: { _t: Date.now() },
+			headers: { "Cache-Control": "no-cache, no-store" },
+		});
+		return response.data;
+	}
+
+	/**
+	 * Acknowledge a jump was consumed so the server can clear its state.
+	 * Separate POST ensures the transient is deleted even if GET responses are cached.
+	 */
+	async clearPendingJump(): Promise<void> {
+		try {
+			await this.client.post("/sync/clear-jump");
+		} catch {
+			// Best-effort — if the endpoint doesn't exist yet, ignore
+		}
+	}
+
+	/**
+	 * Push cursor block ID to the server via direct DB write.
+	 * Fire-and-forget with a short timeout so it doesn't block cursor movement.
+	 */
+	async pushCursorBlock(postId: number, blockId: string, ts: number): Promise<void> {
+		try {
+			await this.client.post("/sync/cursor", { post_id: postId, block_id: blockId, ts }, { timeout: 3000 });
+		} catch {
+			// Best-effort — don't let network issues affect cursor UX
+		}
+	}
+
+	/**
+	 * Rescan metadata line numbers using sequential structural matching.
+	 * DB blocks are matched to the current HTML file; only metadata is updated.
+	 */
+	async rescanLines(postId: number): Promise<{
+		success: boolean;
+		blocks?: Array<{ layoutBlockId: string; blockName: string; line: number }>;
+		count?: number;
+	}> {
+		const response = await this.client.post(`/sync/rescan-lines/${postId}`);
 		return response.data;
 	}
 
@@ -223,9 +563,7 @@ export class RestClient {
 		timestamp?: string;
 		file_unchanged?: boolean;
 	}> {
-		const response = await this.client.get(
-			`/sync/block-changes/${postId}`
-		);
+		const response = await this.client.get(`/sync/block-changes/${postId}`);
 		return response.data;
 	}
 
@@ -236,9 +574,7 @@ export class RestClient {
 		this.debugLogger.log("🎨 Syncing theme.json...");
 
 		try {
-			const response = await this.client.post(
-				"/theme/sync-json"
-			);
+			const response = await this.client.post("/theme/sync-json");
 
 			if (response.data.success) {
 				this.debugLogger.log("✅ theme.json synced");
@@ -246,9 +582,7 @@ export class RestClient {
 
 			return response.data;
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ theme.json sync failed: ${error.message}`
-			);
+			this.debugLogger.log(`❌ theme.json sync failed: ${error.message}`);
 			throw error;
 		}
 	}
@@ -260,14 +594,10 @@ export class RestClient {
 		this.debugLogger.log("🎨 Importing global CSS...");
 
 		try {
-			const response = await this.client.post(
-				"/global-css/import"
-			);
+			const response = await this.client.post("/global-css/import");
 			return response.data;
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Global CSS import failed: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Global CSS import failed: ${error.message}`);
 			throw error;
 		}
 	}
@@ -280,33 +610,24 @@ export class RestClient {
 		direction: "to_theme" | "from_theme" = "to_theme"
 	): Promise<AssetSyncResponse> {
 		const directionLabel =
-			direction === "to_theme"
-				? "dev → theme"
-				: "theme → dev";
-		this.debugLogger.log(
-			`📦 Syncing assets (${directionLabel})...`
-		);
+			direction === "to_theme" ? "dev → theme" : "theme → dev";
+		this.debugLogger.log(`📦 Syncing assets (${directionLabel})...`);
 
 		try {
-			const response =
-				await this.client.post<AssetSyncResponse>(
-					"/assets/sync",
-					{
-						direction: direction,
-					}
-				);
+			const response = await this.client.post<AssetSyncResponse>(
+				"/assets/sync",
+				{
+					direction: direction,
+				}
+			);
 
 			if (response.data.success) {
-				this.debugLogger.log(
-					`✅ Assets synced (${directionLabel})`
-				);
+				this.debugLogger.log(`✅ Assets synced (${directionLabel})`);
 			}
 
 			return response.data;
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Asset sync failed: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Asset sync failed: ${error.message}`);
 			throw error;
 		}
 	}
@@ -325,6 +646,126 @@ export class RestClient {
 	 */
 	async syncAssetsToTheme(): Promise<AssetSyncResponse> {
 		return this.syncAssets("to_theme");
+	}
+
+	/**
+	 * Sync ACF JSON files from dev folder to theme + import into ACF/SCF database.
+	 * Dedicated endpoint for acf-json/ changes so DB import happens immediately.
+	 */
+	async syncAcfJsonToTheme(): Promise<AssetSyncResponse> {
+		this.debugLogger.log("📦 Syncing ACF JSON to theme + DB...");
+
+		try {
+			const response = await this.client.post<AssetSyncResponse>(
+				"/assets/acf-json-sync"
+			);
+
+			if (response.data.success) {
+				this.debugLogger.log("✅ ACF JSON synced to theme & imported to DB");
+			}
+
+			return response.data;
+		} catch (error: any) {
+			this.debugLogger.log(`❌ ACF JSON sync failed: ${error.message}`);
+			throw error;
+		}
+	}
+
+	/**
+	 * Sync taxonomy JSON files from the taxonomies/ dev folder into the WordPress database.
+	 * Dedicated endpoint for taxonomies/ changes so term import happens immediately.
+	 */
+	async syncTaxonomyJsonToWp(): Promise<AssetSyncResponse> {
+		this.debugLogger.log("🗂️ Syncing taxonomy JSON to WP DB...");
+
+		try {
+			const response = await this.client.post<AssetSyncResponse>(
+				"/assets/taxonomy-sync"
+			);
+
+			if (response.data.success) {
+				this.debugLogger.log("✅ Taxonomy JSON imported to WP DB");
+			}
+
+			return response.data;
+		} catch (error: any) {
+			this.debugLogger.log(`❌ Taxonomy JSON sync failed: ${error.message}`);
+			throw error;
+		}
+	}
+
+	/**
+	 * Import global assets (JS/CSS/PHP) into the WordPress database.
+	 * Same-machine: plugin reads files from dev folder on disk.
+	 * Remote: sends file contents in request body.
+	 */
+	async importGlobalAssets(
+		types: string[],
+		files?: Record<string, string>
+	): Promise<{ success: boolean; updated: Record<string, number>; total: number; message: string }> {
+		this.debugLogger.log(`📦 Importing global assets to DB (types: ${types.join(",")})...`);
+
+		try {
+			const payload: Record<string, unknown> = { types };
+			if (files) {
+				payload.files = files;
+			}
+			const response = await this.client.post<{
+				success: boolean;
+				updated: Record<string, number>;
+				total: number;
+				message: string;
+			}>("/sync/import-global-assets", payload);
+
+			if (response.data.success && response.data.total > 0) {
+				this.debugLogger.log(`✅ Global assets updated: ${response.data.message}`);
+			}
+			return response.data;
+		} catch (error: any) {
+			this.debugLogger.log(`❌ Global asset import failed: ${error.message}`);
+			throw error;
+		}
+	}
+
+	/**
+	 * Push file contents directly to the active theme on the server.
+	 * Used in remote dev folder mode instead of syncAssetsToTheme().
+	 */
+	async pushFiles(
+		files: Array<{ path: string; content: string; encoding?: string }>
+	): Promise<{
+		success: boolean;
+		written: string[];
+		errors: Array<{ path: string; error: string }>;
+		count: number;
+	}> {
+		this.debugLogger.log(
+			`📤 Pushing ${files.length} file(s) to server theme...`
+		);
+
+		try {
+			const response = await this.client.post("/assets/push-files", {
+				files,
+			});
+
+			if (response.data.success) {
+				this.debugLogger.log(`✅ Pushed ${response.data.count} files to theme`);
+			} else {
+				const failedPaths = (response.data.errors || [])
+					.map((e: { path: string; error: string }) => `${e.path}: ${e.error}`)
+					.join(", ");
+				this.debugLogger.log(
+					`⚠️ Push partial failure (${response.data.count} written, ${
+						response.data.errors?.length || 0
+					} failed): ${failedPaths}`
+				);
+			}
+
+			return response.data;
+		} catch (error: any) {
+			this.debugLogger.log(`❌ Push files failed: ${error.message}`);
+			throw error;
+		}
 	}
 
 	/**
@@ -349,33 +790,22 @@ export class RestClient {
 		skipped: string[];
 		errors: string[];
 	}> {
-		this.debugLogger.log(
-			"📥 Importing new files from dev folder..."
-		);
+		this.debugLogger.log("📥 Importing new files from dev folder...");
 
 		try {
-			const response = await this.client.post(
-				"/sync/import-new"
-			);
+			const response = await this.client.post("/sync/import-new");
 
 			if (response.data.success) {
 				this.debugLogger.log(
 					`✅ Import complete: ${
-						response.data.imported
-							?.length || 0
-					} imported, ` +
-						`${
-							response.data.skipped
-								?.length || 0
-						} skipped`
+						response.data.imported?.length || 0
+					} imported, ` + `${response.data.skipped?.length || 0} skipped`
 				);
 			}
 
 			return response.data;
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Import failed: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Import failed: ${error.message}`);
 			throw error;
 		}
 	}
@@ -386,8 +816,7 @@ export class RestClient {
 	 */
 	async createPostFromFolder(
 		folderPath: string,
-		postType: string,
-		skipRename: boolean = true // Default to skip - IDE will do the rename via VS Code API
+		postType: string
 	): Promise<{
 		success: boolean;
 		post_id?: number;
@@ -396,23 +825,21 @@ export class RestClient {
 		slug?: string;
 		old_folder?: string;
 		new_folder?: string;
-		renamed_by_server?: boolean;
 		message?: string;
 		error?: string;
 	}> {
 		this.debugLogger.log(
-			`📄 Creating post from folder: ${folderPath} (${postType}, skipRename: ${skipRename})`
+			`📄 Creating post from folder: ${folderPath} (${postType})`
+		);
+		this.debugLogger.log(
+			`   Full URL: ${this.baseUrl}/wp-json/skylit/v1/sync/create-post`
 		);
 
 		try {
-			const response = await this.client.post(
-				"/sync/create-post",
-				{
-					folder_path: folderPath,
-					post_type: postType,
-					skip_rename: skipRename,
-				}
-			);
+			const response = await this.client.post("/sync/create-post", {
+				folder_path: folderPath,
+				post_type: postType,
+			});
 
 			if (response.data.success) {
 				this.debugLogger.log(
@@ -422,10 +849,26 @@ export class RestClient {
 
 			return response.data;
 		} catch (error: any) {
+			const responseData = error.response?.data;
+			const status = error.response?.status;
+			const serverError = responseData?.error || responseData?.message || "";
 			this.debugLogger.log(
-				`❌ Create post failed: ${error.message}`
+				`❌ Create post failed (HTTP ${status}): ${error.message}`
 			);
-			throw error;
+			this.debugLogger.log(
+				`   Server response: ${JSON.stringify(
+					responseData || "no response data"
+				)}`
+			);
+			this.debugLogger.log(
+				`   Sent: folder_path="${folderPath}", post_type="${postType}"`
+			);
+
+			// Show more helpful error to user
+			const detail = serverError ? `: ${serverError}` : "";
+			throw new Error(
+				`Failed to create post: Request failed with status code ${status}${detail}`
+			);
 		}
 	}
 
@@ -444,18 +887,13 @@ export class RestClient {
 		message?: string;
 		error?: string;
 	}> {
-		this.debugLogger.log(
-			`📝 Updating slug for post ${postId}: ${newSlug}`
-		);
+		this.debugLogger.log(`📝 Updating slug for post ${postId}: ${newSlug}`);
 
 		try {
-			const response = await this.client.post(
-				"/sync/update-slug",
-				{
-					post_id: postId,
-					new_slug: newSlug,
-				}
-			);
+			const response = await this.client.post("/sync/update-slug", {
+				post_id: postId,
+				new_slug: newSlug,
+			});
 
 			if (response.data.success) {
 				this.debugLogger.log(
@@ -465,9 +903,7 @@ export class RestClient {
 
 			return response.data;
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Update slug failed: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Update slug failed: ${error.message}`);
 			throw error;
 		}
 	}
@@ -491,128 +927,22 @@ export class RestClient {
 		message?: string;
 		error?: string;
 	}> {
-		this.debugLogger.log(
-			`📝 Updating post ${postId} from metadata`
-		);
+		this.debugLogger.log(`📝 Updating post ${postId} from metadata`);
 
 		try {
-			const response = await this.client.post(
-				"/sync/update-from-metadata",
-				{
-					post_id: postId,
-					...metadata,
-				}
-			);
+			const response = await this.client.post("/sync/update-from-metadata", {
+				post_id: postId,
+				...metadata,
+			});
 
 			if (response.data.success) {
-				this.debugLogger.log(
-					`✅ Metadata synced: ${response.data.message}`
-				);
+				this.debugLogger.log(`✅ Metadata synced: ${response.data.message}`);
 			}
 
 			return response.data;
 		} catch (error: any) {
-			this.debugLogger.log(
-				`❌ Metadata sync failed: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Metadata sync failed: ${error.message}`);
 			throw error;
-		}
-	}
-
-	/**
-	 * Get folder rename notifications from plugin
-	 * Called periodically to catch any renames that might have been missed
-	 */
-	async getRenameNotifications(
-		since?: number,
-		clear: boolean = false
-	): Promise<{
-		success: boolean;
-		notifications: Array<{
-			type: string;
-			old_folder: string;
-			new_folder: string;
-			post_id: number;
-			post_type: string;
-			timestamp: number;
-			message: string;
-		}>;
-		count: number;
-		timestamp: number;
-	}> {
-		try {
-			const params: Record<string, any> = {};
-			if (since !== undefined) {
-				params.since = since;
-			}
-			if (clear) {
-				params.clear = true;
-			}
-
-			const response = await this.client.get(
-				"/sync/rename-notifications",
-				{ params }
-			);
-
-			if (response.data.count > 0) {
-				this.debugLogger.log(
-					`📁 ${response.data.count} rename notification(s) received`
-				);
-			}
-
-			return response.data;
-		} catch (error: any) {
-			// Don't log error for this - it's just a polling endpoint
-			return {
-				success: false,
-				notifications: [],
-				count: 0,
-				timestamp: Date.now() / 1000,
-			};
-		}
-	}
-
-	/**
-	 * Process pending folder renames on the server
-	 * Triggers retry of any failed folder renames
-	 */
-	async processPendingRenames(): Promise<{
-		success: boolean;
-		results: {
-			processed: number;
-			success: number;
-			failed: number;
-			removed?: number;
-		};
-		message: string;
-	}> {
-		this.debugLogger.log("🔄 Processing pending folder renames...");
-
-		try {
-			const response = await this.client.post(
-				"/sync/process-pending-renames"
-			);
-
-			if (response.data.results.success > 0) {
-				this.debugLogger.log(
-					`✅ ${response.data.results.success} pending rename(s) completed`
-				);
-			}
-
-			return response.data;
-		} catch (error: any) {
-			this.debugLogger.log(
-				`⚠️ Could not process pending renames: ${error.message}`
-			);
-			return {
-				success: false,
-				results: {
-					processed: 0,
-					success: 0,
-					failed: 0,
-				},
-				message: error.message,
-			};
 		}
 	}
 
@@ -629,28 +959,17 @@ export class RestClient {
 		this.debugLogger.log("🧹 Cleaning up orphaned metadata...");
 
 		try {
-			const response = await this.client.post(
-				"/sync/cleanup-metadata"
-			);
+			const response = await this.client.post("/sync/cleanup-metadata");
 
-			if (
-				response.data.success &&
-				response.data.deleted > 0
-			) {
-				this.debugLogger.log(
-					`✅ ${response.data.message}`
-				);
+			if (response.data.success && response.data.deleted > 0) {
+				this.debugLogger.log(`✅ ${response.data.message}`);
 			} else if (response.data.deleted === 0) {
-				this.debugLogger.log(
-					"✅ No orphaned metadata found"
-				);
+				this.debugLogger.log("✅ No orphaned metadata found");
 			}
 
 			return response.data;
 		} catch (error: any) {
-			this.debugLogger.log(
-				`⚠️ Metadata cleanup failed: ${error.message}`
-			);
+			this.debugLogger.log(`⚠️ Metadata cleanup failed: ${error.message}`);
 			return {
 				success: false,
 				deleted: 0,
@@ -675,30 +994,20 @@ export class RestClient {
 		old_type?: string;
 		new_type?: string;
 	}> {
-		this.debugLogger.log(
-			`🔄 Converting post ${postId} to ${targetType}...`
-		);
+		this.debugLogger.log(`🔄 Converting post ${postId} to ${targetType}...`);
 
 		try {
-			const response = await this.client.post(
-				"/convert-post-type",
-				{
-					post_id: postId,
-					target_type: targetType,
-					folder_name: folderName,
-				}
-			);
+			const response = await this.client.post("/convert-post-type", {
+				post_id: postId,
+				target_type: targetType,
+				folder_name: folderName,
+			});
 
 			if (response.data.success) {
-				this.debugLogger.log(
-					`✅ Post converted to ${targetType}`
-				);
+				this.debugLogger.log(`✅ Post converted to ${targetType}`);
 			} else {
 				this.debugLogger.log(
-					`❌ Conversion failed: ${
-						response.data.error ||
-						"Unknown error"
-					}`
+					`❌ Conversion failed: ${response.data.error || "Unknown error"}`
 				);
 			}
 
@@ -706,19 +1015,14 @@ export class RestClient {
 		} catch (error: any) {
 			// Extract detailed error from response if available
 			const responseData = error.response?.data;
-			const detailedError =
-				responseData?.error || error.message;
+			const detailedError = responseData?.error || error.message;
 			const errorCode = responseData?.code || "unknown";
 			const errorFile = responseData?.file || "";
 			const errorLine = responseData?.line || "";
 
-			this.debugLogger.log(
-				`❌ Conversion failed: ${detailedError}`
-			);
+			this.debugLogger.log(`❌ Conversion failed: ${detailedError}`);
 			if (errorFile) {
-				this.debugLogger.log(
-					`   File: ${errorFile}:${errorLine}`
-				);
+				this.debugLogger.log(`   File: ${errorFile}:${errorLine}`);
 			}
 			this.debugLogger.log(`   Code: ${errorCode}`);
 
@@ -749,40 +1053,274 @@ export class RestClient {
 		this.debugLogger.log(`📝 Updating post ${postId} metadata...`);
 
 		try {
-			const response = await this.client.post(
-				"/sync/update-from-metadata",
-				{
-					post_id: postId,
-					...metadata,
-				}
-			);
+			const response = await this.client.post("/sync/update-from-metadata", {
+				post_id: postId,
+				...metadata,
+			});
 
 			if (response.data.success) {
-				this.debugLogger.log(
-					`✅ Post metadata updated`
-				);
+				this.debugLogger.log(`✅ Post metadata updated`);
 			} else {
 				this.debugLogger.log(
-					`❌ Update failed: ${
-						response.data.error ||
-						"Unknown error"
-					}`
+					`❌ Update failed: ${response.data.error || "Unknown error"}`
 				);
 			}
 
 			return response.data;
 		} catch (error: any) {
 			const responseData = error.response?.data;
-			const detailedError =
-				responseData?.error || error.message;
+			const detailedError = responseData?.error || error.message;
 
-			this.debugLogger.log(
-				`❌ Update metadata failed: ${detailedError}`
-			);
+			this.debugLogger.log(`❌ Update metadata failed: ${detailedError}`);
 
 			const err = new Error(detailedError);
 			throw err;
 		}
+	}
+
+	/**
+	 * Get list of post IDs with pending exports (remote dev folder mode).
+	 * Extension polls this to detect Gutenberg saves that need to be written locally.
+	 */
+	async getPendingExports(): Promise<PendingExportsResponse> {
+		const response = await this.client.get<PendingExportsResponse>(
+			"/sync/pending-exports"
+		);
+		return response.data;
+	}
+
+	/**
+	 * Get export content for a specific post (remote dev folder mode).
+	 * Returns the compiled HTML/CSS payload and clears the pending flag.
+	 */
+	async getExportContent(postId: number): Promise<ExportPayload> {
+		const profileEnd = this.debugLogger.profileStart("REST getExportContent");
+		this.debugLogger.log(`📥 Fetching export content for post ${postId}...`);
+
+		const response = await this.client.get<ExportPayload>(
+			`/sync/export-content/${postId}`
+		);
+
+		profileEnd(`post ${postId}`);
+		this.debugLogger.log(
+			`✅ Received: ${response.data.slug} (${
+				response.data.html.length
+			} bytes HTML, ${response.data.css?.length || 0} bytes CSS)`
+		);
+
+		return response.data;
+	}
+
+	/**
+	 * Get manifest of all syncable posts (remote dev folder mode).
+	 * Used for initial full sync on first connection.
+	 */
+	async getExportAll(): Promise<ExportAllResponse> {
+		const profileEnd = this.debugLogger.profileStart("REST getExportAll");
+		this.debugLogger.log("📦 Fetching export manifest for all posts...");
+
+		const response = await this.client.get<ExportAllResponse>(
+			"/sync/export-all"
+		);
+
+		profileEnd(`count=${response.data.count}`);
+		this.debugLogger.log(`✅ Manifest received: ${response.data.count} posts`);
+
+		return response.data;
+	}
+
+	/**
+	 * Get pending folder actions (trash/restore/delete) for decoupled mode.
+	 */
+	async getPendingFolderActions(): Promise<{
+		actions: Array<{ post_id: number; slug: string; type_folder: string; action: string; timestamp: number }>;
+		count: number;
+	}> {
+		const response = await this.client.get("/sync/pending-folder-actions");
+		return response.data;
+	}
+
+	/**
+	 * Get global dev folder files (assets, includes, acf-json, etc.)
+	 * for initial remote sync. Returns base64-encoded file contents.
+	 */
+	async getGlobalFiles(): Promise<{
+		files: Array<{ path: string; content: string; encoding: string }>;
+		count: number;
+	}> {
+		this.debugLogger.log("📦 Fetching global dev folder files...");
+
+		const response = await this.client.get("/sync/global-files");
+
+		this.debugLogger.log(
+			`✅ Global files received: ${response.data.count} files`
+		);
+
+		return response.data;
+	}
+
+	/**
+	 * Poll for pending relocation requests from plugin admin.
+	 */
+	async getPendingRelocate(): Promise<{
+		pending: boolean;
+		action?: string;
+		source_path?: string;
+		timestamp?: number;
+		reason?: string;
+	}> {
+		const response = await this.client.get("/sync/pending-relocate");
+		return response.data;
+	}
+
+	/**
+	 * Acknowledge relocation complete (or failed) back to the plugin.
+	 */
+	async ackRelocate(
+		success: boolean,
+		localPath: string
+	): Promise<{ success: boolean; message: string }> {
+		this.debugLogger.log(
+			`📤 Acknowledging relocation: ${
+				success ? "success" : "failed"
+			} → ${localPath}`
+		);
+
+		const response = await this.client.post("/sync/ack-relocate", {
+			success: success,
+			local_path: localPath,
+		});
+
+		return response.data;
+	}
+
+	/**
+	 * Get all AI skillset files (system + custom) for writing to dev folder
+	 */
+	async getSkillsetFiles(): Promise<SkillsetFilesResponse> {
+		this.debugLogger.log("📚 Fetching AI skillset files...");
+
+		const response = await this.client.get<SkillsetFilesResponse>(
+			"/skillset/files"
+		);
+
+		this.debugLogger.log(
+			`✅ Skillset files received: ${response.data.files?.length ?? 0} files`
+		);
+
+		return response.data;
+	}
+
+	// -------------------------------------------------------------------------
+	// Media Library Sync
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Push a single media file to WP via multipart form-data.
+	 * Returns the push result for that file.
+	 */
+	async pushMediaFile(
+		filePath: string,
+		relativePath: string,
+		fileBuffer: Buffer,
+		mimeType: string,
+		alt?: string,
+		title?: string
+	): Promise<MediaPushResponse> {
+		const FormData = require("form-data");
+		const nodePath = require("path");
+		const form = new FormData();
+
+		form.append("file_0", fileBuffer, {
+			filename: nodePath.basename(relativePath),
+			contentType: mimeType,
+		});
+		form.append("path_0", relativePath);
+		if (alt) form.append("alt_0", alt);
+		if (title) form.append("title_0", title);
+
+		this.debugLogger.log(`📤 Pushing media file to WP: ${relativePath}`);
+
+		const response = await this.client.post<MediaPushResponse>(
+			"/media/push",
+			form,
+			{
+				headers: {
+					...form.getHeaders(),
+					Authorization: `Bearer ${this.token}`,
+				},
+				timeout: 120000, // 2 minutes for large files
+			}
+		);
+
+		return response.data;
+	}
+
+	/**
+	 * Rename/move a media file in WP uploads to match a new local path.
+	 */
+	async renameMediaFile(
+		attachmentId: number,
+		newPath: string
+	): Promise<MediaRenameResponse> {
+		this.debugLogger.log(
+			`🔀 Renaming WP media ${attachmentId} → ${newPath}`
+		);
+		const response = await this.client.post<MediaRenameResponse>(
+			"/media/rename",
+			{ attachment_id: attachmentId, new_path: newPath }
+		);
+		return response.data;
+	}
+
+	/**
+	 * Delete a WP attachment by ID.
+	 */
+	async deleteMediaAttachment(attachmentId: number): Promise<void> {
+		this.debugLogger.log(`🗑️ Deleting WP media attachment ${attachmentId}`);
+		await this.client.delete(`/media/delete/${attachmentId}`);
+	}
+
+	/**
+	 * Update alt/title/caption of a WP attachment.
+	 */
+	async updateMediaMeta(
+		attachmentId: number,
+		meta: { alt?: string; title?: string; caption?: string }
+	): Promise<void> {
+		await this.client.post("/media/update-metadata", {
+			attachment_id: attachmentId,
+			...meta,
+		});
+	}
+
+	/**
+	 * Get current media sync settings from WP.
+	 */
+	async getMediaSettings(): Promise<MediaSettingsResponse> {
+		const response = await this.client.get<MediaSettingsResponse>("/media/settings");
+		return response.data;
+	}
+
+	/**
+	 * Run one paginated batch of WP→Dev import.
+	 * Returns { processed, skipped, offset, total, done }.
+	 */
+	async importMediaBatch(offset: number): Promise<{
+		processed: number; skipped: number; offset: number; total: number; done: boolean; message?: string;
+	}> {
+		const response = await this.client.post("/media/import", { offset });
+		return (response.data as any).data;
+	}
+
+	/**
+	 * Run one paginated batch of full media sync (honours direction setting).
+	 */
+	async fullMediaSyncBatch(offset: number): Promise<{
+		processed: number; skipped: number; offset: number; total: number; done: boolean; message?: string;
+	}> {
+		const response = await this.client.post("/media/full-sync", { offset });
+		return (response.data as any).data;
 	}
 
 	/**
@@ -793,25 +1331,21 @@ export class RestClient {
 			// Server responded with error status
 			const status = error.response.status;
 			const data = error.response.data as any;
-			const message =
-				data?.error || data?.message || error.message;
+			const message = data?.error || data?.message || error.message;
 
-			this.debugLogger.log(
-				`❌ API Error ${status}: ${message}`
-			);
+			this.debugLogger.log(`❌ API Error ${status}: ${message}`);
 
 			// Log additional details if available
 			if (data?.error && data?.error !== message) {
-				this.debugLogger.log(
-					`   Details: ${data.error}`
-				);
+				this.debugLogger.log(`   Details: ${data.error}`);
 			}
 
-			if (status === 401 || status === 403) {
-				vscode.window.showErrorMessage(
-					"Authentication failed. Please regenerate your auth token."
-				);
-			} else if (status === 404) {
+		if (status === 401 || status === 403) {
+			// Log only — callers (validateToken / connectToWordPress) handle auth
+			// failures contextually. Showing a popup here causes false alarms during
+			// the two-attempt validation flow (header auth → query param fallback).
+			this.debugLogger.log(`   Auth error ${status} — handled by caller`);
+		} else if (status === 404) {
 				// Log but don't popup for 404 - might be during plugin updates
 				this.debugLogger.log(
 					"   Skylit plugin API not found. Ensure plugin is activated and updated."
@@ -825,9 +1359,7 @@ export class RestClient {
 			// Only log, don't popup - might be temporary network issue
 		} else {
 			// Error setting up request
-			this.debugLogger.log(
-				`❌ Request error: ${error.message}`
-			);
+			this.debugLogger.log(`❌ Request error: ${error.message}`);
 		}
 
 		return Promise.reject(error);
