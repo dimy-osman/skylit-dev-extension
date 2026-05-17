@@ -11,6 +11,7 @@ import * as path from "path";
 import { RestClient } from "./restClient";
 import { StatusBar } from "./statusBar";
 import { DebugLogger } from "./debugLogger";
+import type { SkylitLocalServer } from "./localServer";
 
 /**
  * Join paths using forward slashes (POSIX-style)
@@ -18,6 +19,37 @@ import { DebugLogger } from "./debugLogger";
  */
 function posixJoin(...parts: string[]): string {
 	return parts.join("/").replace(/\/+/g, "/");
+}
+
+/**
+ * Suffixes used by editors, VCS, and AI tools for transient/backup files that
+ * shadow the real file (e.g. `home.html.git`, `home.html.orig`, `home.html~`).
+ * These must never trigger a Skylit sync — they have no canonical post mapping
+ * and re-importing them just churns Gutenberg (canvas jumps, CSS reinject,
+ * "no changes" import-instant cycles).
+ *
+ * Matched case-insensitively against the full file basename.
+ */
+const EDITOR_TEMP_SUFFIXES = [
+	".git",   // Cursor/VS Code source-control + AI agent backups (e.g. foo.html.git)
+	".orig",  // Git merge conflict originals
+	".rej",   // Git merge conflict rejects
+	".bak",   // Generic backup
+	".tmp",   // Generic temp
+	".temp",  // Generic temp
+	".swp",   // Vim swap
+	".swo",   // Vim swap (alt)
+	".swn",   // Vim swap (alt)
+	".old",   // Generic backup
+];
+
+function isEditorTempFile(fileName: string): boolean {
+	const lower = fileName.toLowerCase();
+	if (lower.endsWith("~")) return true; // emacs/gedit-style backups
+	for (const suffix of EDITOR_TEMP_SUFFIXES) {
+		if (lower.endsWith(suffix)) return true;
+	}
+	return false;
 }
 
 /**
@@ -303,6 +335,8 @@ export class FileWatcher {
 	private restClient: RestClient;
 	private statusBar: StatusBar;
 	private debugLogger: DebugLogger;
+	/** Local WS server for push notifications to GT (Phase 4). Set by extension.ts after connect. */
+	private localServer: SkylitLocalServer | null = null;
 	private debounceMs: number = 800;
 	private folderActionDebounceMs: number = 1000; // Debounce folder actions
 	private folderActionCooldownMs: number = 5000; // Don't re-process same post within 5 seconds
@@ -314,6 +348,8 @@ export class FileWatcher {
 	private pathsWrittenDuringStartup: Set<string> = new Set();
 	/** True while syncOnConnection is running — ignore content file watcher events to avoid duplicate "Content file changed" cycles */
 	private startupSyncInProgress: boolean = false;
+	/** After startupSyncInProgress clears, watcher bursts can continue for several seconds — use a longer cooldown briefly */
+	private startupEndedAt: number = 0;
 	private renameCooldownMs: number = 2000; // Time window to match unlink+add as rename
 	private pathToPostIdIndex: Map<string, number> = new Map(); // Reverse index: relative folder path -> post ID
 	private foldingManager: FoldingStateManager; // Manages folding state for unchanged blocks
@@ -336,6 +372,8 @@ export class FileWatcher {
 	// ---- Media Library Sync ----
 	/** In-memory index of .skylit/media/*.json — keyed by local_path */
 	private mediaMetaIndex: Map<string, import("./types").MediaMetadata> = new Map();
+	/** Reverse index: sync_hash → local_path for O(1) content-based dedup across paths */
+	private mediaHashIndex: Map<string, string> = new Map();
 	/** Pending deletes waiting for a matching add (rename detection). hash → { attachmentId, timer } */
 	private pendingMediaDeletes: Map<string, { attachmentId: number; timer: NodeJS.Timeout }> = new Map();
 	/** Cached media sync direction from WP settings */
@@ -344,6 +382,10 @@ export class FileWatcher {
 	private mediaSyncEnabled: boolean = false;
 	/** VS Code native watcher for media-library/ — SSH-compatible */
 	private vscodeMediaWatcher: vscode.FileSystemWatcher | null = null;
+	/** Prevents overlapping REST pushes for the same dev-relative path (watcher + untracked scan). */
+	private mediaPushInFlight: Set<string> = new Set();
+	/** Ignore watcher churn right after same-machine import for paths already in {@link mediaMetaIndex}. */
+	private mediaLibraryImportQuietUntil = 0;
 
 	constructor(
 		devFolder: string,
@@ -370,6 +412,17 @@ export class FileWatcher {
 	private aiSkillsetGenerator: import("./aiSkillsetGenerator").AiSkillsetGenerator | null = null;
 
 	/**
+	 * Mark a path as written by the extension (or a cooperating component like
+	 * ExportPoller) so the file watcher skips re-importing it.
+	 * Remote-mode only — in same-machine mode the plugin writes files directly.
+	 */
+	markSelfWrittenPath(filePath: string): void {
+		const norm = filePath.replace(/\\/g, "/");
+		this.selfWrittenPaths.set(norm, Date.now());
+		this.lastSyncTime.set(norm, Date.now());
+	}
+
+	/**
 	 * Set the AI Skillset Generator so we can trigger regeneration after ACF JSON changes
 	 */
 	setAiSkillsetGenerator(generator: import("./aiSkillsetGenerator").AiSkillsetGenerator) {
@@ -385,10 +438,19 @@ export class FileWatcher {
 	}
 
 	/**
+	 * Attach the local WebSocket server so the file watcher can broadcast
+	 * push events to open Gutenberg tabs (Phase 4).
+	 * Called by extension.ts after the WS server starts.
+	 */
+	setLocalServer(server: SkylitLocalServer | null): void {
+		this.localServer = server;
+	}
+
+	/**
 	 * Start watching files
 	 */
 	async start() {
-		this.debugLogger.info(`👀 Starting file watcher for: ${this.devFolder}`);
+		this.debugLogger.info(`👀 [Chokidar] Watching theme/global files in: ${this.devFolder}`);
 
 		// Main watcher for ALL file content changes (dynamic - watches everything except excluded)
 		this.watcher = chokidar.watch(`${this.devFolder}`, {
@@ -402,6 +464,7 @@ export class FileWatcher {
 				"**/templates/**",
 				"**/parts/**",
 				"**/patterns/**",
+				"**/media-library/**", // Handled exclusively by the VS Code FileSystemWatcher (startMediaLibraryWatcher)
 			],
 			ignoreInitial: true,
 			persistent: true,
@@ -414,11 +477,21 @@ export class FileWatcher {
 
 		// Handler for both file changes and new file additions
 		const handleFileEvent = (filePath: string, eventType: string) => {
-			this.debugLogger.info(`📝 File ${eventType}: ${filePath}`);
-
 			// Normalize path for cross-platform
 			const normalizedPath = filePath.replace(/\\/g, "/");
-			const devFolderNormalized = this.devFolder.replace(/\\/g, "/");
+			const fileName = path.basename(normalizedPath);
+
+			// Skip editor/VCS/AI temp & backup files (e.g. style.css.git, theme.json.orig).
+			// Without this, every Cursor/AI source-control side-write would queue an
+			// import-instant or theme push for a file with no canonical post mapping.
+			if (isEditorTempFile(fileName)) {
+				this.debugLogger.log(
+					`⏭️ [Chokidar] Skipping editor temp/backup file: ${fileName}`
+				);
+				return;
+			}
+
+			this.debugLogger.info(`📝 File ${eventType}: ${filePath}`);
 
 			// Media library files — route to media sync handler
 			if (normalizedPath.includes("/media-library/")) {
@@ -555,6 +628,10 @@ export class FileWatcher {
 		// Start metadata watcher for JSON → WordPress sync
 		await this.startMetadataWatcher();
 
+		// Pre-populate ACF JSON cooldown map from persistent .skylit/acf-json-meta.json
+		// so that files last written by WP admin are not re-imported on extension restart.
+		await this.loadAcfJsonMeta();
+
 		// Media library watcher is started by refreshMediaSyncSettings() after
 		// fetching the sync-enabled flag from WP — not here.
 
@@ -592,6 +669,7 @@ export class FileWatcher {
 	private async syncOnConnection() {
 		const profileEnd = this.debugLogger.profileStart("syncOnConnection");
 		this.startupSyncInProgress = true;
+		this.startupEndedAt = 0;
 		try {
 			this.pathsWrittenDuringStartup.clear();
 			this.debugLogger.info("🔄 Startup sync: full WP ↔ Dev reconciliation...");
@@ -839,6 +917,21 @@ export class FileWatcher {
 						pendingRepairs.push({ entry, activeHtml, activePath });
 					}
 
+					// Stamp sync times so post-connect VS Code watcher "change" bursts do not
+					// immediately re-run import-instant for every file (same keys as syncFile normPath).
+					const htmlNorm = activeHtml.replace(/\\/g, "/");
+					const now = Date.now();
+					this.lastSyncTime.set(htmlNorm, now);
+					this.lastSyncTime.set(activeHtml, now);
+					try {
+						const cssP = posixJoin(activePath, `${entry.folder_name}.css`);
+						if (await vsExists(cssP)) {
+							const cssNorm = cssP.replace(/\\/g, "/");
+							this.lastSyncTime.set(cssNorm, now);
+							this.lastSyncTime.set(cssP, now);
+						}
+					} catch {}
+
 					stats.alreadySynced++;
 					continue;
 				}
@@ -925,7 +1018,11 @@ export class FileWatcher {
 			this.debugLogger.log(`⚠️ Startup sync failed: ${error.message}`);
 			this.pathsWrittenDuringStartup.clear();
 		} finally {
+			// Remote / VS Code often delivers onDidChange in a burst after startup writes finish.
+			// Keep startupSyncInProgress true briefly so those events hit the "during startup, ignoring" path.
+			await new Promise<void>((r) => setTimeout(r, 3000));
 			this.startupSyncInProgress = false;
+			this.startupEndedAt = Date.now();
 			profileEnd();
 		}
 	}
@@ -1241,7 +1338,7 @@ export class FileWatcher {
 
 		const localFolder = this.localDevFolder.replace(/\\/g, "/");
 		this.debugLogger.info(
-			`👀 [Theme Watcher] Setting up VS Code native watcher for: ${localFolder}`
+			`👀 [VS Code Watcher] Watching post-types/templates/parts/patterns in: ${localFolder}`
 		);
 
 		// In remote mode with a local dev path (e.g. C:/Users/...),
@@ -1252,7 +1349,7 @@ export class FileWatcher {
 
 		if (isLocalWindowsPath && isRemoteWorkspace) {
 			this.debugLogger.info(
-				`⏭️ [Theme Watcher] Skipping — local dev path (${localFolder}) is not accessible from the remote server. File pushing happens via REST API.`
+				`⏭️ [VS Code Watcher] Skipping — local dev path (${localFolder}) is not accessible from the remote server. File pushing happens via REST API.`
 			);
 			return;
 		}
@@ -1291,6 +1388,16 @@ export class FileWatcher {
 				return;
 			}
 
+			// Skip editor/VCS/AI temp & backup files (e.g. home.html.git, home.html.orig, home.html~).
+			// These have no canonical post mapping — pushing them would re-import the
+			// real .html sibling and churn Gutenberg (canvas jumps, "no changes" cycles).
+			if (isEditorTempFile(fileName)) {
+				this.debugLogger.log(
+					`⏭️ [VS Code Watcher] Skipping editor temp/backup file: ${fileName}`
+				);
+				return;
+			}
+
 			// Skip directories (VS Code watcher fires for dirs too)
 			// We only want files - check by extension presence
 			const ext = path.extname(fileName);
@@ -1315,6 +1422,18 @@ export class FileWatcher {
 				normalizedPath.includes("/patterns/");
 
 			if (isContentFolder) {
+				// Content folders only sync canonical block markup (.html) and the
+				// optional block-scoped stylesheet (.css). Everything else in those
+				// folders (screenshots, READMEs, sidecar JSON, etc.) is not part of
+				// post content and must not trigger import-instant.
+				const extLower = ext.toLowerCase();
+				if (extLower !== ".html" && extLower !== ".css") {
+					this.debugLogger.log(
+						`⏭️ [VS Code Watcher] Ignoring non-content file in content folder: ${fileName}`
+					);
+					return;
+				}
+
 				if (this.startupSyncInProgress) {
 					this.debugLogger.log(
 						`📝 [VS Code Watcher] Content file ${eventType} (during startup, ignoring): ${normalizedPath}`
@@ -1346,7 +1465,7 @@ export class FileWatcher {
 		});
 
 		this.debugLogger.info(
-			`✅ [Theme Watcher] VS Code native watcher active for: ${localFolder}`
+			`✅ [VS Code Watcher] Active for post-types/templates/parts/patterns in: ${localFolder}`
 		);
 	}
 
@@ -1483,15 +1602,75 @@ export class FileWatcher {
 				}
 			}
 
-			this.debugLogger.log(
-				`📦 Loaded ${this.metadataCache.size} metadata files into cache`
-			);
-		} catch (error: any) {
-			this.debugLogger.log(
-				`⚠️ Could not load metadata cache: ${error.message}`
-			);
+		this.debugLogger.log(
+			`📦 Loaded ${this.metadataCache.size} metadata files into cache`
+		);
+	} catch (error: any) {
+		this.debugLogger.log(
+			`⚠️ Could not load metadata cache: ${error.message}`
+		);
+	}
+}
+
+	/**
+	 * Read .skylit/acf-json-meta.json on startup and pre-populate the in-memory
+	 * lastThemeSyncTime cooldown for files that WP admin wrote last.
+	 *
+	 * Purpose: suppress the burst of watcher events that fires in the first few
+	 * seconds after the extension restarts (chokidar re-scans the folder and emits
+	 * change events for every file it hasn't seen yet). Without this, files that WP
+	 * admin just saved would immediately get re-imported from disk — which is a
+	 * no-op in terms of DB content but causes unnecessary noise and can race with
+	 * a concurrent WP admin session.
+	 *
+	 * The PHP side (sync_acf_json_to_theme) is responsible for the authoritative
+	 * per-file round-trip decision once the sync call is made. The extension only
+	 * needs this cooldown to avoid triggering a sync at all for the first 10 seconds
+	 * when the file hasn't actually changed since WP last wrote it.
+	 *
+	 * Files with no entry or with lastSyncDirection === "dev-to-wp" are NOT stamped
+	 * so that Cursor edits made while the extension was offline are picked up
+	 * immediately on restart.
+	 */
+	private async loadAcfJsonMeta() {
+		const metaPath = posixJoin(this.devFolder, ".skylit", "acf-json-meta.json");
+		try {
+			const raw = await vsReadFile(metaPath);
+			const meta = JSON.parse(raw) as Record<
+				string,
+				{ lastSyncDirection?: string; syncHash?: string }
+			>;
+
+			const acfDir = posixJoin(this.devFolder, "acf-json");
+			let stamped = 0;
+
+			for (const [key, entry] of Object.entries(meta)) {
+				// Only stamp files that WP admin wrote — dev-authored files should
+				// sync immediately on restart if they changed while offline.
+				if (entry.lastSyncDirection !== "wp-to-dev") continue;
+
+				const filePath = posixJoin(acfDir, `${key}.json`);
+				this.lastThemeSyncTime.set(filePath, Date.now());
+				stamped++;
+			}
+
+			if (stamped > 0) {
+				this.debugLogger.log(
+					`🔒 [ACF Meta] Startup: stamped ${stamped} WP-authored file(s) with cooldown to suppress restart noise`
+				);
+			}
+		} catch {
+			// No meta file yet — first run, safe to ignore.
 		}
 	}
+
+	// isAcfFileUnchangedWpWrite was removed.
+	// Round-trip filtering is now done entirely on the PHP side inside
+	// sync_acf_json_to_theme(), which reads acf-json-meta.json and skips
+	// importing files whose lastSyncDirection === 'wp-to-dev' and whose
+	// on-disk hash still matches syncHash. The extension's only job is to
+	// trigger the sync; per-file decisions belong in PHP where the DB state
+	// is accessible.
 
 	/**
 	 * Build reverse index mapping relative folder paths to post IDs
@@ -2248,11 +2427,8 @@ export class FileWatcher {
 		if (response.success) {
 			const actionVerb =
 				action === "trash" ? "moved to trash" : "permanently deleted";
-			this.debugLogger.log(`✅ Post ${postId} ${actionVerb}`);
+			this.debugLogger.info(`✅ IDE→WP Post ${postId} ${actionVerb}`);
 			this.statusBar.showSuccess(`Post ${actionVerb}`, 3000);
-			vscode.window.showInformationMessage(
-				`✅ Post ${postId} ${actionVerb} in WordPress`
-			);
 
 				// Clean up local metadata file for permanent deletes
 				if (action === "delete") {
@@ -2343,9 +2519,7 @@ export class FileWatcher {
 				// Show notification
 				const config = vscode.workspace.getConfiguration("skylit");
 				if (config.get<boolean>("showNotifications", true)) {
-					vscode.window.showInformationMessage(
-						`✅ Slug updated: ${pending.oldSlug} → ${newSlug}`
-					);
+				this.debugLogger.info(`✅ Slug IDE→WP: ${pending.oldSlug} → ${newSlug}`);
 				}
 			} else {
 				this.debugLogger.log(`⚠️ Could not update slug: ${response.error}`);
@@ -2603,11 +2777,6 @@ export class FileWatcher {
 			);
 
 			if (response.success && response.post_id) {
-				this.statusBar.showSuccess(`Created: ${response.title}`);
-				this.debugLogger.log(
-					`✅ Created ${postType} "${response.title}" (ID: ${response.post_id})`
-				);
-
 				// Determine correct path based on post type
 				let basePath: string;
 				if (postTypeFolder === "wp_template") {
@@ -2624,6 +2793,19 @@ export class FileWatcher {
 				// Update reverse index for path-to-postID lookups
 				const slug = response.slug || folderName;
 				this.pathToPostIdIndex.set(`${basePath}/${slug}`, response.post_id);
+
+				// Folder was already linked to an existing WP post — silently mark as in sync
+				if ((response as any).already_linked) {
+					this.debugLogger.log(
+						`ℹ️ Folder already linked to ${postType} ID ${response.post_id} — skipping creation`
+					);
+					return;
+				}
+
+				this.statusBar.showSuccess(`Created: ${response.title}`);
+				this.debugLogger.log(
+					`✅ Created ${postType} "${response.title}" (ID: ${response.post_id})`
+				);
 
 				// Write canonical HTML (with metadata header) back to disk
 				const canonicalHtml = (response as any).canonical_html;
@@ -2668,9 +2850,7 @@ export class FileWatcher {
 
 				const config = vscode.workspace.getConfiguration("skylit");
 				if (config.get<boolean>("showNotifications", true)) {
-					vscode.window.showInformationMessage(
-						`✅ Created ${postType}: ${response.title} (ID: ${response.post_id})`
-					);
+				this.debugLogger.info(`✅ IDE→WP Created ${postType}: ${response.title} (ID: ${response.post_id})`);
 				}
 			} else {
 				this.debugLogger.log(`⚠️ Could not create post: ${response.error}`);
@@ -3394,9 +3574,7 @@ export class FileWatcher {
 				// Show notification
 				const config = vscode.workspace.getConfiguration("skylit");
 				if (config.get<boolean>("showNotifications", true)) {
-					vscode.window.showInformationMessage(
-						`✅ Post ${postId} ${actionVerb} in WordPress`
-					);
+				this.debugLogger.info(`✅ IDE→WP Post ${postId} ${actionVerb}`);
 				}
 			}
 		} catch (error: any) {
@@ -3525,9 +3703,7 @@ export class FileWatcher {
 
 					const config = vscode.workspace.getConfiguration("skylit");
 					if (config.get<boolean>("showNotifications", true)) {
-						vscode.window.showInformationMessage(
-							`✅ Taxonomy terms synced to WordPress`
-						);
+				this.debugLogger.info(`✅ Taxonomy terms IDE→WP synced`);
 					}
 				}
 			} catch (error: any) {
@@ -3602,9 +3778,7 @@ export class FileWatcher {
 
 			const config = vscode.workspace.getConfiguration("skylit");
 			if (config.get<boolean>("showNotifications", true)) {
-				vscode.window.showInformationMessage(
-					`✅ ACF JSON synced to theme & imported to ACF`
-				);
+			this.debugLogger.info(`✅ ACF JSON IDE→WP — synced to theme & imported`);
 			}
 
 		if (this.aiSkillsetGenerator) {
@@ -3723,17 +3897,16 @@ export class FileWatcher {
 			if (isDbMode) {
 				destinations = dbUpdated > 0 ? ["theme", "database"] : ["theme"];
 				toastMsg = dbUpdated > 0
-					? `✅ ${fileName} saved to theme + database`
-					: `✅ ${fileName} saved to theme (database already up to date)`;
+					? `${fileName} IDE→WP — theme + database`
+					: `${fileName} IDE→WP — theme (DB up to date)`;
 			} else {
 				destinations = ["theme"];
-				toastMsg = `✅ ${fileName} saved to theme`;
+				toastMsg = `${fileName} IDE→WP — theme`;
 			}
 
 			const statusMsg = `${fileName} → ${destinations.join(" + ")}`;
 			this.statusBar.showSuccess(statusMsg, 3000);
-			vscode.window.showInformationMessage(toastMsg);
-			this.debugLogger.log(`✅ ${fileName} synced → ${destinations.join(" + ")}`);
+			this.debugLogger.info(`✅ ${toastMsg}`);
 
 			this.lastSyncTime.set(normalizedPath, Date.now());
 
@@ -3804,17 +3977,16 @@ export class FileWatcher {
 			if (isDbMode) {
 				destinations = dbUpdated > 0 ? ["theme", "database"] : ["theme"];
 				toastMsg = dbUpdated > 0
-					? `✅ ${fileName} saved to theme + database`
-					: `✅ ${fileName} saved to theme (database already up to date)`;
+					? `${fileName} IDE→WP — theme + database`
+					: `${fileName} IDE→WP — theme (DB up to date)`;
 			} else {
 				destinations = ["theme"];
-				toastMsg = `✅ ${fileName} saved to theme`;
+				toastMsg = `${fileName} IDE→WP — theme`;
 			}
 
 			const statusMsg = `${fileName} → ${destinations.join(" + ")}`;
 			this.statusBar.showSuccess(statusMsg, 3000);
-			vscode.window.showInformationMessage(toastMsg);
-			this.debugLogger.log(`✅ ${fileName} synced → ${destinations.join(" + ")}`);
+			this.debugLogger.info(`✅ ${toastMsg}`);
 
 			this.lastSyncTime.set(normalizedPath, Date.now());
 
@@ -4016,16 +4188,26 @@ export class FileWatcher {
 				return;
 			}
 
-			// Check cooldown - don't sync if we just synced this file
+			// Check cooldown - don't sync if we just synced this file (use normPath — matches startup stamps)
 			const now = Date.now();
-			const lastSync = this.lastSyncTime.get(filePath) || 0;
+			const lastSync =
+				this.lastSyncTime.get(normPath) ||
+				this.lastSyncTime.get(filePath) ||
+				0;
 			const timeSinceLastSync = now - lastSync;
+			const postStartupWindowMs = 25000;
+			const inPostStartupBurst =
+				this.startupEndedAt > 0 &&
+				now - this.startupEndedAt < postStartupWindowMs;
+			const effectiveCooldownMs = inPostStartupBurst
+				? Math.max(this.syncCooldownMs, 6000)
+				: this.syncCooldownMs;
 
-			if (timeSinceLastSync < this.syncCooldownMs) {
+			if (timeSinceLastSync < effectiveCooldownMs) {
 				this.debugLogger.info(
 					`⏸️ [syncFile] SKIP: cooldown (${Math.round(
-						(this.syncCooldownMs - timeSinceLastSync) / 1000
-					)}s remaining)`
+						(effectiveCooldownMs - timeSinceLastSync) / 1000
+					)}s remaining${inPostStartupBurst ? ", post-startup window" : ""})`
 				);
 				profileEnd("skip: cooldown");
 				return;
@@ -4147,8 +4329,10 @@ export class FileWatcher {
 		});
 	});
 
-			// Record sync time AFTER successful sync
-			this.lastSyncTime.set(filePath, Date.now());
+			// Record sync time AFTER successful sync (both keys — watcher may use either shape)
+			const _syncStamp = Date.now();
+			this.lastSyncTime.set(normPath, _syncStamp);
+			this.lastSyncTime.set(filePath, _syncStamp);
 
 			this.debugLogger.info(
 				`📥 [syncFile] Response: success=${response.success}, blocks_updated=${
@@ -4235,25 +4419,43 @@ export class FileWatcher {
 					} catch {}
 				}
 
-				const config = vscode.workspace.getConfiguration("skylit");
-				if (config.get<boolean>("showNotifications", true)) {
+				{
 					const syncSummary = (response as any).sync_summary as string | undefined;
 					const blocksUpdated = response.blocks_updated ?? 0;
 					const contentChanged = (response as any).content_changed;
-					let syncMsg: string;
-					if (syncSummary) {
-						syncMsg = `✅ ${fileName} — ${syncSummary}`;
-					} else if (blocksUpdated > 0) {
-						syncMsg = `✅ ${fileName} synced — ${blocksUpdated} block${blocksUpdated !== 1 ? "s" : ""} updated`;
-					} else if (contentChanged === false) {
-						syncMsg = `✅ ${fileName} synced — no changes`;
-					} else {
-						syncMsg = `✅ ${fileName} synced`;
-					}
-					vscode.window.showInformationMessage(syncMsg);
-				}
+					const cssChanged = (response as any).css_changed;
 
-				// After canonical HTML is written, format-on-save may reformat the
+					// Build a concise status-bar label (no toast — details are in the output panel).
+					let statusLabel: string;
+					if (syncSummary && syncSummary !== "synced — no changes") {
+						statusLabel = `${fileName} IDE→WP — ${syncSummary}`;
+					} else if (blocksUpdated > 0) {
+						statusLabel = `${fileName} IDE→WP — ${blocksUpdated} block${blocksUpdated !== 1 ? "s" : ""}`;
+					} else if (cssChanged) {
+						statusLabel = `${fileName} IDE→WP — CSS`;
+					} else if (contentChanged === false && !cssChanged) {
+						statusLabel = `${fileName} IDE→WP — no changes`;
+					} else {
+						statusLabel = `${fileName} IDE→WP`;
+					}
+				this.statusBar.showSuccess(statusLabel, 4000);
+				this.debugLogger.info(`✅ ${statusLabel}`);
+
+				// Broadcast file-changed to any connected GT tabs via WS (Phase 4).
+				// The GT client receives this and calls importFileChanges directly,
+				// skipping the /sync/check round-trip entirely.
+				if (this.localServer?.isRunning && postId) {
+					const changedFiles: string[] = [];
+					if (blocksUpdated > 0 || (response as any).content_changed) changedFiles.push('html');
+					if ((response as any).css_changed) changedFiles.push('css');
+					if (changedFiles.length > 0) {
+						const fileHash = (response as any).html_hash ?? '';
+						this.localServer.broadcastFileChanged(postId, changedFiles, fileHash);
+					}
+				}
+			}
+
+			// After canonical HTML is written, format-on-save may reformat the
 				// file, shifting line numbers. Delay then rescan metadata so cursor
 				// sync stays accurate even after formatters run.
 				const rescanPostId = postId;
@@ -4278,12 +4480,16 @@ export class FileWatcher {
 					}
 				}, 800);
 			}
-		} catch (error: any) {
-			profileEnd(`error: ${error.message}`);
-			this.debugLogger.info(`❌ [syncFile] ERROR: ${error.message}`);
-			vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
-		}
+	} catch (error: any) {
+		profileEnd(`error: ${error.message}`);
+		// Include file name in the log so it's clear which file failed
+		const failedFile = path.basename(filePath.replace(/\\/g, "/"));
+		this.debugLogger.info(`❌ [syncFile] ERROR (${failedFile}): ${error.message}`);
+		// Show a notification with the actual reason — error.message is already
+		// enriched by restClient with the PHP error body when available.
+		vscode.window.showErrorMessage(`[Skylit] Sync failed for ${failedFile}: ${error.message}`);
 	}
+}
 
 	/**
 	 * Restore folding state for unchanged blocks after WordPress export
@@ -4601,6 +4807,12 @@ export class FileWatcher {
 			// Primary: push via REST (direct DB write, bypasses all caching)
 			this.restClient.pushCursorBlock(postId, layoutBlockId, ts).catch(() => {});
 
+			// Secondary: broadcast via WS for zero-latency GT cursor update (Phase 4).
+			// The REST push is kept as the canonical write for polling-mode sessions.
+			if (this.localServer?.isRunning) {
+				this.localServer.broadcastCursor(postId, layoutBlockId, ts);
+			}
+
 			// Fallback: write file with timestamp so GT dedup can detect changes
 			const activeBlockPath = posixJoin(
 				this.devFolder,
@@ -4849,8 +5061,28 @@ export class FileWatcher {
 		const uriToPath = (uri: vscode.Uri) =>
 			uri.scheme === "file" ? uri.fsPath : uri.path;
 
+		// VS Code often fires both onDidCreate and onDidChange for the same file
+		// within milliseconds (e.g. PHP/import). Dedup per path for add+change together
+		// so we do not start two concurrent pushes for one save.
+		const mediaEventDedup = new Map<string, number>();
+		const deduped = (uri: vscode.Uri, event: "add" | "change" | "unlink"): boolean => {
+			const p = uriToPath(uri);
+			const key = event === "unlink" ? `unlink:${p}` : `write:${p}`;
+			const last = mediaEventDedup.get(key) ?? 0;
+			const now = Date.now();
+			if (now - last < 2000) return true; // duplicate — skip
+			mediaEventDedup.set(key, now);
+			// Cleanup stale entries periodically to avoid unbounded growth
+			if (mediaEventDedup.size > 200) {
+				const cutoff = now - 10000;
+				for (const [k, t] of mediaEventDedup) if (t < cutoff) mediaEventDedup.delete(k);
+			}
+			return false;
+		};
+
 		this.vscodeMediaWatcher.onDidCreate((uri) => {
 			if (!shouldProcess(uri)) return;
+			if (deduped(uri, "add")) return;
 			const p = uriToPath(uri);
 			this.debugLogger.log(`📷 Media created: ${p}`);
 			this.handleMediaFileChange(p, "add");
@@ -4858,6 +5090,7 @@ export class FileWatcher {
 
 		this.vscodeMediaWatcher.onDidChange((uri) => {
 			if (!shouldProcess(uri)) return;
+			if (deduped(uri, "change")) return;
 			const p = uriToPath(uri);
 			this.debugLogger.log(`📷 Media changed: ${p}`);
 			this.handleMediaFileChange(p, "change");
@@ -4873,6 +5106,173 @@ export class FileWatcher {
 		this.debugLogger.info("✅ Media library watcher started");
 	}
 
+	/** Normalize paths for reliable dev-root prefix checks (handles /c:/ vs C:/, slashes). */
+	private normalizePathForComparison(filePath: string): string {
+		let s = filePath.replace(/\\/g, "/").replace(/\/+$/, "");
+		const slashDrive = /^\/([a-zA-Z]):\//.exec(s);
+		if (slashDrive) {
+			s = `${slashDrive[1].toUpperCase()}:/${s.slice(slashDrive[0].length)}`;
+		} else if (/^[a-zA-Z]:\//.test(s)) {
+			s = s.charAt(0).toUpperCase() + s.slice(1);
+		}
+		return s;
+	}
+
+	/** Path relative to dev root, or null if not under root. */
+	private tryStripDevRoot(fullPath: string, root: string): string | null {
+		const f = this.normalizePathForComparison(fullPath);
+		const r = this.normalizePathForComparison(root);
+		if (f === r) return "";
+		if (f.startsWith(r + "/")) {
+			return f.slice(r.length + 1);
+		}
+		return null;
+	}
+
+	/**
+	 * Canonical path under dev root (e.g. media-library/foo/bar.jpg).
+	 * Avoids basename-only metadata when uri.path does not match devFolder casing/prefix.
+	 */
+	private resolveDevRelativePath(filePathOrUriPath: string): string {
+		let rel = this.tryStripDevRoot(filePathOrUriPath, this.devFolder);
+		if (rel === null) {
+			rel = this.tryStripDevRoot(filePathOrUriPath, this.localDevFolder);
+		}
+		if (rel !== null) {
+			return rel;
+		}
+		const f = this.normalizePathForComparison(filePathOrUriPath);
+		const lower = f.toLowerCase();
+		const needle = "media-library/";
+		const idx = lower.indexOf(needle);
+		if (idx !== -1) {
+			const tail = f.slice(idx + needle.length).replace(/^\/+/, "");
+			return `media-library/${tail}`;
+		}
+		const base = path.posix.basename(f);
+		this.debugLogger.warn(
+			`⚠️ Media: could not resolve dev-relative path, using basename only: ${base}`
+		);
+		return base;
+	}
+
+	/**
+	 * Recursive list of media files as dev-relative paths (media-library/...).
+	 */
+	private async collectMediaFileRelPathsUnderMediaLibrary(): Promise<string[]> {
+		const MEDIA_EXTENSIONS = new Set([
+			".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+			".mp4", ".webm", ".ogg", ".mov",
+			".mp3", ".wav", ".aac",
+			".pdf",
+		]);
+		const out: string[] = [];
+		const mediaLibUri = pathToUri(posixJoin(this.devFolder, "media-library"));
+
+		const walk = async (dirUri: vscode.Uri, relSuffix: string): Promise<void> => {
+			try {
+				const entries = await vscode.workspace.fs.readDirectory(dirUri);
+				for (const [name, type] of entries) {
+					const child = vscode.Uri.joinPath(dirUri, name);
+					if (type === vscode.FileType.Directory) {
+						if (!relSuffix && name === "_trash") {
+							continue;
+						}
+						const next = relSuffix ? `${relSuffix}/${name}` : name;
+						await walk(child, next);
+					} else if (
+						type === vscode.FileType.File &&
+						MEDIA_EXTENSIONS.has(path.extname(name).toLowerCase())
+					) {
+						const relPath = relSuffix ? `media-library/${relSuffix}/${name}` : `media-library/${name}`;
+						out.push(relPath.replace(/\/+/g, "/"));
+					}
+				}
+			} catch {
+				/* missing folder */
+			}
+		};
+		await walk(mediaLibUri, "");
+		return out;
+	}
+
+	/**
+	 * basename → single media-library-relative path when unique; ambiguous basenames excluded.
+	 */
+	private async buildMediaLibraryBasenameLookup(): Promise<{
+		uniqueByBasename: Map<string, string>;
+		ambiguousBasenames: Set<string>;
+	}> {
+		const paths = await this.collectMediaFileRelPathsUnderMediaLibrary();
+		const uniqueByBasename = new Map<string, string>();
+		const ambiguousBasenames = new Set<string>();
+
+		for (const relPath of paths) {
+			const base = path.posix.basename(relPath);
+			if (ambiguousBasenames.has(base)) continue;
+			const existing = uniqueByBasename.get(base);
+			if (existing !== undefined) {
+				if (existing !== relPath) {
+					uniqueByBasename.delete(base);
+					ambiguousBasenames.add(base);
+				}
+			} else {
+				uniqueByBasename.set(base, relPath);
+			}
+		}
+		return { uniqueByBasename, ambiguousBasenames };
+	}
+
+	/**
+	 * True if the media file for `localPath` (relative to dev root) still exists on disk.
+	 * Uses VS Code FS (SSH-safe) with retries for OneDrive/cloud hydration delays; for local
+	 * `file` workspaces, falls back to Node `fs` when VS Code falsely reports missing so we
+	 * do not treat live files as "offline deleted" and mass-delete WP attachments.
+	 */
+	private async localMediaFileStillPresent(localPath: string): Promise<boolean> {
+		const normRoot = (p: string) => p.replace(/\\/g, "/").replace(/\/$/, "");
+		const roots =
+			normRoot(this.localDevFolder) === normRoot(this.devFolder)
+				? [this.devFolder]
+				: [this.devFolder, this.localDevFolder];
+		const fullPaths = [...new Set(roots.map((r) => posixJoin(r, localPath)))];
+
+		const statVs = async (): Promise<boolean> => {
+			for (const fullPath of fullPaths) {
+				try {
+					const st = await vscode.workspace.fs.stat(pathToUri(fullPath));
+					if (st.type === vscode.FileType.Directory) continue;
+					return true;
+				} catch {
+					/* next path */
+				}
+			}
+			return false;
+		};
+
+		const delaysMs = [0, 280, 650];
+		for (let i = 0; i < delaysMs.length; i++) {
+			if (delaysMs[i] > 0) {
+				await new Promise<void>((r) => setTimeout(r, delaysMs[i]));
+			}
+			if (await statVs()) return true;
+		}
+
+		const ws0 = vscode.workspace.workspaceFolders?.[0]?.uri;
+		if (ws0?.scheme === "file") {
+			for (const fullPath of fullPaths) {
+				const normalized = path.normalize(fullPath.replace(/\//g, path.sep));
+				try {
+					const st = await fs.promises.stat(normalized);
+					if (st.isFile()) return true;
+				} catch {
+					/* continue */
+				}
+			}
+		}
+		return false;
+	}
+
 	/**
 	 * Load all .skylit/media/*.json files into the in-memory index.
 	 * Called once on connection. Uses VS Code FS API for SSH/remote compatibility.
@@ -4880,8 +5280,12 @@ export class FileWatcher {
 	 */
 	public async loadMediaMetaIndex(): Promise<void> {
 		const mediaMetaDir = posixJoin(this.devFolder, ".skylit", "media");
-		this.mediaMetaIndex.clear();
+		// Build into a fresh map, then swap atomically so concurrent watcher
+		// events never see a partially-populated (or empty) index mid-rebuild.
+		const newIndex = new Map<string, import("./types").MediaMetadata>();
 		try {
+			const basenameLookup = await this.buildMediaLibraryBasenameLookup();
+
 			const dirUri = pathToUri(mediaMetaDir);
 			const entries = await vscode.workspace.fs.readDirectory(dirUri);
 
@@ -4896,62 +5300,102 @@ export class FileWatcher {
 					const meta = JSON.parse(raw) as import("./types").MediaMetadata;
 					if (!meta.local_path) continue;
 
-					// Check whether the actual media file still exists
-					const mediaFileUri = pathToUri(posixJoin(this.devFolder, meta.local_path));
-					let fileExists = false;
-					try {
-						await vscode.workspace.fs.stat(mediaFileUri);
-						fileExists = true;
-					} catch {
-						fileExists = false;
+					let localPath = meta.local_path.replace(/\\/g, "/");
+					if (!localPath.startsWith("media-library/")) {
+						const base = path.posix.basename(localPath);
+						if (!basenameLookup.ambiguousBasenames.has(base)) {
+							const canonical = basenameLookup.uniqueByBasename.get(base);
+							if (canonical) {
+								meta.local_path = canonical;
+								localPath = canonical;
+								try {
+									await vscode.workspace.fs.writeFile(
+										fileUri,
+										Buffer.from(JSON.stringify(meta, null, "\t"), "utf-8")
+									);
+								} catch {
+									/* ignore */
+								}
+								this.debugLogger.info(
+									`🔧 Media metadata repaired local_path: ${base} → ${canonical} (attachment ${meta.attachment_id})`
+								);
+							}
+						} else {
+							this.debugLogger.warn(
+								`⚠️ Media metadata ambiguous basename "${base}", skip local_path repair (attachment ${meta.attachment_id})`
+							);
+						}
 					}
 
-					if (fileExists) {
-						this.mediaMetaIndex.set(meta.local_path, meta);
-					} else {
-						// Stale — file was deleted while the extension was offline.
-						// Remove the metadata JSON now; schedule WP delete below.
-						this.debugLogger.log(`🧹 Stale media (file missing): ${meta.local_path} — queuing WP delete`);
-						staleEntries.push({ attachmentId: meta.attachment_id, localPath: meta.local_path });
-						try {
-							await vscode.workspace.fs.delete(fileUri, { useTrash: false });
-						} catch { /* ignore */ }
-					}
-				} catch {
-					// Skip malformed metadata files
-				}
-			}
+					const fileExists = await this.localMediaFileStillPresent(localPath);
 
-			this.debugLogger.info(
-				`📂 Media metadata index loaded: ${this.mediaMetaIndex.size} entries` +
-				(staleEntries.length ? `, ${staleEntries.length} stale (will delete from WP)` : "")
-			);
-
-			// Delete stale attachments from WordPress — only when sync direction allows
-			// local→WP deletes (same guard as the live watcher unlink path).
-			if (
-				staleEntries.length > 0 &&
-				this.mediaSyncEnabled &&
-				this.mediaSyncDirection !== "wp-to-local"
-			) {
-				this.debugLogger.info(`🗑️ Cleaning up ${staleEntries.length} WP attachment(s) deleted while offline…`);
-				for (const { attachmentId, localPath } of staleEntries) {
+				if (fileExists) {
+					newIndex.set(localPath, meta);
+				} else {
+					// Stale — file was deleted while the extension was offline (confirmed missing).
+					// Remove the metadata JSON now; schedule WP delete below when we have an ID.
+					this.debugLogger.log(`🧹 Stale media (file missing): ${localPath} — queuing WP delete`);
 					try {
-						await this.restClient.deleteMediaAttachment(attachmentId);
-						this.debugLogger.info(`✅ WP attachment deleted (offline cleanup): ${localPath} (ID ${attachmentId})`);
-					} catch (err: any) {
-						this.debugLogger.warn(`⚠️ Could not delete WP attachment ${attachmentId} (${localPath}): ${err.message}`);
+						await vscode.workspace.fs.delete(fileUri, { useTrash: false });
+					} catch { /* ignore */ }
+					if (meta.attachment_id && meta.attachment_id > 0) {
+						staleEntries.push({ attachmentId: meta.attachment_id, localPath });
 					}
 				}
-			} else if (staleEntries.length > 0) {
-				this.debugLogger.info(`⏭️ Stale WP attachments NOT deleted — sync disabled or direction is wp-to-local`);
+			} catch {
+				// Skip malformed metadata files
 			}
-
-		} catch {
-			// Folder may not exist yet — not an error
-			this.debugLogger.info(`📂 Media metadata dir not found yet — starting fresh`);
 		}
+
+		// Atomic swap — any concurrent watcher event that ran during the rebuild
+		// against the old index is still valid; live writes during rebuild are
+		// preserved by merging them into the new index before swapping.
+		for (const [k, v] of this.mediaMetaIndex) {
+			if (!newIndex.has(k)) {
+				newIndex.set(k, v);
+			}
+		}
+		this.mediaMetaIndex = newIndex;
+
+		// Rebuild the reverse hash→path index for cross-path dedup.
+		const newHashIndex = new Map<string, string>();
+		for (const [lp, m] of this.mediaMetaIndex) {
+			if (m.sync_hash) {
+				newHashIndex.set(m.sync_hash, lp);
+			}
+		}
+		this.mediaHashIndex = newHashIndex;
+
+		this.debugLogger.info(
+			`📂 Media metadata index loaded: ${this.mediaMetaIndex.size} entries` +
+			(staleEntries.length ? `, ${staleEntries.length} stale (will delete from WP)` : "")
+		);
+
+		// Delete stale attachments from WordPress — only when sync direction allows
+		// local→WP deletes (same guard as the live watcher unlink path).
+		if (
+			staleEntries.length > 0 &&
+			this.mediaSyncEnabled &&
+			this.mediaSyncDirection !== "wp-to-local"
+		) {
+			this.debugLogger.info(`🗑️ Cleaning up ${staleEntries.length} WP attachment(s) deleted while offline…`);
+			for (const { attachmentId, localPath } of staleEntries) {
+				try {
+					await this.restClient.deleteMediaAttachment(attachmentId);
+					this.debugLogger.info(`✅ WP attachment deleted (offline cleanup): ${localPath} (ID ${attachmentId})`);
+				} catch (err: any) {
+					this.debugLogger.warn(`⚠️ Could not delete WP attachment ${attachmentId} (${localPath}): ${err.message}`);
+				}
+			}
+		} else if (staleEntries.length > 0) {
+			this.debugLogger.info(`⏭️ Stale WP attachments NOT deleted — sync disabled or direction is wp-to-local`);
+		}
+
+	} catch {
+		// Folder may not exist yet — not an error
+		this.debugLogger.info(`📂 Media metadata dir not found yet — starting fresh`);
 	}
+}
 
 	/**
 	 * Write a metadata entry to .skylit/media/{attachment_id}.json and update the index.
@@ -4967,6 +5411,9 @@ export class FileWatcher {
 			this.debugLogger.log(`⚠️ Media: failed to write metadata: ${err.message}`);
 		}
 		this.mediaMetaIndex.set(meta.local_path, meta);
+		if (meta.sync_hash) {
+			this.mediaHashIndex.set(meta.sync_hash, meta.local_path);
+		}
 	}
 
 	/**
@@ -4980,6 +5427,10 @@ export class FileWatcher {
 			const uri = pathToUri(filePath);
 			await vscode.workspace.fs.delete(uri, { useTrash: false });
 		} catch { /* file may not exist — ignore */ }
+		const existing = this.mediaMetaIndex.get(localPath);
+		if (existing?.sync_hash) {
+			this.mediaHashIndex.delete(existing.sync_hash);
+		}
 		this.mediaMetaIndex.delete(localPath);
 	}
 
@@ -4991,21 +5442,36 @@ export class FileWatcher {
 	private async handleMediaFileChange(filePath: string, eventType: "add" | "change" | "unlink"): Promise<"pushed" | "skipped" | "renamed" | "deleted" | "error" | "ignored"> {
 		if (!this.mediaSyncEnabled) return "ignored";
 
-		const normalizedPath = filePath.replace(/\\/g, "/");
-		// Strip the dev folder prefix to get the relative path — use devFolder (not localDevFolder)
-		// because VS Code native watcher URIs are based on devFolder path.
-		const devFolderNormalized = this.devFolder.replace(/\\/g, "/").replace(/\/$/, "");
-		const localDevFolderNormalized = this.localDevFolder.replace(/\\/g, "/").replace(/\/$/, "");
+		// Skip events for files we just wrote ourselves (media import, pull
+		// sync, etc). Without this guard, the WP→local import would cause an
+		// immediate push back to WordPress — a classic echo loop.
+		const selfKey = filePath.replace(/\\/g, "/");
+		const selfStamp = this.selfWrittenPaths.get(selfKey);
+		if (selfStamp && Date.now() - selfStamp < 5000) {
+			this.debugLogger.log(`⏭️ Media skip (self-written): ${filePath}`);
+			return "skipped";
+		}
 
-		// Compute local_path relative to dev root (e.g. "media-library/test/photo.webp")
-		// Accept either devFolder or localDevFolder prefix (handles local + SSH cases)
-		let localPath: string;
-		if (normalizedPath.startsWith(devFolderNormalized + "/")) {
-			localPath = normalizedPath.substring(devFolderNormalized.length + 1);
-		} else if (normalizedPath.startsWith(localDevFolderNormalized + "/")) {
-			localPath = normalizedPath.substring(localDevFolderNormalized.length + 1);
-		} else {
-			localPath = path.basename(normalizedPath);
+		const localPath = this.resolveDevRelativePath(filePath);
+
+		// Plugin mirrors WP trash under media-library/_trash/ — never push those paths as new uploads.
+		if (
+			(eventType === "add" || eventType === "change") &&
+			localPath.startsWith("media-library/_trash/")
+		) {
+			this.debugLogger.log(
+				`⏭️ Media skip (trash mirror, no push): ${localPath}`
+			);
+			return "ignored";
+		}
+
+		if (
+			(eventType === "add" || eventType === "change") &&
+			Date.now() < this.mediaLibraryImportQuietUntil &&
+			this.mediaMetaIndex.has(localPath)
+		) {
+			this.debugLogger.log(`⏭️ Media skip (post-import quiet, already indexed): ${localPath}`);
+			return "skipped";
 		}
 
 		if (eventType === "add" || eventType === "change") {
@@ -5030,41 +5496,108 @@ export class FileWatcher {
 			return "skipped";
 		}
 
+		// Cross-path content dedup: another path already has the same bytes in WP.
+		// Instead of creating a duplicate attachment, reuse the existing one and
+		// update its local_path mapping to point to this new filename as well.
+		if (!existingMeta) {
+			const existingPath = this.mediaHashIndex.get(hash);
+			if (existingPath) {
+				const otherMeta = this.mediaMetaIndex.get(existingPath);
+				if (otherMeta) {
+					this.debugLogger.log(
+						`⏭️ Media skip (identical content already synced as ${existingPath}): ${localPath} (ID: ${otherMeta.attachment_id})`
+					);
+					return "skipped";
+				}
+			}
+		}
+
 			// Rename detection: check if any pending delete has this hash
 			const pendingEntry = this.pendingMediaDeletes.get(hash);
 			if (pendingEntry) {
-				// This is a rename/move — cancel delete, call rename endpoint
 				clearTimeout(pendingEntry.timer);
 				this.pendingMediaDeletes.delete(hash);
 
-				this.debugLogger.log(`🔀 Media rename detected: ${localPath} (attachment ${pendingEntry.attachmentId})`);
-
-			try {
-				// WP path is relative to media-library/
-				const newWpPath = localPath.replace(/^media-library\//, "");
-				await this.restClient.renameMediaFile(pendingEntry.attachmentId, newWpPath);
-
-				// Update metadata
 				const oldMeta = [...this.mediaMetaIndex.values()].find(
 					(m) => m.attachment_id === pendingEntry.attachmentId
 				);
-				if (oldMeta) {
-					this.mediaMetaIndex.delete(oldMeta.local_path);
+				const oldPath = oldMeta?.local_path ?? "";
+
+				const movedToTrash =
+					localPath.startsWith("media-library/_trash/") &&
+					oldPath.startsWith("media-library/") &&
+					!oldPath.startsWith("media-library/_trash/");
+
+				const movedFromTrash =
+					oldPath.startsWith("media-library/_trash/") &&
+					localPath.startsWith("media-library/") &&
+					!localPath.startsWith("media-library/_trash/");
+
+				this.debugLogger.log(
+					`🔀 Media move detected: ${localPath} (attachment ${pendingEntry.attachmentId})`
+				);
+
+				try {
+					if (movedToTrash) {
+						await this.restClient.trashMediaAttachment(pendingEntry.attachmentId);
+						if (oldMeta) {
+							this.mediaMetaIndex.delete(oldMeta.local_path);
+						}
+						const newWpPath = localPath.replace(/^media-library\/_trash\//, "");
+						const newMeta: import("./types").MediaMetadata = {
+							attachment_id: pendingEntry.attachmentId,
+							local_path: localPath,
+							wp_path: newWpPath,
+							sync_hash: hash,
+							modified_local: new Date().toISOString(),
+							modified_wp: new Date().toISOString(),
+						};
+						await this.writeMediaMeta(newMeta);
+						this.debugLogger.log(`✅ Media trashed on WP: ${localPath}`);
+					} else if (movedFromTrash) {
+						await this.restClient.restoreMediaAttachment(pendingEntry.attachmentId);
+						if (oldMeta) {
+							this.mediaMetaIndex.delete(oldMeta.local_path);
+						}
+						const newWpPath = localPath.replace(/^media-library\//, "");
+						const newMeta: import("./types").MediaMetadata = {
+							attachment_id: pendingEntry.attachmentId,
+							local_path: localPath,
+							wp_path: newWpPath,
+							sync_hash: hash,
+							modified_local: new Date().toISOString(),
+							modified_wp: new Date().toISOString(),
+						};
+						await this.writeMediaMeta(newMeta);
+						this.debugLogger.log(`✅ Media restored on WP: ${localPath}`);
+					} else {
+						const newWpPath = localPath.replace(/^media-library\//, "");
+						await this.restClient.renameMediaFile(pendingEntry.attachmentId, newWpPath);
+						if (oldMeta) {
+							this.mediaMetaIndex.delete(oldMeta.local_path);
+						}
+						const newMeta: import("./types").MediaMetadata = {
+							attachment_id: pendingEntry.attachmentId,
+							local_path: localPath,
+							wp_path: newWpPath,
+							sync_hash: hash,
+							modified_local: new Date().toISOString(),
+							modified_wp: new Date().toISOString(),
+						};
+						await this.writeMediaMeta(newMeta);
+						this.debugLogger.log(`✅ Media renamed: ${localPath}`);
+					}
+				} catch (err: any) {
+					this.debugLogger.log(`❌ Media rename/trash/restore failed: ${err.message}`);
 				}
-				const newMeta: import("./types").MediaMetadata = {
-					attachment_id: pendingEntry.attachmentId,
-					local_path: localPath,
-					wp_path: newWpPath,
-					sync_hash: hash,
-					modified_local: new Date().toISOString(),
-					modified_wp: new Date().toISOString(),
-				};
-			await this.writeMediaMeta(newMeta);
-			this.debugLogger.log(`✅ Media renamed: ${localPath}`);
-			} catch (err: any) {
-				this.debugLogger.log(`❌ Media rename failed: ${err.message}`);
+				return "renamed";
 			}
-			return "renamed";
+
+			if (localPath.startsWith("media-library/_trash/")) {
+				this.debugLogger.log(
+					`⏭️ Media skip (won't push new files from media-library/_trash): ${localPath}`
+				);
+				return "ignored";
 			}
 
 			// New file or content changed — push to WP
@@ -5081,32 +5614,38 @@ export class FileWatcher {
 
 			this.debugLogger.log(`📤 Pushing media file: ${relPath}`);
 
+			if (this.mediaPushInFlight.has(localPath)) {
+				this.debugLogger.log(`⏭️ Media skip (push already in progress): ${localPath}`);
+				return "skipped";
+			}
+			this.mediaPushInFlight.add(localPath);
 			try {
 				const response = await this.restClient.pushMediaFile(
 					filePath, relPath, fileBuffer, mimeType
 				);
 
-			const result = response.results?.[0];
-			if (result?.success && result.attachment_id) {
-				const meta: import("./types").MediaMetadata = {
-					attachment_id: result.attachment_id,
-					local_path: localPath,
-					wp_path: relPath,
-					sync_hash: hash,
-					modified_local: new Date().toISOString(),
-					modified_wp: new Date().toISOString(),
-				};
-				await this.writeMediaMeta(meta);
-				this.debugLogger.info(`✅ Media pushed: ${relPath} (ID: ${result.attachment_id})`);
-				return "pushed";
-			} else {
+				const result = response.results?.[0];
+				if (result?.success && result.attachment_id) {
+					const meta: import("./types").MediaMetadata = {
+						attachment_id: result.attachment_id,
+						local_path: localPath,
+						wp_path: relPath,
+						sync_hash: hash,
+						modified_local: new Date().toISOString(),
+						modified_wp: new Date().toISOString(),
+					};
+					await this.writeMediaMeta(meta);
+					this.debugLogger.info(`✅ Media pushed: ${relPath} (ID: ${result.attachment_id})`);
+					return "pushed";
+				}
 				this.debugLogger.warn(`⚠️ Media push failed: ${result?.error || "unknown error"}`);
 				return "error";
+			} catch (err: any) {
+				this.debugLogger.warn(`❌ Media push error: ${err.message}`);
+				return "error";
+			} finally {
+				this.mediaPushInFlight.delete(localPath);
 			}
-		} catch (err: any) {
-			this.debugLogger.warn(`❌ Media push error: ${err.message}`);
-			return "error";
-		}
 
 	} else if (eventType === "unlink") {
 		// File deleted — put in pending buffer for 1 second (rename detection window)
@@ -5118,7 +5657,9 @@ export class FileWatcher {
 
 		const { attachment_id: attachmentId, sync_hash: hash } = existingMeta;
 
-		this.debugLogger.log(`🗑️ Media delete queued: ${localPath} (1s rename window)`);
+			this.debugLogger.log(`🗑️ Media delete queued: ${localPath} (1s rename window)`);
+
+		const trashFile = localPath.startsWith("media-library/_trash/");
 
 		const timer = setTimeout(async () => {
 			this.pendingMediaDeletes.delete(hash);
@@ -5129,13 +5670,26 @@ export class FileWatcher {
 				return;
 			}
 
-			this.debugLogger.log(`🗑️ Media deleting from WP: attachment ${attachmentId}`);
+			const actionLabel = trashFile ? "permanent delete" : "trash";
+			this.debugLogger.log(
+				`🗑️ Media ${actionLabel} on WP: attachment ${attachmentId}`
+			);
 			try {
-				await this.restClient.deleteMediaAttachment(attachmentId);
-				await this.removeMediaMeta(attachmentId, localPath);
-				this.debugLogger.log(`✅ Media deleted from WP: attachment ${attachmentId}`);
+				if (trashFile) {
+					await this.restClient.deleteMediaAttachment(attachmentId);
+					await this.removeMediaMeta(attachmentId, localPath);
+				} else {
+					await this.restClient.trashMediaAttachment(attachmentId);
+					// PHP updates .skylit/media/{id}.json and may move the file to _trash — resync index.
+					try {
+						await this.loadMediaMetaIndex();
+					} catch {
+						/* best-effort */
+					}
+				}
+				this.debugLogger.log(`✅ Media ${actionLabel} completed: attachment ${attachmentId}`);
 			} catch (err: any) {
-				this.debugLogger.log(`❌ Media delete from WP failed: ${err.message}`);
+				this.debugLogger.log(`❌ Media ${actionLabel} on WP failed: ${err.message}`);
 			}
 		}, 1000);
 
@@ -5170,11 +5724,30 @@ export class FileWatcher {
 			} catch (err: any) {
 				this.debugLogger.warn(`⚠️ Media meta index load failed: ${err?.message || err}`);
 			}
+
+			// Bidirectional / wp-to-local: pull from WP BEFORE starting the watcher.
+			// If the watcher is running while PHP copies files to disk during import
+			// (same-machine mode), it fires on each new file, finds no metadata yet,
+			// and immediately pushes the file back to WP — creating an echo loop and
+			// duplicate attachments. Starting the watcher AFTER the import ensures the
+			// metadata index is fully populated before the watcher ever sees a file.
+			if (this.mediaSyncDirection !== "local-to-wp") {
+				try {
+					await this.importMediaFromWP();
+				} catch (err: any) {
+					this.debugLogger.warn(
+						`⚠️ Media import on connect failed: ${err?.message || err}`
+					);
+				}
+			}
+
+			// Start watcher only after import completes and metadata index is populated.
 			try {
 				this.startMediaLibraryWatcher();
 			} catch (err: any) {
 				this.debugLogger.warn(`⚠️ Media watcher start failed: ${err?.message || err}`);
 			}
+
 			if (this.mediaSyncDirection !== "wp-to-local") {
 				this.syncUntrackedMediaFiles().catch((err: any) => {
 					this.debugLogger.warn(`⚠️ Media untracked sync failed: ${err?.message || err}`);
@@ -5223,13 +5796,16 @@ export class FileWatcher {
 			return;
 		}
 
+		// Deduplicate by localPath so a file that appears under multiple URIs
+		// (e.g. returned twice by VS Code FS on Windows) is only pushed once.
+		const seen = new Set<string>();
 		const untracked = files.filter((uri) => {
-			const normalizedPath = uri.path.replace(/\\/g, "/");
-			const devFolderNormalized = this.devFolder.replace(/\\/g, "/").replace(/\/$/, "");
-			const localPath = normalizedPath.startsWith(devFolderNormalized + "/")
-				? normalizedPath.substring(devFolderNormalized.length + 1)
-				: path.basename(normalizedPath);
-			return !this.mediaMetaIndex.has(localPath);
+			const filePath = uri.scheme === "file" ? uri.fsPath : uri.path;
+			const localPath = this.resolveDevRelativePath(filePath);
+			if (this.mediaMetaIndex.has(localPath)) return false;
+			if (seen.has(localPath)) return false;
+			seen.add(localPath);
+			return true;
 		});
 
 		if (untracked.length === 0) {
@@ -5262,18 +5838,70 @@ export class FileWatcher {
 		let total = 0;
 		let processed = 0;
 		let skipped = 0;
-		const errors = 0;
+		let errors = 0;
 
-		this.debugLogger.info("📥 Manual import: pulling WP media → media-library/");
+		this.debugLogger.info(
+			`📥 Importing WP media → media-library/ (${this.remoteMode ? "remote: stream base64" : "same-machine: server-side copy"})`
+		);
 
 		// eslint-disable-next-line no-constant-condition
 		while (true) {
 			let batch: Awaited<ReturnType<typeof this.restClient.importMediaBatch>>;
 			try {
-				batch = await this.restClient.importMediaBatch(offset);
+				batch = await this.restClient.importMediaBatch(offset, this.remoteMode);
 			} catch (err: any) {
 				this.debugLogger.warn(`❌ Import batch failed at offset ${offset}: ${err.message}`);
 				break;
+			}
+
+			// In remote mode the server ships file contents back base64 — write
+			// them locally here, tag each path as self-written so the media
+			// watcher ignores the write, and persist the metadata so we never
+			// try to push these files back to WP on reconnect.
+			if (this.remoteMode && Array.isArray(batch.files)) {
+				for (const f of batch.files) {
+					if (f.skipped || !f.content) continue;
+					try {
+						const absPath = posixJoin(this.devFolder, f.local_path);
+						const dir = path.dirname(absPath);
+						if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+						const buf = Buffer.from(f.content, "base64");
+
+						// Persist metadata FIRST so the media watcher — which may
+						// fire between our writeFileSync and the metadata persist
+						// — sees an existing entry with matching hash and skips
+						// the push. Also mark the path as self-written so we get
+						// a second safety net independent of hash comparison.
+						const meta: import("./types").MediaMetadata = {
+							attachment_id: f.attachment_id,
+							local_path: f.local_path,
+							wp_path: f.wp_path,
+							sync_hash: f.hash,
+							modified_local: new Date().toISOString(),
+							modified_wp: new Date().toISOString(),
+						};
+						await this.writeMediaMeta(meta);
+
+						// Skip write if local file is already identical.
+						let skipWrite = false;
+						if (fs.existsSync(absPath)) {
+							try {
+								if (fs.readFileSync(absPath).equals(buf)) skipWrite = true;
+							} catch { /* ignore */ }
+						}
+
+						if (!skipWrite) {
+							this.markSelfWrittenPath(absPath);
+							fs.writeFileSync(absPath, buf);
+						}
+					} catch (err: any) {
+						errors++;
+						this.debugLogger.warn(
+							`⚠️ Failed to write imported media ${f.local_path}: ${err?.message || err}`
+						);
+					}
+				}
 			}
 
 			processed += batch.processed;
@@ -5290,12 +5918,20 @@ export class FileWatcher {
 			if (batch.done || batch.message) break;
 		}
 
-		this.debugLogger.info(`✅ Import complete — processed: ${processed}, skipped: ${skipped}`);
+		this.debugLogger.info(
+			`✅ Media import complete — processed: ${processed}, skipped: ${skipped}, errors: ${errors}`
+		);
 
 		// Reload the metadata index so the watcher reflects newly imported files
 		try {
 			await this.loadMediaMetaIndex();
 		} catch { /* non-fatal */ }
+
+		if (!this.remoteMode) {
+			// Same-machine import: PHP wrote files; mute redundant watcher pushes briefly
+			// for paths already in the index (index was just refreshed above).
+			this.mediaLibraryImportQuietUntil = Date.now() + 12000;
+		}
 
 		return { processed, skipped, errors };
 	}

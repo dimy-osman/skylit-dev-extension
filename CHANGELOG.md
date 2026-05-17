@@ -2,6 +2,107 @@
 
 All notable changes to the Skylit.DEV I/O extension will be documented in this file.
 
+## [1.53.61] - 2026-05-17
+
+Paired WordPress plugin release: **Skylit.DEV 5.99.305**.
+
+### Added
+
+- **WebSocket sync transport** — Local WS server (`127.0.0.1`) pushes file-changed and cursor events to Gutenberg; replaces constant REST polling when the extension is connected. Remote-SSH port auto-forward via `portsAttributes`.
+- **`POST /sync/register-ws-endpoint`** — Extension registers WS port + session token with WordPress for editor page injection.
+
+### Changed
+
+- **Polling fallback** — Combined `GET /sync/changes` endpoint with server-side change cursor, visibility-aware idle backoff, and Dev Sync setting: Auto (WS preferred) / WebSocket only / Polling (debug).
+
+## [1.53.58] - 2026-05-12
+
+### Fixed
+
+- **File watcher — editor/VCS/AI sidecar files no longer trigger sync cycles** — Cursor's source-control extension and AI agents commonly write transient sibling files next to the file they're editing (e.g. `home.html.git`, `home.html.orig`, `home.html~`). Because these end with a non-dot extension and live inside `post-types/templates/parts/patterns`, both the VS Code `FileSystemWatcher` and the chokidar watcher used to pass them through `handleFileChange` → `syncFile`. `extractPostInfo` resolves the post via the *folder* slug, so every `.git` sibling was triggering a redundant import-instant call against the real `.html` post — which returned `blocks_updated: 0, content_changed: false` but still forced Gutenberg to recompute blocks, re-inject CSS, and visibly jump the canvas. After a single AI edit the user could see 15+ phantom sync cycles in the Output panel. Both watchers now reject filenames ending in `.git`, `.orig`, `.rej`, `.bak`, `.tmp`, `.temp`, `.swp`, `.swo`, `.swn`, `.old`, or `~` before any debounce/cooldown logic runs.
+- **Content-folder whitelist** — Inside `post-types/`, `templates/`, `parts/`, and `patterns/` only `.html` and `.css` files are now eligible for `syncFile()`. Sidecar JSON, screenshots, READMEs, and any future tooling artifact in a post folder will be ignored instead of routed through `import-instant`. Eliminates a class of "canvas jumps but nothing changed" reports.
+
+## [1.53.57] - 2026-05-10
+
+### Fixed
+
+- **Media library** — `handleMediaFileChange` ignores adds/changes under `media-library/_trash/` before reading/pushing, avoiding “Reserved path segment: _trash” when WordPress/plugin moves trashed files into the dev mirror.
+
+## [1.53.56] - 2026-05-10
+
+Paired WordPress plugin release: **Skylit.DEV 5.99.247**.
+
+### Changed
+
+- **Media library** — `restClient` trash/restore routes and `fileWatcher` handling for `media-library/_trash` (move vs unlink, skip `_trash` in untracked walk, self-write safety) aligned with the plugin’s soft-delete layout.
+
+## [1.53.44] - 2026-04-24
+
+### Fixed
+
+- **Auth token storage** — `saveToken` now trims pasted tokens (avoids `invalid_token` when WordPress meta matches but the IDE stored a leading/trailing space). Secret storage keys normalize the hostname to lowercase so `https://Skylit.dev` and `https://skylit.dev` resolve to the same saved token.
+
+## [1.53.41] - 2026-04-17
+
+Paired WordPress plugin release: **Skylit.DEV 5.99.101** (remote dev folder train; Gutenberg import uses full `resetBlocks` — extension APIs unchanged from this changelog).
+
+### Fixed
+
+- **Remote mode — media library now populates via the proper pipeline** — `FileWatcher.importMediaFromWP()` now passes `remote: true` when running in remote mode, consumes the `files[]` array shipped back by Skylit.DEV plugin **5.99.87+**, and writes each attachment to `media-library/` with full `.skylit/media/*.json` metadata. Previously the import endpoint was effectively a no-op in remote mode and `media-library/` stayed empty.
+- **Remote mode — pull before push on connect** — `refreshMediaSyncSettings()` now awaits `importMediaFromWP()` before kicking off `syncUntrackedMediaFiles()`. Running push first would re-upload files the server already has, creating duplicate attachments and triggering `403` rate limits. The pull populates the metadata index so push-untracked correctly skips files already on WordPress.
+- **Media watcher — skip self-written paths and hash-matched metadata** — `handleMediaFileChange()` now bails out early when a path was just written by the extension (`selfWrittenPaths` mechanism shared with the content watcher), breaking WP→local→WP echo loops. The import flow also writes metadata BEFORE writing the file so the watcher's existing hash-match skip fires first.
+
+### Changed
+
+- `ExportPoller.downloadGlobalFiles()` no longer needs to download `media-library/` (plugin excludes it); media is handled exclusively through the dedicated import pipeline.
+- `RestClient.importMediaBatch(offset, remote = false)` now exposes the remote flag and the `files[]` / `remote` fields on the response type.
+
+## [1.53.40] - 2026-04-17
+
+### Fixed
+
+- **Remote mode — global files reconciled on every connect** — `ExportPoller.downloadGlobalFiles()` was only called during an explicit "Sync Now" (full sync). It is now invoked on every remote connect so `media-library/`, `acf-json/`, `.skylit/site.json`, `.cursorrules`, `.gitignore`, `theme.json`, `assets/`, and other global files are reconciled automatically. Combined with Skylit.DEV plugin **5.99.85+** (`global-files` endpoint recursively scans the entire dev root), the local folder now mirrors the server comprehensively.
+- **Remote mode — global file writes no longer trigger the file watcher** — Global file downloads now go through the `onFileWritten` callback (marked as self-written) and are also skipped entirely when local content is already byte-identical, so the watcher doesn't attempt to push them back to WordPress.
+
+### Changed
+
+- `ExportPoller.downloadGlobalFiles()` is now public so the extension can call it on connect, not only on full sync.
+
+## [1.53.39] - 2026-04-17
+
+### Fixed
+
+- **Remote mode — sync loop prevention** — Export poller now marks every file it writes via `FileWatcher.markSelfWrittenPath()`, preventing the file watcher from re-importing Gutenberg exports back to WP. Eliminates the GT save → export → local write → import-instant → override loop that caused content to revert after edits.
+
+### Added
+
+- **Remote mode — local folder scaffolding on connect** — The standard dev folder directory tree (`acf-json/`, `media-library/`, `taxonomies/`, `.skylit/media/`, etc.) is now scaffolded on export poller start and full sync, not just on explicit "Sync Now". Mirrors the structure the WP plugin creates server-side.
+- **Remote mode — pre-fill local dev path** — The `connectRemote` command and folder relocation prompts now pre-fill with the current workspace folder or existing `skylit.localDevPath` setting.
+
+## [1.53.31] - 2026-03-27
+
+### Added
+
+- **Open in IDE (poll)** — `RestClient.getPendingOpenIde()` / `clearPendingOpenIde()`; `extension.ts` polls after connect (with backoff on errors), resolves dev paths, opens the HTML document in the editor, dedupes by file + timestamp. Pairs with Skylit.DEV plugin **5.96.83+** (`request-open-ide` / `get-open-ide`).
+
+### Fixed
+
+- **Post-connect watcher bursts (`fileWatcher.ts`)** — Startup reconciliation stamps `lastSyncTime` for HTML/CSS paths that were already in sync (normalized keys); keeps `startupSyncInProgress` true for 3s after reconciliation; first 25s after startup use a higher effective sync cooldown (6s min) so VS Code/chokidar change bursts do not enqueue duplicate `import-instant` storms. `syncFile` records sync time under both `normPath` and raw `filePath`.
+
+## [1.53.21] - 2026-03-23
+
+### Added
+
+- **Post-update grammar recompile** — When the plugin sets `pending_grammar_recompile` (after a Skylit version upgrade), the extension detects it on sync status polling and runs `POST /skylit/v1/sync/post-update-reimport` in batches across `wp_block`, `wp_template`, `wp_template_part`, `page`, and `post`, with a progress notification and log output. Clears validation drift where stored `post_content` no longer matches the current HTML compiler.
+
+### Changed
+
+- **Pattern instance attribute guard** — Phantom HTML tag protection is **disabled by default**. Set `PATTERN_INSTANCE_GUARD_ENABLED` to `true` in `instanceAttributeGuard.ts` to restore the previous always-on behavior.
+
+### Fixed
+
+- **ACF JSON watcher restart burst** — On connection, the file watcher preloads `.skylit/acf-json-meta.json` so files last written from WordPress admin inherit the same cooldown as a live round-trip, avoiding a storm of redundant sync calls when chokidar re-emits changes for every `acf-json/*.json` file after an extension restart.
+
 ## [1.53.9] - 2026-03-17
 
 ### Fixed

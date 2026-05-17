@@ -15,9 +15,13 @@ import { ProtocolHandler } from "./protocolHandler";
 import { DebugLogger } from "./debugLogger";
 import { PostTypeConverter } from "./postTypeConverter";
 import { ConnectionState } from "./types";
-import { InstanceAttributeGuard } from "./instanceAttributeGuard";
+import {
+	InstanceAttributeGuard,
+	PATTERN_INSTANCE_GUARD_ENABLED,
+} from "./instanceAttributeGuard";
 import { ExportPoller } from "./exportPoller";
 import { AiSkillsetGenerator } from "./aiSkillsetGenerator";
+import { SkylitLocalServer } from "./localServer";
 
 let workspaceManager: WorkspaceManager;
 let authManager: AuthManager;
@@ -30,14 +34,17 @@ let postTypeConverter: PostTypeConverter | null = null;
 let instanceAttributeGuard: InstanceAttributeGuard | null = null;
 let exportPoller: ExportPoller | null = null;
 let aiSkillsetGenerator: AiSkillsetGenerator | null = null;
+let localServer: SkylitLocalServer | null = null;
 let statusCheckInterval: NodeJS.Timeout | null = null;
 let metadataCleanupInterval: NodeJS.Timeout | null = null;
+let grammarRecompileInProgress: boolean = false;
 let relocatePollingInterval: NodeJS.Timeout | null = null;
 let workspaceLockHeartbeatInterval: NodeJS.Timeout | null = null;
 let currentDevPath: string | null = null;
 let isRemoteMode: boolean = false;
 let connectionInProgress: boolean = false;
 let lastConnectedSiteUrl: string | null = null;
+let lastConnectedSite: any = null;
 let hasWorkspaceLock: boolean = false;
 let currentWorkspaceLockPath: string | null = null;
 const WORKSPACE_LOCK_FILE = ".skylit/.extension-lock.json";
@@ -110,17 +117,86 @@ export async function activate(context: vscode.ExtensionContext) {
 	// Register protocol handler
 	protocolHandler.register(context);
 
-	// Start instance attribute guard IMMEDIATELY (before connection).
-	// It uses content-based detection (no REST API needed), so it can
-	// protect pattern instance tags from the moment the editor opens.
-	if (instanceAttributeGuard) {
+	// Pattern instance tag protection (phantom_blocks HTML): off by default.
+	// Re-enable: set PATTERN_INSTANCE_GUARD_ENABLED in instanceAttributeGuard.ts to true.
+	if (PATTERN_INSTANCE_GUARD_ENABLED) {
+		if (instanceAttributeGuard) {
+			instanceAttributeGuard.dispose();
+		}
+		instanceAttributeGuard = new InstanceAttributeGuard("", debugLogger);
+		instanceAttributeGuard.start();
+	} else if (instanceAttributeGuard) {
 		instanceAttributeGuard.dispose();
+		instanceAttributeGuard = null;
 	}
-	instanceAttributeGuard = new InstanceAttributeGuard("", debugLogger);
-	instanceAttributeGuard.start();
 
 	// Register commands
 	registerCommands(context);
+
+	// Watch for skylit.localDevPath changes mid-session.
+	// Decoupled/remote mode reads this on connect; if it changes we need to
+	// dispose the file watcher + export poller and reconnect against the new path.
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeConfiguration(async (e) => {
+			if (!e.affectsConfiguration("skylit.localDevPath")) return;
+
+			const newPath = vscode.workspace
+				.getConfiguration("skylit")
+				.get<string>("localDevPath", "")
+				.trim();
+
+			debugLogger.info(
+				`⚙️ skylit.localDevPath changed → '${newPath || "(empty)"}'`
+			);
+
+			if (!isRemoteMode || !lastConnectedSite || !restClient) {
+				// Same-machine mode (or not connected) reads dev_path from the server,
+				// so a localDevPath change doesn't apply right now. It will take effect
+				// the next time the user switches the plugin to remote mode and reconnects.
+				debugLogger.log(
+					"   ↪️ Not in remote mode (or not connected) — skipping live reconfigure"
+				);
+				return;
+			}
+
+			if (!newPath) {
+				vscode.window.showWarningMessage(
+					"skylit.localDevPath was cleared while remote mode is active. The connection has been kept on the previous path. Set a new path and reconnect."
+				);
+				return;
+			}
+
+			if (newPath === currentDevPath) {
+				debugLogger.log(
+					"   ↪️ New value matches the active dev path — nothing to do"
+				);
+				return;
+			}
+
+			try {
+				await fs.promises.access(newPath, fs.constants.W_OK);
+			} catch (err: any) {
+				vscode.window.showErrorMessage(
+					`skylit.localDevPath is not a writable directory: ${newPath}. ${err.message}. The previous path is still active.`
+				);
+				return;
+			}
+
+			debugLogger.info(
+				`🔄 Reconnecting to apply new local dev path: ${newPath}`
+			);
+			try {
+				await connectToWordPress(lastConnectedSite, context, true);
+			} catch (err: any) {
+				debugLogger.error(
+					`❌ Reconnect after localDevPath change failed: ${err.message}`
+				);
+				vscode.window.showErrorMessage(
+					`Failed to apply new local dev path: ${err.message}`
+				);
+			}
+		})
+	);
 
 	// Check if a site URL is configured at WORKSPACE level only (not user level)
 	// This ensures the extension only connects when the workspace explicitly configures a site
@@ -276,6 +352,10 @@ export function deactivate() {
 	stopWorkspaceLockHeartbeat();
 	void releaseWorkspaceLock();
 
+	if (localServer) {
+		localServer.stop();
+		localServer = null;
+	}
 	if (fileWatcher) {
 		fileWatcher.dispose();
 	}
@@ -479,6 +559,7 @@ function registerCommands(context: vscode.ExtensionContext) {
 
 			// Stop jump polling
 			stopJumpPolling();
+			stopOpenIdePolling();
 
 			// Stop relocate polling
 			stopRelocatePolling();
@@ -502,6 +583,7 @@ function registerCommands(context: vscode.ExtensionContext) {
 			}
 			restClient = null;
 			currentDevPath = null;
+			lastConnectedSite = null;
 			statusBar.updateStatus("disconnected", "Disconnected");
 			debugLogger.info("🔌 Disconnected from WordPress");
 		})
@@ -1774,12 +1856,39 @@ function registerCommands(context: vscode.ExtensionContext) {
 			});
 			if (!token) return;
 
-			const localPath = await vscode.window.showInputBox({
+			// Pre-fill with existing setting, or the current workspace folder
+		const existingLocalDevPath = vscode.workspace
+			.getConfiguration("skylit")
+			.get<string>("localDevPath", "")
+			.trim();
+		const workspaceFolder =
+			vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
+		const suggestedPath = existingLocalDevPath || workspaceFolder;
+
+		const localPath = await vscode.window.showInputBox({
 				prompt: "Enter local dev folder path (where files will be stored)",
+				value: suggestedPath,
 				placeHolder: "C:\\projects\\mysite-dev-root",
 				ignoreFocusOut: true,
 				validateInput: (value) => {
-					if (!value.trim()) return "Path is required";
+					const v = value.trim();
+					if (!v) return "Path is required";
+					try {
+						const stat = fs.statSync(v);
+						if (!stat.isDirectory()) {
+							return "Path exists but is not a directory";
+						}
+						try {
+							fs.accessSync(v, fs.constants.W_OK);
+						} catch {
+							return "Path is not writable by VS Code";
+						}
+					} catch (err: any) {
+						if (err && err.code === "ENOENT") {
+							return "Directory does not exist — create it first";
+						}
+						return `Cannot access path: ${err?.message || err}`;
+					}
 					return null;
 				},
 			});
@@ -1804,6 +1913,45 @@ function registerCommands(context: vscode.ExtensionContext) {
 		// Save token and register site
 		await authManager.saveToken(cleanUrl, token);
 		await authManager.registerSite(cleanUrl, new URL(cleanUrl).hostname, cleanPath);
+
+		// Proactively flip the WP plugin into remote/decoupled mode so the user
+		// doesn't have to open WP Admin → Skylit.DEV → Dev Sync first. If the
+		// endpoint isn't there (older plugin), silently fall through and let the
+		// post-connect mismatch warning kick in.
+		try {
+			const probeClient = new RestClient(cleanUrl, token, debugLogger);
+			const tokenCheck = await probeClient.validateToken();
+			if (tokenCheck.valid) {
+				try {
+					const result = await probeClient.setRemoteMode("remote");
+					if (result.changed) {
+						debugLogger.info(
+							`🔀 Plugin switched to remote mode (${result.previous} → ${result.mode})`
+						);
+					}
+				} catch (e: any) {
+					if (e?.response?.status === 404) {
+						debugLogger.warn(
+							"⚠️ Plugin does not expose /sync/set-remote-mode (older version). " +
+								"Please switch dev folder location to 'Remote' in WP Admin manually."
+						);
+					} else {
+						debugLogger.warn(
+							`⚠️ Could not auto-switch plugin to remote mode: ${e?.message || e}`
+						);
+					}
+				}
+			} else if (tokenCheck.tokenInvalid) {
+				vscode.window.showErrorMessage(
+					"Token rejected by WordPress. Generate a new token in Skylit.DEV → Dev Sync → Generate Token."
+				);
+				return;
+			}
+		} catch (e: any) {
+			debugLogger.warn(
+				`⚠️ Pre-connect probe failed: ${e?.message || e}. Continuing with regular connect.`
+			);
+		}
 
 		const remoteSite = {
 			name: new URL(cleanUrl).hostname,
@@ -2149,13 +2297,24 @@ function registerCommands(context: vscode.ExtensionContext) {
 								}
 							};
 
-							progress.report({
-								message: "Copying files...",
-							});
-							copyRecursive(currentDevPath!, newPath);
-							progress.report({
-								message: "Files copied!",
-							});
+						progress.report({
+							message: "Copying files...",
+						});
+						copyRecursive(currentDevPath!, newPath);
+
+						// Clear the copied .skylit/media/ index so loadMediaMetaIndex
+						// starts fresh at the new location. Without this, the JSON entries
+						// reference media files that don't exist at the new path yet, causing
+						// them to be treated as "deleted offline" and purged from WP on startup.
+						const newMediaMetaDir = path.join(newPath, ".skylit", "media");
+						if (fs.existsSync(newMediaMetaDir)) {
+							fs.rmSync(newMediaMetaDir, { recursive: true, force: true });
+							fs.mkdirSync(newMediaMetaDir, { recursive: true });
+						}
+
+						progress.report({
+							message: "Files copied!",
+						});
 						}
 					);
 
@@ -2241,6 +2400,7 @@ function registerCommands(context: vscode.ExtensionContext) {
 				await restClient!.ackRelocate(true, newPath);
 
 				// Switch to remote mode
+				const oldDevPath = currentDevPath;
 				isRemoteMode = true;
 				currentDevPath = newPath;
 
@@ -2248,6 +2408,19 @@ function registerCommands(context: vscode.ExtensionContext) {
 				if (fileWatcher) {
 					fileWatcher.dispose();
 				}
+
+				// Remove the old dev folder now that all files are at the new location.
+				if (action.value === "move-local" && oldDevPath && oldDevPath !== newPath) {
+					try {
+						if (fs.existsSync(oldDevPath)) {
+							fs.rmSync(oldDevPath, { recursive: true, force: true });
+							debugLogger.info(`🗑️ Deleted old dev folder: ${oldDevPath}`);
+						}
+					} catch (err: any) {
+						debugLogger.warn(`⚠️ Could not delete old dev folder: ${err.message}`);
+					}
+				}
+
 				fileWatcher = new FileWatcher(
 					newPath,
 					restClient!,
@@ -2271,7 +2444,8 @@ function registerCommands(context: vscode.ExtensionContext) {
 					restClient!,
 					newPath,
 					statusBar,
-					debugLogger
+					debugLogger,
+					fileWatcher ? (p) => fileWatcher!.markSelfWrittenPath(p) : undefined
 				);
 				exportPoller.start();
 
@@ -2762,8 +2936,10 @@ async function connectToWordPress(
 			);
 		}
 
-	// Security: Auto-upgrade HTTP → HTTPS, warn only when manually connecting
-	const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|::1)/i.test(
+	// Security: Auto-upgrade HTTP → HTTPS, warn only when manually connecting.
+	// *.local TLD (LocalWP, Valet, Herd) is treated as local — no HTTPS upgrade,
+	// no security warning, self-signed certs are expected and handled in RestClient.
+	const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|::1|[^/:]+\.local)(:\d+)?/i.test(
 		siteUrl
 	);
 	const isHttps = siteUrl.startsWith("https://");
@@ -2940,8 +3116,81 @@ async function connectToWordPress(
 
 		// Derive remote/decoupled mode from the plugin's setting — NOT from local config
 		const pluginIsDecoupled = status.dev_folder_location === "remote";
+
+		// Honour the discovery endpoint's `remoteCapable` flag. If the plugin
+		// reports it cannot serve remote-mode traffic (older version that lacks
+		// the export-content / global-files endpoints) but is configured for
+		// remote, refuse to start the export poller — it would 404 on every poll.
+		if (pluginIsDecoupled && discovered && discovered.remoteCapable === false) {
+			debugLogger.error(
+				"❌ Plugin reports remoteCapable=false but is set to remote mode."
+			);
+			vscode.window
+				.showErrorMessage(
+					"This Skylit.DEV plugin version does not support remote mode. Update the plugin or switch the dev folder location away from 'Remote'.",
+					"Open Settings"
+				)
+				.then((sel) => {
+					if (sel === "Open Settings") {
+						vscode.env.openExternal(
+							vscode.Uri.parse(
+								`${siteUrl}/wp-admin/admin.php?page=skylit-dev-sync`
+							)
+						);
+					}
+				});
+			statusBar.updateStatus("error", "Plugin too old for remote mode");
+			return;
+		}
+
 		isRemoteMode = pluginIsDecoupled;
 		restClient!.isRemoteMode = isRemoteMode;
+
+		// Mismatch detection: user configured a localDevPath (only meaningful for
+		// remote mode) but the plugin is in a same-machine mode. Without this, the
+		// extension silently uses status.dev_path and the user never realizes their
+		// localDevPath is being ignored. Offer to flip the plugin via the new endpoint.
+		const configuredLocalDevPath = vscodeConfig
+			.get<string>("localDevPath", "")
+			.trim();
+		if (!isRemoteMode && configuredLocalDevPath) {
+			debugLogger.warn(
+				`⚠️ skylit.localDevPath is set ('${configuredLocalDevPath}') but plugin dev_folder_location='${status.dev_folder_location}'. The local path will be ignored unless the plugin is switched to 'remote'.`
+			);
+			vscode.window
+				.showWarningMessage(
+					`Skylit plugin is in '${status.dev_folder_location}' mode but you've configured a local dev path. The local path is being ignored.`,
+					"Switch Plugin to Remote",
+					"Open Settings",
+					"Ignore"
+				)
+				.then(async (sel) => {
+					if (sel === "Switch Plugin to Remote" && restClient) {
+						try {
+							await restClient.setRemoteMode("remote");
+							vscode.window.showInformationMessage(
+								"Plugin switched to remote mode. Reconnecting..."
+							);
+							await connectToWordPress(site, context, true);
+						} catch (err: any) {
+							if (err?.response?.status === 404) {
+								vscode.window.showErrorMessage(
+									"This plugin version cannot switch modes via API. Open WP Admin → Skylit.DEV → Dev Sync and choose 'Remote — Extension-managed' manually."
+								);
+							} else {
+								vscode.window.showErrorMessage(
+									`Could not switch plugin to remote: ${err?.message || err}`
+								);
+							}
+						}
+					} else if (sel === "Open Settings") {
+						vscode.commands.executeCommand(
+							"workbench.action.openSettings",
+							"skylit.localDevPath"
+						);
+					}
+				});
+		}
 
 		// Determine the effective dev path:
 		// Decoupled mode → use local dev path from extension settings
@@ -2961,6 +3210,41 @@ async function connectToWordPress(
 				statusBar.updateStatus("error", "Local dev path not configured");
 				return;
 			}
+
+			// Validate the local path exists and is writable. A typo or unmounted
+			// drive would otherwise surface much later as a generic write error
+			// from inside performFullSync / downloadGlobalFiles.
+			try {
+				const stat = fs.statSync(localDevPath);
+				if (!stat.isDirectory()) {
+					throw new Error("Path exists but is not a directory");
+				}
+				fs.accessSync(localDevPath, fs.constants.W_OK);
+			} catch (err: any) {
+				const reason =
+					err && err.code === "ENOENT"
+						? "directory does not exist"
+						: err?.message || String(err);
+				debugLogger.error(
+					`❌ Decoupled mode: local dev path unusable — ${reason}: ${localDevPath}`
+				);
+				vscode.window
+					.showErrorMessage(
+						`Local dev folder is unusable (${reason}): ${localDevPath}. Fix skylit.localDevPath or create the directory, then reconnect.`,
+						"Open Settings"
+					)
+					.then((sel) => {
+						if (sel === "Open Settings") {
+							vscode.commands.executeCommand(
+								"workbench.action.openSettings",
+								"skylit.localDevPath"
+							);
+						}
+					});
+				statusBar.updateStatus("error", "Local dev path unusable");
+				return;
+			}
+
 			effectiveDevPath = localDevPath;
 			debugLogger.info(
 				`🔌 Decoupled mode: using local dev path: ${effectiveDevPath}`
@@ -3003,9 +3287,7 @@ async function connectToWordPress(
 			fileWatcher.dispose();
 		}
 
-		debugLogger.info(`👀 Starting file watcher for: ${effectiveDevPath}`);
-
-		// Show "Connected" immediately so the user isn't blocked by the startup sync
+	// Show "Connected" immediately so the user isn't blocked by the startup sync
 		const modeLabel = isRemoteMode ? "Decoupled" : "Connected";
 		statusBar.updateStatus("connected", modeLabel);
 
@@ -3024,15 +3306,53 @@ async function connectToWordPress(
 			php: (status.php_source || "theme") as "theme" | "database",
 		});
 
+		// Dev path + REST client are ready — start Gutenberg ↔ IDE polling immediately.
+		// File watcher startup (theme/metadata/ACF) can take several seconds; jump + Open in IDE
+		// only need currentDevPath + restClient + lock (startup sync still runs in background).
+		currentDevPath = effectiveDevPath;
+		if (hasWorkspaceLock) {
+			startJumpPolling();
+			startOpenIdePolling();
+			debugLogger.info(
+				"📍 Jump-to-code + Open-in-IDE polling started (file watcher init continues in parallel)"
+			);
+		}
+
 		await fileWatcher.start();
+
+		// ── WebSocket sync server ──────────────────────────────────────────────
+		// Start (or restart) the local WS server so Gutenberg editor tabs can
+		// receive push notifications instead of polling PHP.
+		// Non-fatal: if the WS server can't bind, sync continues via polling.
+		try {
+			if (localServer && localServer.isRunning) {
+				localServer.stop();
+			}
+			const extensionVersion = vscode.extensions.getExtension('dimy-osman.skylit-dev-io')
+				?.packageJSON?.version ?? 'unknown';
+			localServer = new SkylitLocalServer(extensionVersion, debugLogger['outputChannel']);
+			const wsPort = await localServer.start(site.siteUrl, async (port, token) => {
+				if (restClient) {
+					await restClient.registerWsEndpoint(port, token);
+				}
+			});
+			if (wsPort) {
+				debugLogger.info(`🔌 WS sync server started on port ${wsPort}`);
+				// Make the localServer available to fileWatcher for broadcasting (Phase 4).
+				if (fileWatcher && typeof (fileWatcher as any).setLocalServer === 'function') {
+					(fileWatcher as any).setLocalServer(localServer);
+				}
+			} else {
+				debugLogger.log('⚠️ WS sync server could not bind — polling fallback active');
+			}
+		} catch (wsErr: any) {
+			debugLogger.log('⚠️ WS sync server error: ' + (wsErr?.message ?? String(wsErr)));
+		}
 
 		// Media sync runs in the background — never blocks jump polling or import.
 		fileWatcher.refreshMediaSyncSettings().catch((mediaErr: any) => {
 			debugLogger.log(`⚠️ Media sync init failed: ${mediaErr?.message || mediaErr}`);
 		});
-
-		// Store the current dev path
-		currentDevPath = effectiveDevPath;
 
 		// Export poller only in decoupled mode — pulls queued exports from WordPress.
 		// In same-machine mode the plugin writes files directly to the server dev folder.
@@ -3044,10 +3364,22 @@ async function connectToWordPress(
 				restClient,
 				effectiveDevPath,
 				statusBar,
-				debugLogger
+				debugLogger,
+				fileWatcher ? (p) => fileWatcher!.markSelfWrittenPath(p) : undefined
 			);
 			exportPoller.start();
 			debugLogger.info("📡 Export poller started (decoupled mode)");
+
+			// Reconcile global files (acf-json, .skylit config, theme.json, assets, etc.)
+			// on every connect — the startup sync only handles post HTML files.
+			// NOTE: media-library/ is intentionally excluded server-side from this
+			// endpoint; it has its own dedicated pipeline inside FileWatcher's
+			// refreshMediaSyncSettings() which does a metadata-tracking pull
+			// before any untracked push, so the media watcher will never create
+			// upload loops.
+			exportPoller.downloadGlobalFiles().catch((err: any) => {
+				debugLogger.log(`⚠️ Global files reconciliation failed: ${err?.message || err}`);
+			});
 
 			const postTypesDir = path.join(effectiveDevPath, "post-types");
 			if (!fs.existsSync(postTypesDir)) {
@@ -3181,16 +3513,39 @@ async function connectToWordPress(
 						});
 					}
 				}
+
+				// Detect pending grammar recompile after a plugin version upgrade.
+				// This flag is set by skylit_check_version_and_clear_hashes() when the
+				// compiler output may have changed, causing Gutenberg block validation
+				// failures on every page with skylit/atomic-* blocks.
+				if (
+					!grammarRecompileInProgress &&
+					updatedStatus.pending_grammar_recompile &&
+					updatedStatus.dev_folder_location !== "remote" &&
+					restClient
+				) {
+					const pgr = updatedStatus.pending_grammar_recompile;
+					grammarRecompileInProgress = true;
+					debugLogger.info(
+						`♻️ Pending grammar recompile detected: ${pgr.from_version} → ${pgr.to_version}. Starting bulk re-import...`
+					);
+					runPostUpdateReimport(pgr.from_version, pgr.to_version)
+						.catch((err: any) => {
+							debugLogger.warn(
+								`♻️ Post-update reimport failed: ${err?.message || err}`
+							);
+						})
+						.finally(() => {
+							grammarRecompileInProgress = false;
+						});
+				}
 			} catch (error: any) {
 				profileEnd(`error: ${error.message}`);
 				debugLogger.log(`⚠️ Status check failed: ${error.message}`);
 			}
 		}, 60000); // Check every 60 seconds
 
-		// Start jump-to-code polling (every 500ms for responsiveness)
-		if (hasWorkspaceLock) {
-			startJumpPolling();
-		}
+		// Jump + Open-in-IDE polling already started right after lock + currentDevPath (before fileWatcher.start).
 
 		// Start relocation request polling (every 5s, handles plugin-initiated moves)
 		startRelocatePolling();
@@ -3219,6 +3574,7 @@ async function connectToWordPress(
 		}
 
 		lastConnectedSiteUrl = siteUrl;
+		lastConnectedSite = site;
 
 		// Auto-register this site so it appears in the multi-site picker
 		const siteName = (() => {
@@ -3233,6 +3589,8 @@ async function connectToWordPress(
 		vscode.window.showInformationMessage(displayMessage);
 	} catch (error: any) {
 		debugLogger.error(`❌ Connection failed: ${error.message}`);
+		stopJumpPolling();
+		stopOpenIdePolling();
 		stopWorkspaceLockHeartbeat();
 		await releaseWorkspaceLock();
 		statusBar.updateStatus("error", "Connection failed");
@@ -3251,6 +3609,385 @@ async function connectToWordPress(
  * This prevents infinite re-jumps when server-level HTTP caching (e.g.
  * LiteSpeed) returns a stale GET response after the transient was deleted.
  */
+
+/**
+ * Absolute path under the dev root from a REST payload (open-in-IDE / jump).
+ * PHP normally sends a root-relative path; if dev-root stripping failed server-side,
+ * the value may already be absolute — never do `${devRoot}/${absolutePath}`.
+ */
+function resolveSkylitDevHtmlPath(
+	devRoot: string,
+	fileFromServer: string
+): string | null {
+	const root = devRoot.replace(/\\/g, "/").replace(/\/$/, "");
+	let f = (fileFromServer || "").replace(/\\/g, "/").trim();
+	if (!f || f.includes("..")) {
+		return null;
+	}
+	if (f.startsWith("/") || /^[A-Za-z]:\//.test(f)) {
+		return f;
+	}
+	return `${root}/${f.replace(/^\/+/, "")}`;
+}
+
+function skylitNormalizeFsPath(p: string): string {
+	const n = path.normalize(p.replace(/\//g, path.sep));
+	return n.replace(/[\\/]+$/, "") || n;
+}
+
+function skylitPathsEqualFs(a: string, b: string): boolean {
+	const na = skylitNormalizeFsPath(a);
+	const nb = skylitNormalizeFsPath(b);
+	if (process.platform === "win32") {
+		return na.localeCompare(nb, undefined, { sensitivity: "accent" }) === 0;
+	}
+	return na === nb;
+}
+
+function skylitTryRealpath(p: string): string {
+	try {
+		return fs.realpathSync.native(p);
+	} catch {
+		try {
+			return fs.realpathSync(p);
+		} catch {
+			return p;
+		}
+	}
+}
+
+/**
+ * Longest workspace root that is a strict prefix of the target path (file is under that folder).
+ */
+function skylitPickWorkspaceFolderContainingTarget(
+	absoluteFsPath: string
+): vscode.WorkspaceFolder | null {
+	const folders = vscode.workspace.workspaceFolders;
+	if (!folders?.length) {
+		return null;
+	}
+	const absN = skylitNormalizeFsPath(absoluteFsPath);
+	let best: vscode.WorkspaceFolder | null = null;
+	let bestLen = -1;
+	for (const f of folders) {
+		const fp = skylitNormalizeFsPath(f.uri.fsPath);
+		if (absN === fp || absN.startsWith(fp + path.sep)) {
+			if (fp.length > bestLen) {
+				bestLen = fp.length;
+				best = f;
+			}
+		}
+	}
+	return best;
+}
+
+/**
+ * URI for opening a dev HTML file. Contract:
+ * - Plugin exposes configured dev root (`dev_path` / `currentDevPath`).
+ * - REST `file` is root-relative layout: `post-types/…`, `patterns/…`, etc. (unless PHP sent an absolute path).
+ * Build the resource URI by matching that layout to the workspace folder that owns the dev tree — never
+ * `Uri.with({ path: absolute })` on vscode-remote.
+ */
+function resolveSkylitFileOpenUri(
+	devRoot: string,
+	fileFromServer: string
+): vscode.Uri | null {
+	const fullPathPosix = resolveSkylitDevHtmlPath(devRoot, fileFromServer);
+	if (!fullPathPosix) {
+		return null;
+	}
+
+	const trimmed = (fileFromServer || "").replace(/\\/g, "/").trim();
+	const isAbsPayload =
+		trimmed.startsWith("/") ||
+		/^[A-Za-z]:\//.test(trimmed) ||
+		/^[A-Za-z]:\\/.test(trimmed);
+
+	const segs = trimmed.split("/").filter((s) => s.length > 0);
+	if (segs.some((s) => s === "..")) {
+		return null;
+	}
+
+	const folders = vscode.workspace.workspaceFolders;
+	if (!folders || folders.length === 0) {
+		return vscode.Uri.file(fullPathPosix);
+	}
+
+	const devRootNorm = skylitNormalizeFsPath(devRoot.replace(/\//g, path.sep));
+	let absoluteFsPath: string;
+	try {
+		if (isAbsPayload) {
+			absoluteFsPath = skylitNormalizeFsPath(
+				trimmed.replace(/\//g, path.sep)
+			);
+		} else {
+			absoluteFsPath = skylitNormalizeFsPath(
+				path.join(devRootNorm, ...segs)
+			);
+		}
+	} catch {
+		return vscode.Uri.file(fullPathPosix);
+	}
+
+	// 0) URI-path matching — scheme-agnostic, works on every OS and for every workspace kind
+	// (local file://, Remote SSH vscode-remote://, Cursor ssh-remote, Codespaces, etc.).
+	//
+	// f.uri.fsPath is unreliable for non-file:// schemes: on Windows it produces a UNC path
+	// like \\ssh-remote+host\home\... that never matches a posix devRoot string; on Linux/Mac
+	// it may produce //ssh-remote+host/home/... which is equally wrong for string comparison.
+	// f.uri.path is always the raw posix path component regardless of scheme or host OS.
+	//
+	// Safe for local Windows workspaces too: a Windows drive-letter path like C:/Users/...
+	// never starts with the /c:/Users/... form that uri.path uses, so there is no false match
+	// and the fsPath-based strategies below handle that case as before.
+	//
+	// Uses longest-match (most specific workspace folder) to handle multi-root workspaces.
+	{
+		const targetPosix = fullPathPosix.replace(/\\/g, "/");
+		let bestFolder: vscode.WorkspaceFolder | null = null;
+		let bestLen = -1;
+		for (const f of folders) {
+			const folderUriPath = f.uri.path.replace(/\/$/, "");
+			if (
+				folderUriPath &&
+				targetPosix.startsWith(folderUriPath + "/") &&
+				folderUriPath.length > bestLen
+			) {
+				bestLen = folderUriPath.length;
+				bestFolder = f;
+			}
+		}
+		if (bestFolder) {
+			const relPosix = targetPosix.slice(bestLen + 1);
+			const relSegs = relPosix.split("/").filter((s) => s.length > 0);
+			if (relSegs.length > 0) {
+				return vscode.Uri.joinPath(bestFolder.uri, ...relSegs);
+			}
+		}
+	}
+
+	// 1) fsPath-based: resolved path sits under a workspace root (local workspaces, symlinks).
+	const containing = skylitPickWorkspaceFolderContainingTarget(absoluteFsPath);
+	if (containing) {
+		let rel: string;
+		try {
+			rel = path.relative(containing.uri.fsPath, absoluteFsPath);
+		} catch {
+			rel = "";
+		}
+		if (rel && !path.isAbsolute(rel)) {
+			const relNorm = rel.replace(/\\/g, "/");
+			if (!relNorm.startsWith("..")) {
+				const relParts = rel.split(path.sep).filter((p) => p.length > 0);
+				if (relParts.length > 0) {
+					return vscode.Uri.joinPath(containing.uri, ...relParts);
+				}
+			}
+		}
+	}
+
+	// 2) Workspace folder is the plugin dev root (or same inode via realpath) → append REST segments.
+	const devReal = skylitTryRealpath(devRootNorm);
+	for (const f of folders) {
+		const fp = skylitNormalizeFsPath(f.uri.fsPath);
+		const fr = skylitTryRealpath(fp);
+		if (
+			!isAbsPayload &&
+			(skylitPathsEqualFs(fp, devRootNorm) ||
+				skylitPathsEqualFs(fp, devReal) ||
+				skylitPathsEqualFs(fr, devRootNorm) ||
+				skylitPathsEqualFs(fr, devReal))
+		) {
+			return vscode.Uri.joinPath(f.uri, ...segs);
+		}
+	}
+
+	// 3) Dev root is nested inside a workspace folder — prefix segments + layout from REST.
+	for (const f of folders) {
+		const fp = skylitNormalizeFsPath(f.uri.fsPath);
+		if (
+			!isAbsPayload &&
+			(devRootNorm === fp || devRootNorm.startsWith(fp + path.sep))
+		) {
+			const mid = devRootNorm.slice(fp.length + 1).split(path.sep).filter(Boolean);
+			return vscode.Uri.joinPath(f.uri, ...mid, ...segs);
+		}
+	}
+
+	// 4) Legacy: first folder where path.relative works.
+	for (const folder of folders) {
+		let rel: string;
+		try {
+			rel = path.relative(folder.uri.fsPath, absoluteFsPath);
+		} catch {
+			continue;
+		}
+		if (!rel || path.isAbsolute(rel)) {
+			continue;
+		}
+		const relNorm = rel.replace(/\\/g, "/");
+		if (relNorm.startsWith("..")) {
+			continue;
+		}
+		const relParts = rel.split(path.sep).filter((p) => p.length > 0);
+		return vscode.Uri.joinPath(folder.uri, ...relParts);
+	}
+
+	return vscode.Uri.file(fullPathPosix);
+}
+
+/** Remote SSH / Cursor: workspace.fs and openTextDocument refuse files the client will not sync (~50MB). */
+function isRemoteExtensionFileSizeBlockedError(message: string): boolean {
+	return /50\s*MB|cannot be synchronized with extensions/i.test(message);
+}
+
+/** Cap for reading whole file into memory when bypassing remote FS (avoid OOM). */
+const SKYLIT_HTML_FS_READ_MAX_BYTES = 80 * 1024 * 1024;
+
+/**
+ * Read a dev HTML file via vscode.workspace.fs (works for both local and remote URIs,
+ * including SSH/Cursor remote workspaces where the extension runs on the UI/local side).
+ * This is the fallback when openTextDocument rejects the URI due to the ~50MB extension
+ * sync gate — workspace.fs bypasses that gate because it never syncs content locally.
+ */
+async function openHtmlTextDocumentBypassRemoteLimit(
+	fileUri: vscode.Uri
+): Promise<vscode.TextDocument> {
+	const st = await vscode.workspace.fs.stat(fileUri);
+	if (st.size > SKYLIT_HTML_FS_READ_MAX_BYTES) {
+		throw new Error(
+			`File is ~${Math.round(st.size / (1024 * 1024))} MB; auto-open is limited to ${SKYLIT_HTML_FS_READ_MAX_BYTES / (1024 * 1024)} MB. Trim the HTML or open it from the Explorer.`
+		);
+	}
+	const rawBytes = await vscode.workspace.fs.readFile(fileUri);
+	return vscode.workspace.openTextDocument({
+		content: Buffer.from(rawBytes).toString("utf8"),
+		language: "html",
+	});
+}
+
+/**
+ * Open a dev HTML document. Falls back to vscode.workspace.fs when openTextDocument
+ * is blocked (e.g. Cursor's "cannot be synchronized with extensions" gate).
+ * workspace.fs correctly routes I/O through the remote FS provider so SSH/above-wp
+ * paths are resolved on the server, not on the local Windows extension host.
+ */
+async function openSkylitHtmlDocument(fileUri: vscode.Uri): Promise<{
+	document: vscode.TextDocument;
+	openedAsBuffer: boolean;
+}> {
+	try {
+		const document = await vscode.workspace.openTextDocument(fileUri);
+		return { document, openedAsBuffer: false };
+	} catch (e: any) {
+		const msg = e?.message || String(e);
+		if (!isRemoteExtensionFileSizeBlockedError(msg)) {
+			throw e;
+		}
+		debugLogger.warn(
+			`   ⚠️ Remote file sync limit — opening via vscode.workspace.fs: ${fileUri.toString()}`
+		);
+		const document = await openHtmlTextDocumentBypassRemoteLimit(fileUri);
+		return { document, openedAsBuffer: true };
+	}
+}
+
+/** Reuse an already-open editor tab for this path (avoids a second tab / Untitled duplicate). */
+function findOpenSkylitFileDocument(fileUri: vscode.Uri): vscode.TextDocument | undefined {
+	if (!fileUri.fsPath) {
+		return undefined;
+	}
+	let want: string;
+	try {
+		want = path.normalize(fileUri.fsPath);
+	} catch {
+		return undefined;
+	}
+	for (const d of vscode.workspace.textDocuments) {
+		if (d.isUntitled) {
+			continue;
+		}
+		if (d.uri.scheme !== "file" && d.uri.scheme !== "vscode-remote") {
+			continue;
+		}
+		try {
+			if (path.normalize(d.uri.fsPath) === want) {
+				return d;
+			}
+		} catch {
+			continue;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Show dev HTML: focus existing tab if already open; otherwise open in the active editor group (not Beside).
+ */
+async function showSkylitHtmlInEditor(
+	fileUri: vscode.Uri,
+	document: vscode.TextDocument,
+	openedAsBuffer: boolean,
+	options?: { selection?: vscode.Range; preserveFocus?: boolean }
+): Promise<vscode.TextEditor> {
+	const preserveFocus = options?.preserveFocus ?? false;
+	const baseOpts: vscode.TextDocumentShowOptions = {
+		preview: false,
+		preserveFocus,
+		viewColumn: vscode.ViewColumn.Active,
+	};
+	if (options?.selection) {
+		baseOpts.selection = options.selection;
+	}
+
+	if (!openedAsBuffer && fileUri.fsPath) {
+		let want: string;
+		try {
+			want = path.normalize(fileUri.fsPath);
+		} catch {
+			want = "";
+		}
+		if (want) {
+			for (const ed of vscode.window.visibleTextEditors) {
+				if (ed.document.isUntitled) {
+					continue;
+				}
+				try {
+					if (path.normalize(ed.document.uri.fsPath) === want) {
+						return await vscode.window.showTextDocument(ed.document, {
+							...baseOpts,
+							viewColumn: ed.viewColumn,
+						});
+					}
+				} catch {
+					continue;
+				}
+			}
+		}
+	}
+
+	return await vscode.window.showTextDocument(document, baseOpts);
+}
+
+/**
+ * Check whether a dev file can be opened. Uses vscode.workspace.fs.stat which works for
+ * both local and remote (SSH/Cursor) URIs. The old fs.promises.access fallback is omitted
+ * because fileUri.fsPath for a vscode-remote:// URI on Windows resolves to a bogus local
+ * path (C:\home\...) and the stat gate never triggers on a plain stat anyway.
+ */
+async function verifySkylitFileReachable(
+	fileUri: vscode.Uri,
+	fullPathForLog: string
+): Promise<boolean> {
+	try {
+		await vscode.workspace.fs.stat(fileUri);
+		return true;
+	} catch {
+		debugLogger.log(`   ℹ️ workspace.fs.stat could not reach: ${fullPathForLog}`);
+		return false;
+	}
+}
+
 let jumpPollingInterval: NodeJS.Timeout | null = null;
 let jumpPollIntervalMs: number = 500;
 const JUMP_POLL_MIN_INTERVAL = 500;
@@ -3273,10 +4010,12 @@ function startJumpPolling() {
 }
 
 async function pollForJump() {
-	if (!restClient || !hasWorkspaceLock) return;
-
 	const profileEnd = debugLogger.profileStart("pollForJump");
 	try {
+		if (!restClient || !hasWorkspaceLock) {
+			return;
+		}
+
 		const jumpData = await restClient.getPendingJump();
 
 		if (consecutiveErrors > 0) {
@@ -3308,42 +4047,68 @@ async function pollForJump() {
 				return;
 			}
 
-			const devRoot = currentDevPath.replace(/\\/g, "/").replace(/\/$/, "");
-			const relFile = jumpData.file.replace(/\\/g, "/").replace(/^\/+/, "");
-			if (relFile.includes("..")) {
-				debugLogger.warn(`   ❌ Ignoring unsafe jump path: ${jumpData.file}`);
+			const fullPath = resolveSkylitDevHtmlPath(
+				currentDevPath,
+				jumpData.file
+			);
+			if (!fullPath) {
+				debugLogger.warn(`   ❌ Ignoring invalid jump path: ${jumpData.file}`);
 				return;
 			}
-			const fullPath = `${devRoot}/${relFile}`;
 
-			const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-			let fileUri: vscode.Uri;
-
-			if (workspaceFolder && workspaceFolder.uri.scheme !== "file") {
-				fileUri = workspaceFolder.uri.with({ path: fullPath });
-			} else {
-				fileUri = vscode.Uri.file(fullPath);
+			const fileUri = resolveSkylitFileOpenUri(currentDevPath, jumpData.file);
+			if (!fileUri) {
+				debugLogger.warn(`   ❌ Could not resolve jump URI: ${jumpData.file}`);
+				return;
 			}
 
-			debugLogger.info(`   Dev root: ${devRoot}`);
+			debugLogger.info(`   Resolved path: ${fullPath}`);
 			debugLogger.info(`   File URI: ${fileUri.toString()}`);
 
-			try {
-				await vscode.workspace.fs.stat(fileUri);
-			} catch {
+			const reachable = await verifySkylitFileReachable(fileUri, fullPath);
+			if (!reachable) {
 				debugLogger.warn(`   ❌ Jump file not found in active workspace: ${fullPath}`);
 				return;
 			}
 
-			const document = await vscode.workspace.openTextDocument(fileUri);
-			const editor = await vscode.window.showTextDocument(document, {
-				selection: new vscode.Range(
-					jumpData.line - 1,
-					jumpData.column || 0,
-					jumpData.line - 1,
-					jumpData.column || 0
-				),
-				preserveFocus: false,
+			const existingJump = findOpenSkylitFileDocument(fileUri);
+			let document: vscode.TextDocument;
+			let openedAsBuffer = false;
+			if (existingJump) {
+				document = existingJump;
+				debugLogger.info(`   📍 Jump: focusing existing tab`);
+			} else {
+				try {
+					const opened = await openSkylitHtmlDocument(fileUri);
+					document = opened.document;
+					openedAsBuffer = opened.openedAsBuffer;
+				} catch (openErr: any) {
+					const msg = openErr?.message || String(openErr);
+					debugLogger.error(`   ❌ Jump: could not open editor: ${msg}`);
+					void vscode.window.showErrorMessage(
+						`Skylit: Could not open ${jumpData.file} — ${msg}`
+					);
+					return;
+				}
+			}
+			if (openedAsBuffer) {
+				void vscode.window.showInformationMessage(
+					"Skylit: Jump target opened in a buffer (file exceeds Remote 50MB sync). Save As… to write to disk."
+				);
+			}
+
+			const jumpSel = new vscode.Range(
+				jumpData.line - 1,
+				jumpData.column || 0,
+				jumpData.line - 1,
+				jumpData.column || 0
+			);
+			const preserveJumpFocus = vscode.workspace
+				.getConfiguration("skylit")
+				.get<boolean>("gutenbergJumpPreserveFocus", true);
+			const editor = await showSkylitHtmlInEditor(fileUri, document, openedAsBuffer, {
+				selection: jumpSel,
+				preserveFocus: preserveJumpFocus,
 			});
 
 			editor.revealRange(
@@ -3396,12 +4161,170 @@ function stopJumpPolling() {
 	if (jumpPollingInterval) {
 		clearTimeout(jumpPollingInterval);
 		jumpPollingInterval = null;
-		jumpPollIntervalMs = JUMP_POLL_MIN_INTERVAL;
-		consecutiveErrors = 0;
-		lastHandledJumpKey = null;
-		lastHandledJumpTimestamp = 0;
-		debugLogger.log("📍 Jump-to-code polling stopped");
 	}
+	jumpPollIntervalMs = JUMP_POLL_MIN_INTERVAL;
+	consecutiveErrors = 0;
+	lastHandledJumpKey = null;
+	lastHandledJumpTimestamp = 0;
+	debugLogger.log("📍 Jump-to-code polling stopped");
+}
+
+/** Gutenberg "Open in IDE" — focuses the workspace HTML file (active group; reuses an open tab). */
+let openIdePollingInterval: NodeJS.Timeout | null = null;
+let openIdePollIntervalMs: number = JUMP_POLL_MIN_INTERVAL;
+let openIdeConsecutiveErrors = 0;
+let lastHandledOpenIdeKey: string | null = null;
+let lastHandledOpenIdeTimestamp = 0;
+
+function startOpenIdePolling() {
+	if (openIdePollingInterval) {
+		clearTimeout(openIdePollingInterval);
+	}
+	openIdePollIntervalMs = JUMP_POLL_MIN_INTERVAL;
+	openIdeConsecutiveErrors = 0;
+	debugLogger.log("📂 Starting Open-in-IDE polling...");
+	pollForOpenIde();
+}
+
+async function pollForOpenIde() {
+	const profileEnd = debugLogger.profileStart("pollForOpenIde");
+	try {
+		if (!restClient || !hasWorkspaceLock) {
+			return;
+		}
+
+		const openData = await restClient.getPendingOpenIde();
+
+		if (openIdeConsecutiveErrors > 0) {
+			debugLogger.log(
+				`✅ Open-in-IDE polling recovered, resetting interval to ${JUMP_POLL_MIN_INTERVAL}ms`
+			);
+		}
+		openIdePollIntervalMs = JUMP_POLL_MIN_INTERVAL;
+		openIdeConsecutiveErrors = 0;
+
+		if (openData.pending && openData.file) {
+			const serverTs = openData.timestamp || 0;
+			const openKey = `${openData.file}:${serverTs}`;
+
+			if (
+				lastHandledOpenIdeKey === openKey &&
+				serverTs <= lastHandledOpenIdeTimestamp
+			) {
+				debugLogger.log(`⏭️ Skipping already-consumed open-ide: ${openKey}`);
+				return;
+			}
+
+			debugLogger.info(`📂 Open in IDE request: ${openData.file}`);
+
+			if (!currentDevPath) {
+				debugLogger.warn(`   ❌ No currentDevPath set, cannot resolve file`);
+				return;
+			}
+
+			const fullPath = resolveSkylitDevHtmlPath(
+				currentDevPath,
+				openData.file
+			);
+			if (!fullPath) {
+				debugLogger.warn(`   ❌ Ignoring invalid open-ide path: ${openData.file}`);
+				return;
+			}
+
+			const fileUri = resolveSkylitFileOpenUri(currentDevPath, openData.file);
+			if (!fileUri) {
+				debugLogger.warn(`   ❌ Could not resolve open-in-IDE URI: ${openData.file}`);
+				return;
+			}
+
+			debugLogger.info(`   Resolved path: ${fullPath}`);
+			debugLogger.info(`   File URI: ${fileUri.toString()}`);
+
+			const openIdeReachable = await verifySkylitFileReachable(fileUri, fullPath);
+			if (!openIdeReachable) {
+				debugLogger.warn(`   ❌ Open-in-IDE file not found in workspace: ${fullPath}`);
+				void vscode.window.showWarningMessage(
+					`Skylit: File not found in workspace — ${openData.file} (resolved: ${fullPath}). Open the dev root folder that contains it.`
+				);
+				return;
+			}
+
+			const existingOpenIde = findOpenSkylitFileDocument(fileUri);
+			let openIdeDoc: vscode.TextDocument;
+			let openIdeBuffer = false;
+			if (existingOpenIde) {
+				openIdeDoc = existingOpenIde;
+				debugLogger.info(`   📂 Open in IDE: focusing existing tab`);
+			} else {
+				try {
+					const opened = await openSkylitHtmlDocument(fileUri);
+					openIdeDoc = opened.document;
+					openIdeBuffer = opened.openedAsBuffer;
+				} catch (openErr: any) {
+					const msg = openErr?.message || String(openErr);
+					debugLogger.error(`   ❌ Open in IDE: could not open editor: ${msg}`);
+					void vscode.window.showErrorMessage(
+						`Skylit: Could not open ${openData.file} — ${msg}`
+					);
+					return;
+				}
+			}
+
+			await showSkylitHtmlInEditor(fileUri, openIdeDoc, openIdeBuffer);
+
+			if (openIdeBuffer) {
+				void vscode.window.showInformationMessage(
+					"Skylit: Opened in a buffer (file exceeds Remote 50MB extension sync). Use Save As… to write to the dev path, or edit in Explorer."
+				);
+			}
+
+			if (fileWatcher) {
+				fileWatcher.suppressCursorSyncBriefly();
+			}
+
+			lastHandledOpenIdeKey = openKey;
+			lastHandledOpenIdeTimestamp = serverTs;
+			debugLogger.info(`✅ Opened in new tab: ${openData.file}`);
+
+			restClient.clearPendingOpenIde().catch(() => {});
+		}
+	} catch (error: any) {
+		if (
+			error.message &&
+			!error.message.includes("No pending") &&
+			!error.message.includes("404")
+		) {
+			openIdeConsecutiveErrors++;
+			if (openIdeConsecutiveErrors > 1) {
+				openIdePollIntervalMs = Math.min(
+					openIdePollIntervalMs * 2,
+					JUMP_POLL_MAX_INTERVAL
+				);
+				const jitter = openIdePollIntervalMs * 0.25 * (Math.random() - 0.5);
+				openIdePollIntervalMs = Math.round(openIdePollIntervalMs + jitter);
+			}
+			if (openIdeConsecutiveErrors <= 2 || openIdeConsecutiveErrors % 10 === 0) {
+				debugLogger.warn(
+					`⚠️ Open-in-IDE poll error (${openIdeConsecutiveErrors}x): ${error.message}`
+				);
+			}
+		}
+	} finally {
+		profileEnd();
+		openIdePollingInterval = setTimeout(pollForOpenIde, openIdePollIntervalMs);
+	}
+}
+
+function stopOpenIdePolling() {
+	if (openIdePollingInterval) {
+		clearTimeout(openIdePollingInterval);
+		openIdePollingInterval = null;
+	}
+	openIdePollIntervalMs = JUMP_POLL_MIN_INTERVAL;
+	openIdeConsecutiveErrors = 0;
+	lastHandledOpenIdeKey = null;
+	lastHandledOpenIdeTimestamp = 0;
+	debugLogger.log("📂 Open-in-IDE polling stopped");
 }
 
 /**
@@ -3454,6 +4377,101 @@ function stopMetadataCleanup() {
 }
 
 /**
+ * Run a full post-update grammar recompile after a Skylit version upgrade.
+ *
+ * Iterates through wp_block patterns first (their compiled output is embedded
+ * in pages), then pages, then posts — re-importing each from its dev HTML file
+ * so the stored Gutenberg block grammar matches what the current JS save()
+ * functions produce.  Without this, every page with skylit/atomic-* blocks
+ * shows "Attempt Block Recovery" in the editor.
+ *
+ * The PHP endpoint clears the pending_grammar_recompile flag automatically
+ * when the last batch of the final post type completes.
+ */
+async function runPostUpdateReimport(
+	fromVersion: string,
+	toVersion: string
+): Promise<void> {
+	if (!restClient) return;
+
+	// Patterns first, then theme templates (FSE), then regular content.
+	const postTypes = [
+		"wp_block",
+		"wp_template",
+		"wp_template_part",
+		"page",
+		"post",
+	];
+	const BATCH = 5;
+
+	debugLogger.info(
+		`♻️ Grammar recompile ${fromVersion} → ${toVersion}: re-importing dev files...`
+	);
+
+	vscode.window.withProgress(
+		{
+			location: vscode.ProgressLocation.Notification,
+			title: `Skylit: Recompiling block grammar (${fromVersion} → ${toVersion})`,
+			cancellable: false,
+		},
+		async (progress) => {
+			let totalProcessed = 0;
+			let totalFailed = 0;
+
+			for (const postType of postTypes) {
+				let offset = 0;
+				let totalInType = 0;
+
+				while (true) {
+					if (!restClient) break;
+					let result: import("./types").PostUpdateReimportResponse;
+					try {
+						result = await restClient.postUpdateReimport(
+							postType,
+							offset,
+							BATCH
+						);
+					} catch (err: any) {
+						debugLogger.warn(
+							`♻️ Reimport batch failed (type=${postType} offset=${offset}): ${err?.message}`
+						);
+						break;
+					}
+
+					totalInType = result.total_in_type;
+					totalProcessed += result.processed;
+					totalFailed += result.failed;
+
+					const pct =
+						totalInType > 0
+							? Math.round(((offset + BATCH) / totalInType) * 100)
+							: 100;
+					progress.report({
+						message: `${postType} ${Math.min(offset + BATCH, totalInType)}/${totalInType}`,
+						increment: pct / postTypes.length,
+					});
+
+					debugLogger.log(
+						`♻️ Reimport batch: type=${postType} offset=${offset} processed=${result.processed} skipped=${result.skipped} failed=${result.failed}`
+					);
+
+					if (result.next_offset === null) break;
+					offset = result.next_offset;
+				}
+			}
+
+			const msg =
+				totalFailed > 0
+					? `Block grammar recompile complete. ${totalProcessed} reimported, ${totalFailed} failed. Check Skylit log for details.`
+					: `Block grammar recompile complete. ${totalProcessed} posts reimported.`;
+
+			debugLogger.info(`♻️ ${msg}`);
+			vscode.window.showInformationMessage(`Skylit: ${msg}`);
+		}
+	);
+}
+
+/**
  * Prompt user for a local dev folder path.
  * Uses showInputBox instead of showOpenDialog because in Remote SSH sessions
  * the file picker shows the server filesystem, not the local machine.
@@ -3464,6 +4482,14 @@ async function promptForLocalDevFolder(
 	const isRemoteSession =
 		typeof vscode.env.remoteName === "string" && vscode.env.remoteName !== "";
 
+	const existingPath = vscode.workspace
+		.getConfiguration("skylit")
+		.get<string>("localDevPath", "")
+		.trim();
+	const workspaceFolder =
+		vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
+	const defaultPath = existingPath || workspaceFolder;
+
 	if (!isRemoteSession) {
 		const folderUri = await vscode.window.showOpenDialog({
 			canSelectFolders: true,
@@ -3471,6 +4497,9 @@ async function promptForLocalDevFolder(
 			canSelectMany: false,
 			openLabel: "Select Dev Folder",
 			title: prompt,
+			defaultUri: defaultPath
+				? vscode.Uri.file(defaultPath)
+				: undefined,
 		});
 		if (!folderUri || folderUri.length === 0) return undefined;
 		return folderUri[0].fsPath;
@@ -3657,7 +4686,8 @@ async function handlePluginRelocateRequest(action: string) {
 		restClient,
 		newPath,
 		statusBar,
-		debugLogger
+		debugLogger,
+		fileWatcher ? (p) => fileWatcher!.markSelfWrittenPath(p) : undefined
 	);
 	exportPoller.start();
 

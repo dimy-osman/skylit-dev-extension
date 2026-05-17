@@ -89,6 +89,35 @@ export interface StatusResponse {
 	css_source?: "theme" | "database";
 	/** Where global PHP is loaded from on the frontend: 'theme' | 'database' */
 	php_source?: "theme" | "database";
+	/**
+	 * Non-null when a version upgrade has changed the block compiler output and
+	 * all wp_block patterns + pages need to be re-imported from dev files so the
+	 * stored Gutenberg block grammar matches the current save() functions.
+	 */
+	pending_grammar_recompile?: {
+		from_version: string;
+		to_version: string;
+		flagged_at: number;
+	} | null;
+}
+
+export interface PostUpdateReimportResponse {
+	success: boolean;
+	post_type: string;
+	offset: number;
+	batch_size: number;
+	processed: number;
+	skipped: number;
+	failed: number;
+	total_in_type: number;
+	next_offset: number | null;
+	recompile_cleared: boolean;
+	details: Array<{
+		post_id: number;
+		status: "ok" | "skipped" | "failed";
+		message?: string;
+		blocks_updated?: number;
+	}>;
 }
 
 /**

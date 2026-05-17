@@ -2,7 +2,7 @@
 	"name": "skylit-dev-io",
 	"displayName": "Skylit.DEV I/O - WordPress Sync",
 	"description": "VS Code/Cursor extension for instant WordPress Gutenberg sync. Solves WP Cron unreliability on local development. Requires Skylit.DEV WordPress plugin.",
-	"version": "1.53.9",
+	"version": "1.53.61",
 	"publisher": "dimy-osman",
 	"license": "SEE LICENSE IN LICENSE",
 	"engines": {
@@ -188,6 +188,12 @@
 				"when": "editorTextFocus && resourceExtname == .html"
 			}
 		],
+		"portsAttributes": {
+			"39595": {
+				"label": "Skylit WS Sync",
+				"onAutoForward": "silent"
+			}
+		},
 		"configuration": {
 			"title": "Skylit.DEV I/O",
 			"properties": {
@@ -231,6 +237,11 @@
 					"type": "boolean",
 					"default": false,
 					"description": "Log process/timing/resource usage (which process, duration ms, heap). Enable with debugOutput to see exact picture of what consumes what and why."
+				},
+				"skylit.gutenbergJumpPreserveFocus": {
+					"type": "boolean",
+					"default": true,
+					"description": "When true, Gutenberg jump-to-line updates the HTML tab and cursor position without moving keyboard focus (e.g. keeps focus in Cursor/VS Code chat or terminal). Disable to always focus the editor on jump (legacy behavior)."
 				}
 			}
 		}
@@ -247,6 +258,7 @@
 	"devDependencies": {
 		"@types/node": "^20.0.0",
 		"@types/vscode": "^1.80.0",
+		"@types/ws": "^8.18.1",
 		"@typescript-eslint/eslint-plugin": "^6.0.0",
 		"@typescript-eslint/parser": "^6.0.0",
 		"@vscode/vsce": "^3.7.1",
@@ -258,7 +270,8 @@
 	},
 	"dependencies": {
 		"axios": "^1.6.0",
-		"chokidar": "^3.5.3"
+		"chokidar": "^3.5.3",
+		"ws": "^8.20.1"
 	},
 	"optionalDependencies": {
 		"fsevents": "^2.3.3"

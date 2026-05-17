@@ -258,36 +258,80 @@ export class WorkspaceManager {
 	}
 
 	/**
-	 * Find WordPress in common subdirectories
+	 * Find WordPress in subdirectories via recursive scan (up to 4 levels deep)
 	 */
 	private async findWordPressInSubdirectories(
 		startPath: string
 	): Promise<string | null> {
-		// Common WordPress subdirectory patterns
-		const commonPaths = [
-			"public_html", // Hostinger, cPanel, most shared hosts
-			"public", // Valet, Forge
-			"app/public", // LocalWP
-			"htdocs", // XAMPP
-			"www", // Some setups
-			"wordpress", // Manual installs
-			"wp", // Short name
-		];
+		return this.findWordPressRecursive(startPath, 0, 4);
+	}
 
-		for (const subPath of commonPaths) {
-			const fullPath = this.joinPath(startPath, subPath);
-			const wpConfigPath = this.joinPath(
-				fullPath,
-				"wp-config.php"
+	/** Dirs that are never WordPress roots and should be skipped during recursion */
+	private static readonly SKIP_DIRS = new Set([
+		"node_modules",
+		".git",
+		".svn",
+		".hg",
+		"vendor",
+		"wp-admin",
+		"wp-includes",
+		"wp-content",
+		".cache",
+		"dist",
+		"build",
+		".vscode",
+		".idea",
+		"__pycache__",
+	]);
+
+	/**
+	 * Recursively search for wp-config.php, skipping noise directories.
+	 */
+	private async findWordPressRecursive(
+		dirPath: string,
+		currentDepth: number,
+		maxDepth: number
+	): Promise<string | null> {
+		if (currentDepth > maxDepth) {
+			return null;
+		}
+
+		// Check this directory first
+		const wpConfigPath = this.joinPath(dirPath, "wp-config.php");
+		if (await this.fileExists(wpConfigPath)) {
+			this.debugLogger.log(
+				`   ✅ Found wp-config.php (recursive): ${wpConfigPath}`
+			);
+			return dirPath;
+		}
+
+		// Recurse into child directories
+		let children: string[];
+		try {
+			children = await this.readDirectory(dirPath);
+		} catch {
+			return null;
+		}
+
+		for (const child of children) {
+			if (WorkspaceManager.SKIP_DIRS.has(child)) {
+				continue;
+			}
+
+			const childPath = this.joinPath(dirPath, child);
+
+			if (!(await this.isDirectory(childPath))) {
+				continue;
+			}
+
+			const result = await this.findWordPressRecursive(
+				childPath,
+				currentDepth + 1,
+				maxDepth
 			);
 
-			this.debugLogger.log(`   🔎 Checking: ${wpConfigPath}`);
-
-			if (await this.fileExists(wpConfigPath)) {
-				this.debugLogger.log(
-					`   ✅ Found wp-config.php in subdirectory!`
-				);
-				return fullPath;
+			if (result) {
+				return result;
 			}
 		}
 

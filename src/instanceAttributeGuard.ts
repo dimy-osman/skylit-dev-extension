@@ -1,23 +1,28 @@
 /**
  * Instance Attribute Guard
  *
- * Prevents editing of entire opening/closing tags on pattern instance elements
- * inside <section data-skylit-pattern-ref-id="..."> blocks in non-wp_block
- * post type HTML files.
+ * Prevents editing of pattern instance elements in non-wp_block post type
+ * HTML files. Pattern instances are single self-closing tags:
  *
- * Protected (read-only — whole tags):
- *   - <section data-skylit-pattern-ref-id="...">  (opening tag)
- *   - </section>                                   (closing tag)
- *   - <h2 data-skylit-override-name="..." ...>     (child opening tags)
- *   - </h2>                                        (child closing tags)
+ *   <section data-skylit-pattern-ref-id="..."
+ *            data-skylit-override-data='{"slot":{"content":"..."}}'></section>
  *
- * Freely editable:
- *   - Element CONTENT between tags: <h2 ...>THIS IS EDITABLE</h2>
- *   - Everything outside <section data-skylit-pattern-ref-id> blocks
- *   - All tags/attributes on pattern originals (wp_block in patterns/ folder)
+ * The entire tag is protected. Override values are edited via Gutenberg,
+ * not in the HTML file.
+ *
+ * Everything outside pattern instance sections is freely editable.
+ * Pattern originals (wp_block in patterns/ folder) are never guarded.
+ *
+ * Only activates for files whose WordPress Sync Metadata declares:
+ *   Display Mode: phantom_blocks
+ *
+ * Enable by setting PATTERN_INSTANCE_GUARD_ENABLED to true and calling .start() from extension.ts.
  */
 
 import * as vscode from "vscode";
+
+/** When false (default), the guard does not run: no edit blocking, no gray decorations. */
+export const PATTERN_INSTANCE_GUARD_ENABLED = false;
 import { DebugLogger } from "./debugLogger";
 
 /**
@@ -86,6 +91,13 @@ export class InstanceAttributeGuard {
 	 * Start the guard
 	 */
 	public start(): void {
+		if (!PATTERN_INSTANCE_GUARD_ENABLED) {
+			this.debugLogger.log(
+				"🛡️ Instance Attribute Guard: Skipped (PATTERN_INSTANCE_GUARD_ENABLED is false)"
+			);
+			return;
+		}
+
 		this.debugLogger.log(
 			"🛡️ Instance Attribute Guard: Starting..."
 		);
@@ -178,6 +190,16 @@ export class InstanceAttributeGuard {
 			this.guardedDocuments.delete(uri);
 			return;
 		}
+
+		// Guard is only relevant for phantom_blocks mode.
+		// In template_loader / fields_only / other modes the instance slots are
+		// either not present or freely editable, so protection is not needed.
+		const displayMode = this.parseDisplayMode(text);
+		if (displayMode !== "phantom_blocks") {
+			this.guardedDocuments.delete(uri);
+			return;
+		}
+
 		if (!text.includes("data-skylit-pattern-ref-id")) {
 			this.guardedDocuments.delete(uri);
 			return;
@@ -210,6 +232,25 @@ export class InstanceAttributeGuard {
 		return null;
 	}
 
+	private parseDisplayMode(text: string): string | null {
+		const match = text.match(
+			/<!--\s*\n?\s*WordPress Sync Metadata\s*\n([\s\S]*?)-->/
+		);
+		if (!match) return null;
+
+		for (const line of match[1].split("\n")) {
+			const ci = line.indexOf(":");
+			if (ci === -1) continue;
+			if (
+				line.substring(0, ci).trim().toLowerCase().replace(/\s+/g, "") ===
+				"displaymode"
+			) {
+				return line.substring(ci + 1).trim();
+			}
+		}
+		return null;
+	}
+
 	// ───────────────────────────────────────────────
 	// Protection cache — whole-tag ranges
 	// ───────────────────────────────────────────────
@@ -217,93 +258,25 @@ export class InstanceAttributeGuard {
 	/**
 	 * Build protection cache.
 	 *
-	 * Protected ranges cover ENTIRE opening and closing tags of every element
-	 * inside a <section data-skylit-pattern-ref-id> block, plus the section's
-	 * own opening and closing tags.
-	 *
-	 * Content between > and </ is NOT protected (that's the editable field value).
+	 * Pattern instances are single self-closing tags with a JSON data attribute.
+	 * The entire <section ...></section> is protected.
 	 */
 	private buildProtectionCache(document: vscode.TextDocument): void {
 		const text = document.getText();
 		const uri = document.uri.toString();
 		const ranges: ProtectedRange[] = [];
 
-		// Match each <section data-skylit-pattern-ref-id="..."> ... </section> block
+		// Match entire <section data-skylit-pattern-ref-id="..."> ... </section>
 		const sectionRegex =
-			/<section\s+data-skylit-pattern-ref-id="[^"]*"[^>]*>([\s\S]*?)<\/section>/gi;
+			/<section\s+data-skylit-pattern-ref-id="[^"]*"[^>]*>[\s\S]*?<\/section>/gi;
 		let sectionMatch: RegExpExecArray | null;
 
 		while ((sectionMatch = sectionRegex.exec(text)) !== null) {
-			const blockStart = sectionMatch.index;
-			const blockText = sectionMatch[0];
-
-			// 1. Protect the <section ...> opening tag
-			const openTagEnd = blockText.indexOf(">") + 1; // includes the >
 			ranges.push({
-				start: blockStart,
-				end: blockStart + openTagEnd,
-				label: "<section> opening tag",
+				start: sectionMatch.index,
+				end: sectionMatch.index + sectionMatch[0].length,
+				label: "pattern instance",
 			});
-
-			// 2. Protect the </section> closing tag
-			const closingTagStr = "</section>";
-			const closingIdx = blockText.lastIndexOf(closingTagStr);
-			if (closingIdx !== -1) {
-				ranges.push({
-					start: blockStart + closingIdx,
-					end:
-						blockStart +
-						closingIdx +
-						closingTagStr.length,
-					label: "</section> closing tag",
-				});
-			}
-
-			// 3. Protect every child element's opening and closing tags inside the section
-			//    Match opening tags like <h2 ...>, <p ...>, <span ...>, <img .../>
-			//    and closing tags like </h2>, </p>, </span>
-			const innerHtml = sectionMatch[1]; // content between <section> and </section>
-			const innerStart = blockStart + openTagEnd;
-
-			// Opening tags: <tagname ...> or <tagname .../>
-			const openingTagRegex =
-				/<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*\/?>/g;
-			let childMatch: RegExpExecArray | null;
-			openingTagRegex.lastIndex = 0;
-
-			while (
-				(childMatch =
-					openingTagRegex.exec(innerHtml)) !==
-				null
-			) {
-				ranges.push({
-					start: innerStart + childMatch.index,
-					end:
-						innerStart +
-						childMatch.index +
-						childMatch[0].length,
-					label: `<${childMatch[1]}> opening tag`,
-				});
-			}
-
-			// Closing tags: </tagname>
-			const closingTagRegex = /<\/([a-zA-Z][a-zA-Z0-9]*)>/g;
-			closingTagRegex.lastIndex = 0;
-
-			while (
-				(childMatch =
-					closingTagRegex.exec(innerHtml)) !==
-				null
-			) {
-				ranges.push({
-					start: innerStart + childMatch.index,
-					end:
-						innerStart +
-						childMatch.index +
-						childMatch[0].length,
-					label: `</${childMatch[1]}> closing tag`,
-				});
-			}
 		}
 
 		this.protectionCache.set(uri, {

@@ -6,6 +6,8 @@ Work in your code editor and see changes appear in Gutenberg without manually tr
 
 Requires the Skylit.DEV WordPress plugin. This extension will not work without the plugin installed on your WordPress site.
 
+**Version pairing (remote dev folder / decoupled mode):** use extension **1.53.41** with Skylit.DEV plugin **5.99.101+** so media-library streaming, `global-files` reconciliation, and export-poller self-write markings stay aligned end-to-end. See [`CHANGELOG.md`](CHANGELOG.md) for details.
+
 ## What It Does
 
 - IDE → WordPress: Save HTML/CSS and sync into Gutenberg automatically

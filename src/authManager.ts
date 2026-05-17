@@ -41,7 +41,8 @@ export class AuthManager {
 
     async saveToken(siteUrl: string, token: string): Promise<void> {
         const key = this.getStorageKey(siteUrl);
-        await this.secretStorage.store(key, token);
+        const cleanToken = token.trim();
+        await this.secretStorage.store(key, cleanToken);
         this.debugLogger.info(`✅ Saved token for ${siteUrl}`);
     }
 
@@ -130,6 +131,7 @@ export class AuthManager {
     private normalizeUrl(url: string): string {
         return url
             .replace(/^https?:\/\//, '')
-            .replace(/\/$/, '');
+            .replace(/\/$/, '')
+            .toLowerCase();
     }
 }

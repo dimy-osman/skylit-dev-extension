@@ -5,6 +5,7 @@
 
 import axios, { AxiosInstance, AxiosError } from "axios";
 import { createHash } from "crypto";
+import * as https from "https";
 import * as vscode from "vscode";
 import { DebugLogger } from "./debugLogger";
 import {
@@ -23,6 +24,22 @@ import {
 	MediaRenameResponse,
 	MediaSettingsResponse,
 } from "./types";
+
+/**
+ * Returns an https.Agent with rejectUnauthorized=false for local development
+ * hostnames (localhost, 127.0.0.1, ::1, *.local). For all other hosts the
+ * default Node TLS validation applies (rejectUnauthorized=true).
+ *
+ * LocalWP, Valet, Herd, and similar tools issue self-signed certificates for
+ * *.local domains — refusing them makes local development impossible.
+ */
+function localDevHttpsAgent(url: string): https.Agent | undefined {
+	const LOCAL_PATTERN = /^https:\/\/(localhost|127\.0\.0\.1|::1|[^/:]+\.local)(:\d+)?/i;
+	if (LOCAL_PATTERN.test(url)) {
+		return new https.Agent({ rejectUnauthorized: false });
+	}
+	return undefined;
+}
 
 export class RestClient {
 	private client: AxiosInstance;
@@ -52,6 +69,7 @@ export class RestClient {
 				Authorization: `Bearer ${token}`,
 				"Content-Type": "application/json",
 			},
+			httpsAgent: localDevHttpsAgent(this.baseUrl),
 		});
 
 		// Request interceptor: append token as query param when header auth is stripped
@@ -84,6 +102,10 @@ export class RestClient {
 		try {
 			const response = await axios.get(url, {
 				timeout: 10000,
+				headers: {
+					"User-Agent": "Skylit.DEV-IO-Extension/1.0 (VSCode)",
+				},
+				httpsAgent: localDevHttpsAgent(url),
 			});
 			if (response.data?.siteUrl) {
 				debugLogger.log(
@@ -97,8 +119,9 @@ export class RestClient {
 					remoteCapable: response.data.remoteCapable || false,
 				};
 			}
+			debugLogger.warn(`   ⚠️ Discovery returned unexpected response: ${JSON.stringify(response.data)}`);
 		} catch (error: any) {
-			debugLogger.log(`   ⚠️ Discovery failed: ${error.message}`);
+			debugLogger.warn(`   ⚠️ Discovery failed (HTTP or network error): ${error.message}`);
 		}
 		return null;
 	}
@@ -117,27 +140,43 @@ export class RestClient {
 			: "(empty)";
 		const url = `${this.baseUrl}/wp-json/skylit/v1/sync/validate-token`;
 
+		const sharedHeaders = {
+			"Content-Type": "application/json",
+			"User-Agent": "Skylit.DEV-IO-Extension/1.0 (VSCode)",
+		};
+
 		// Attempt 1: Header-based auth (standard Bearer token)
-		this.debugLogger.log(
+		this.debugLogger.warn(
 			`🔑 Validating token (${tokenPreview}) against ${this.baseUrl}...`
 		);
 		try {
 			const resp = await axios.get(url, {
 				timeout: 30000,
 				headers: {
+					...sharedHeaders,
 					Authorization: `Bearer ${this.token}`,
-					"Content-Type": "application/json",
 				},
 				validateStatus: () => true,
+				httpsAgent: localDevHttpsAgent(url),
 			});
 
-			this.debugLogger.log(
+			// Visible in output panel so the user can see exactly what the server returned
+			this.debugLogger.warn(
 				`   Header auth → HTTP ${resp.status} — ${JSON.stringify(resp.data)}`
 			);
 
 			if (resp.status === 200 && resp.data?.valid) {
-				this.debugLogger.log(`✅ Token valid (header auth) for user ${resp.data.user_id}`);
+				this.debugLogger.warn(`✅ Token valid (header auth) for user ${resp.data.user_id}`);
 				return { valid: true, tokenInvalid: false };
+			}
+
+			// HTTP 200 but valid is false/missing — unexpected plugin response
+			if (resp.status === 200 && !resp.data?.valid) {
+				this.debugLogger.error(
+					`❌ Plugin returned HTTP 200 but valid=false. Response: ${JSON.stringify(resp.data)}\n` +
+					"   This may mean the plugin is returning HTML (Cloudflare challenge?) or an unexpected JSON shape."
+				);
+				return { valid: false, tokenInvalid: false };
 			}
 
 			// 404 = REST route not registered = plugin crashed/deactivated
@@ -155,29 +194,35 @@ export class RestClient {
 				);
 				return { valid: false, tokenInvalid: false };
 			}
+
+			// 401 on attempt 1 = header stripped or wrong token — fall through to query param
+			this.debugLogger.warn(
+				`   Header auth → HTTP ${resp.status} — falling back to query param auth...`
+			);
 		} catch (err: any) {
-			this.debugLogger.log(`   Header auth network error: ${err.message}`);
+			this.debugLogger.warn(`   Header auth network error: ${err.message} — retrying with query param...`);
 		}
 
 		// Attempt 2: Query parameter auth (for hosts that strip Authorization header)
-		this.debugLogger.log(
-			"🔄 Header auth failed — retrying with query parameter auth..."
+		this.debugLogger.warn(
+			"🔄 Retrying with query parameter auth..."
 		);
 		try {
 			const resp2 = await axios.get(url, {
 				timeout: 30000,
 				params: { _skylit_token: this.token },
-				headers: { "Content-Type": "application/json" },
+				headers: sharedHeaders,
 				validateStatus: () => true,
+				httpsAgent: localDevHttpsAgent(url),
 			});
 
-			this.debugLogger.log(
+			this.debugLogger.warn(
 				`   Query param auth → HTTP ${resp2.status} — ${JSON.stringify(resp2.data)}`
 			);
 
 			if (resp2.status === 200 && resp2.data?.valid) {
 				this.useQueryParamAuth = true;
-				this.debugLogger.log(
+				this.debugLogger.warn(
 					`✅ Token valid (query param mode) for user ${resp2.data.user_id}`
 				);
 				this.debugLogger.info(
@@ -185,6 +230,15 @@ export class RestClient {
 					"   For better security, add to .htaccess: RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]"
 				);
 				return { valid: true, tokenInvalid: false };
+			}
+
+			// HTTP 200 but valid is false/missing — unexpected plugin response
+			if (resp2.status === 200 && !resp2.data?.valid) {
+				this.debugLogger.error(
+					`❌ Plugin returned HTTP 200 but valid=false on query param attempt. Response: ${JSON.stringify(resp2.data)}\n` +
+					"   The server may be returning a Cloudflare challenge page or cached response instead of JSON."
+				);
+				return { valid: false, tokenInvalid: false };
 			}
 
 			if (resp2.status === 404) {
@@ -201,16 +255,31 @@ export class RestClient {
 				return { valid: false, tokenInvalid: false };
 			}
 
-			// 401 from both header and query param = token is genuinely wrong
+			// 401 from both header and query param = token is definitively wrong
 			if (resp2.status === 401) {
-				this.debugLogger.log("❌ Token rejected by WordPress (401 on both auth methods).");
+				this.debugLogger.error(
+					`❌ Token rejected by WordPress (401 on both auth methods). ` +
+					`Token preview: ${tokenPreview}. Please generate a new token in WP Admin → Skylit.DEV → Dev Sync.`
+				);
 				return { valid: false, tokenInvalid: true };
 			}
+
+			this.debugLogger.error(
+				`❌ Unexpected HTTP ${resp2.status} on query param attempt. ` +
+				`Response: ${JSON.stringify(resp2.data)}`
+			);
 		} catch (err: any) {
-			this.debugLogger.log(`   Query param auth network error: ${err.message}`);
+			this.debugLogger.error(`   Query param auth network error: ${err.message}`);
+			this.debugLogger.error(
+				`   Cannot reach ${this.baseUrl} from this machine. ` +
+				`Check: firewall, VPN, proxy, or DNS resolution for this hostname.`
+			);
 		}
 
-		this.debugLogger.log("❌ Could not validate token — server may be down or unreachable.");
+		this.debugLogger.error(
+			`❌ Could not validate token against ${this.baseUrl}. ` +
+			"Check the output above for the exact HTTP status or network error."
+		);
 		return { valid: false, tokenInvalid: false };
 	}
 
@@ -288,14 +357,37 @@ export class RestClient {
 				return this.syncFile(postId, html, css, _retriesLeft - 1);
 			}
 
-			// Log the full response body so PHP errors are visible in the Output panel,
-			// not just the generic "Request failed with status code 500" message.
+			// Extract a human-readable reason from the response body so every
+			// layer above (fileWatcher, status bar, popup) shows the real PHP error
+			// instead of the generic "Request failed with status code 500".
 			const responseBody = error?.response?.data;
-			const bodyDetail = responseBody
-				? (typeof responseBody === "string"
-					? responseBody.substring(0, 500)
-					: JSON.stringify(responseBody).substring(0, 500))
-				: "(no response body)";
+			let bodyDetail = "(no response body)";
+			let phpMessage = "";
+			if (responseBody) {
+				if (typeof responseBody === "object") {
+					// WP_Error REST format: { code, message, data: { status } }
+					phpMessage =
+						responseBody.message ||
+						responseBody.error ||
+						responseBody.code ||
+						"";
+					bodyDetail = phpMessage || JSON.stringify(responseBody).substring(0, 500);
+				} else if (typeof responseBody === "string") {
+					// Raw PHP fatal / HTML — strip tags and truncate
+					const stripped = responseBody
+						.replace(/<[^>]+>/g, " ")
+						.replace(/\s+/g, " ")
+						.trim();
+					bodyDetail = stripped.substring(0, 500);
+					phpMessage = stripped.substring(0, 200);
+				}
+			}
+
+			// Enrich the error message so callers see the PHP reason, not just the HTTP status
+			if (phpMessage) {
+				error.message = `HTTP ${httpStatus} — ${phpMessage}`;
+			}
+
 			this.debugLogger.log(
 				`❌ Sync failed [${httpStatus ?? "?"}] post ${postId}: ${error.message} | body: ${bodyDetail}`
 			);
@@ -357,6 +449,29 @@ export class RestClient {
 			this.debugLogger.log(`❌ Diagnose failed: ${error.message}`);
 			throw error;
 		}
+	}
+
+	/**
+	 * Re-import one batch of posts from dev files to rebuild block grammar after
+	 * a version upgrade.  Call repeatedly (incrementing offset) until next_offset
+	 * is null, first for post_type='wp_block' then 'page' then 'post'.
+	 */
+	async postUpdateReimport(
+		postType: string,
+		offset: number,
+		batchSize: number = 5
+	): Promise<import("./types").PostUpdateReimportResponse> {
+		this.debugLogger.log(
+			`♻️ Post-update reimport: type=${postType} offset=${offset} batch=${batchSize}`
+		);
+		const response = await this.client.post<
+			import("./types").PostUpdateReimportResponse
+		>("/sync/post-update-reimport", {
+			post_type: postType,
+			offset,
+			batch_size: batchSize,
+		});
+		return response.data;
 	}
 
 	/**
@@ -510,6 +625,51 @@ export class RestClient {
 		} catch {
 			// Best-effort — if the endpoint doesn't exist yet, ignore
 		}
+	}
+
+	/**
+	 * Poll for Gutenberg "Open in IDE" (opens document as a new tab — not jump-to-line).
+	 */
+	async getPendingOpenIde(): Promise<{
+		pending: boolean;
+		file?: string;
+		line?: number;
+		column?: number;
+		post_id?: number;
+		timestamp?: number;
+		reason?: string;
+	}> {
+		const response = await this.client.get("/sync/get-open-ide", {
+			params: { _t: Date.now() },
+			headers: { "Cache-Control": "no-cache, no-store" },
+		});
+		return response.data;
+	}
+
+	async clearPendingOpenIde(): Promise<void> {
+		try {
+			await this.client.post("/sync/clear-open-ide");
+		} catch {
+			// Best-effort
+		}
+	}
+
+	/**
+	 * Register the local WebSocket endpoint with WordPress so the plugin can
+	 * inject WS connection details into the Gutenberg editor page (SKYLITDevConfig.ws).
+	 *
+	 * Called once on WS server start and re-called every ~4 minutes to refresh
+	 * the 10-minute server-side transient TTL.
+	 *
+	 * @param port         Port the WS server is bound to.
+	 * @param clientToken  Session token browsers must send on WS upgrade.
+	 */
+	async registerWsEndpoint(port: number, clientToken: string): Promise<void> {
+		await this.client.post(
+			'/sync/register-ws-endpoint',
+			{ port, client_token: clientToken },
+			{ timeout: 5000 },
+		);
 	}
 
 	/**
@@ -781,6 +941,40 @@ export class RestClient {
 	}
 
 	/**
+	 * Switch the WordPress plugin's `skylit_dev_folder_location` setting.
+	 * Used by the connect-remote flow so the user does not have to flip the
+	 * dropdown in WP Admin first.
+	 */
+	async setRemoteMode(
+		mode:
+			| "remote"
+			| "root"
+			| "above-wp"
+			| "wp-root"
+			| "wp-content"
+			| "custom"
+	): Promise<{
+		success: boolean;
+		changed: boolean;
+		mode: string;
+		previous: string;
+		message: string;
+	}> {
+		this.debugLogger.log(`🔀 Setting plugin dev_folder_location → ${mode}`);
+		const response = await this.client.post("/sync/set-remote-mode", { mode });
+		if (response.data?.changed) {
+			this.debugLogger.info(
+				`🔀 Plugin dev_folder_location: ${response.data.previous} → ${response.data.mode}`
+			);
+		} else {
+			this.debugLogger.log(
+				`🔀 Plugin dev_folder_location already '${response.data?.mode}'`
+			);
+		}
+		return response.data;
+	}
+
+	/**
 	 * Import all new files from dev folder
 	 * Creates posts from folders without _ID suffix
 	 */
@@ -852,6 +1046,19 @@ export class RestClient {
 			const responseData = error.response?.data;
 			const status = error.response?.status;
 			const serverError = responseData?.error || responseData?.message || "";
+
+			// 400 "Folder already linked" means WP already has this post — not a real error
+			if (status === 400 && responseData?.post_id && /already linked/i.test(serverError)) {
+				this.debugLogger.log(
+					`ℹ️ Folder already linked to post ID ${responseData.post_id} — treating as already in sync`
+				);
+				return {
+					success: true,
+					post_id: responseData.post_id,
+					already_linked: true,
+				} as any;
+			}
+
 			this.debugLogger.log(
 				`❌ Create post failed (HTTP ${status}): ${error.message}`
 			);
@@ -1133,7 +1340,7 @@ export class RestClient {
 	 * Get pending folder actions (trash/restore/delete) for decoupled mode.
 	 */
 	async getPendingFolderActions(): Promise<{
-		actions: Array<{ post_id: number; slug: string; type_folder: string; action: string; timestamp: number }>;
+		actions: Array<{ post_id: number; slug: string; type_folder: string; action: string; timestamp: number; old_slug?: string }>;
 		count: number;
 	}> {
 		const response = await this.client.get("/sync/pending-folder-actions");
@@ -1282,6 +1489,22 @@ export class RestClient {
 	}
 
 	/**
+	 * Soft-trash a WP attachment (Move to Trash).
+	 */
+	async trashMediaAttachment(attachmentId: number): Promise<void> {
+		this.debugLogger.log(`🗑️ Trashing WP media attachment ${attachmentId}`);
+		await this.client.post(`/media/trash/${attachmentId}`);
+	}
+
+	/**
+	 * Restore a WP attachment from trash.
+	 */
+	async restoreMediaAttachment(attachmentId: number): Promise<void> {
+		this.debugLogger.log(`♻️ Restoring WP media attachment ${attachmentId}`);
+		await this.client.post(`/media/restore/${attachmentId}`);
+	}
+
+	/**
 	 * Update alt/title/caption of a WP attachment.
 	 */
 	async updateMediaMeta(
@@ -1304,12 +1527,37 @@ export class RestClient {
 
 	/**
 	 * Run one paginated batch of WP→Dev import.
-	 * Returns { processed, skipped, offset, total, done }.
+	 * Returns { processed, skipped, offset, total, done } plus optional
+	 * `files` array when `remote: true` is passed — the server ships file
+	 * contents back base64-encoded so the IDE can write them locally.
 	 */
-	async importMediaBatch(offset: number): Promise<{
-		processed: number; skipped: number; offset: number; total: number; done: boolean; message?: string;
+	async importMediaBatch(
+		offset: number,
+		remote: boolean = false
+	): Promise<{
+		processed: number;
+		skipped: number;
+		offset: number;
+		total: number;
+		done: boolean;
+		message?: string;
+		remote?: boolean;
+		files?: Array<{
+			attachment_id: number;
+			local_path: string;
+			wp_path: string;
+			hash: string;
+			size: number;
+			content?: string;
+			encoding?: string;
+			skipped?: boolean;
+			reason?: string;
+		}>;
 	}> {
-		const response = await this.client.post("/media/import", { offset });
+		const response = await this.client.post("/media/import", {
+			offset,
+			remote: remote ? 1 : 0,
+		});
 		return (response.data as any).data;
 	}
 
@@ -1331,34 +1579,38 @@ export class RestClient {
 			// Server responded with error status
 			const status = error.response.status;
 			const data = error.response.data as any;
-			const message = data?.error || data?.message || error.message;
+
+			// Extract the real reason from WP_Error JSON or raw PHP output
+			let phpReason = "";
+			if (data) {
+				if (typeof data === "object") {
+					phpReason = data.message || data.error || data.code || "";
+				} else if (typeof data === "string") {
+					phpReason = data
+						.replace(/<[^>]+>/g, " ")
+						.replace(/\s+/g, " ")
+						.trim()
+						.substring(0, 300);
+				}
+			}
+			const message = phpReason || error.message;
 
 			this.debugLogger.log(`❌ API Error ${status}: ${message}`);
 
-			// Log additional details if available
-			if (data?.error && data?.error !== message) {
-				this.debugLogger.log(`   Details: ${data.error}`);
-			}
-
 		if (status === 401 || status === 403) {
-			// Log only — callers (validateToken / connectToWordPress) handle auth
-			// failures contextually. Showing a popup here causes false alarms during
-			// the two-attempt validation flow (header auth → query param fallback).
 			this.debugLogger.log(`   Auth error ${status} — handled by caller`);
 		} else if (status === 404) {
-				// Log but don't popup for 404 - might be during plugin updates
 				this.debugLogger.log(
 					"   Skylit plugin API not found. Ensure plugin is activated and updated."
 				);
+			} else if (status >= 500 && phpReason) {
+				// Enrich the Axios error message so it bubbles up with the PHP reason
+				(error as any).message = `HTTP ${status} — ${phpReason}`;
+				this.debugLogger.log(`   PHP error: ${phpReason}`);
 			}
-			// Don't show popup for 400 errors during batch operations (scan)
-			// The error is already logged to output channel
 		} else if (error.request) {
-			// Request made but no response
 			this.debugLogger.log("❌ No response from WordPress");
-			// Only log, don't popup - might be temporary network issue
 		} else {
-			// Error setting up request
 			this.debugLogger.log(`❌ Request error: ${error.message}`);
 		}
 
